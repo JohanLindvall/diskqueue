@@ -6,8 +6,9 @@ Guidance for working in this repository.
 
 `github.com/JohanLindvall/wal` — a generic, durable FIFO queue (write-ahead log)
 for Go. The public API and behaviour are documented in [README.md](README.md);
-read it first. It has **no third-party dependencies** beyond `golang.org/x/sys`
-(for mmap/msync) — it used to wrap `tidwall/wal`, but now ships its own store.
+read it first. Its only dependencies are `golang.org/x/sys` (mmap/msync) and
+`cespare/xxhash/v2` (per-record checksums) — it used to wrap `tidwall/wal`, but
+now ships its own store.
 
 - [store.go](store.go) — the `store`: the mmap-backed, `[]byte`-only file backend.
 - [wal.go](wal.go) — the generic `WAL[T]` writer/owner (Add, Empty/Count/Size,
@@ -30,14 +31,18 @@ go test -cover ./...
 ## Storage model (store.go)
 
 A directory of numbered files `data.00000001`, … each `SegmentSize` bytes,
-preallocated and mmap'd, capped at `maxSegments` live files. 32-byte header of
-four little-endian uint64 file-local values: `[0:8]` commit cursor (next
-uncommitted record), `[8:16]` write cursor (data end), `[16:24]` written record
-count, `[24:32]` committed record count; then `[32:cap]` records, each
-`uvarint(len) || payload`. The header is the single source of truth — recovery
-reads **no records at all** (data end, resume point, and `Count()` all come from
-the header). The write cursor / written count are published *after* the record
-bytes so only fully-written records are visible.
+preallocated, capped at `maxSegments` live files, and mmap'd **on demand** (LRU,
+capped by `maxMapped`; the active file stays mapped, the fd is closed right after
+mmap). 64-byte LE header: `[0:8]` magic, `[8:16]` commit cursor (next uncommitted
+record), `[16:24]` write cursor (data end), `[24:32]` written count, `[32:40]`
+committed count, `[40]` version, `[56:64]` xxhash64 of `[0:56]`; then records,
+each `uvarint(len) || payload || xxhash64(payload)` (8-byte LE checksum trailer,
+verified on read — mismatch → `ErrCorrupt`, cursor not advanced). The header is
+the single source of truth — recovery reads **no records at all**: `load` preads
+each 64-byte header (no mapping), validates magic/version (`ErrBadFormat`) and the
+header checksum (`ErrCorrupt`), and takes data end, resume point and `Count()`
+from it. The write cursor / written count (and the header checksum) are published
+*after* the record bytes so only fully-written records are visible.
 
 Three cursors, all global byte offsets into the logical stream (file `F` holds
 offsets `[F.base, F.base+F.size)`):
@@ -81,18 +86,41 @@ mirrors its own `written`/`committed` counts into its header.
   is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.
 - **Records never span files.** `append` cycles when `size+recLen > segmentSize`.
   A record bigger than `segmentSize` is `ErrRecordTooLarge`.
-- **Recovery (`load`) reads no records.** Reopen takes each file's data end from
-  its write cursor and its `written`/`committed` counts from the header (summed
-  into `nWritten`/`nCommitted`), and `commitOff` from the first file whose commit
-  cursor is short of its end; `headOff = commitOff`. `dropCommitted` subtracts the
-  dropped file's counts (it's fully committed, so `written == committed`, keeping
-  `Count` exact). Fully-committed leading files are *not* dropped on open.
+- **Recovery (`load`) reads no records.** Reopen preads each file's 64-byte header
+  (no mapping), validates it, and takes the data end from the write cursor and the
+  `written`/`committed` counts from the header (summed into `nWritten`/
+  `nCommitted`), with `commitOff` from the first file whose commit cursor is short
+  of its end; `headOff = commitOff`. Only the active file is mapped at the end of
+  `load`. `dropCommitted` subtracts the dropped file's counts (it's fully
+  committed, so `written == committed`, keeping `Count` exact). Fully-committed
+  leading files are *not* dropped on open.
+- **Corruption is strict by default, opt-in recovery via `recoverCorrupt`.**
+  `read` returns `ErrCorrupt` (not empty) for an undecodable record; `takeHead`
+  surfaces a bad length/checksum as `ErrCorrupt`. With `recoverCorrupt`: `load`
+  drops a torn *trailing* segment (only the highest num — earlier files hold
+  committed data) and recreates a fresh file if all were dropped; `takeHead`
+  calls `skipCorruptSegment`, which advances `headOff` past the segment and
+  force-commits its tail when `commitOff` is already inside it (auto-commit path),
+  reclaiming it. Recovery is lossy; `s.corruptions` counts events (`WAL.Corruptions`).
 - **Blocking waiters.** `waitLocked`/`signal` use a lazily-created `notify`
   channel, nil when nobody waits, so `Add` stays allocation-free.
 - **`Reader.Drain`/`Follow` consume** via the shared `headOff` (like iterator-
-  shaped `Take`): read, release lock, yield, then `commitTo`. `Drain` is bounded
-  by a `writeOff` snapshot; `Follow` waits via `waitLocked` (which lives on WAL,
-  called as `r.w.waitLocked`).
+  shaped `Take`): read **and `commitTo` under the lock**, then release and yield —
+  so they commit-on-read (at-most-once) and are safe for concurrent cooperating
+  readers. `Drain` is bounded by a `writeOff` snapshot; `Follow` waits via
+  `waitLocked` (which lives on WAL, called as `r.w.waitLocked`).
+- **Sync policy.** `noSync` skips msync; `syncEvery <= 1` msyncs every write/
+  commit (ordered: data then header); `syncEvery > 1` (`batched()`) defers to
+  `flushBatch` every N ops. A torn tail from a power loss between batched flushes
+  is caught by the per-record xxhash on read. `sync()`/`Close` always flush; an
+  optional `SyncInterval` goroutine (`syncLoop`, stopped by `Close` via
+  `syncStop`/`syncDone`) flushes on a timer as a wall-clock backstop.
+- **Lazy mapping.** Files map on demand via `ensureMapped` (`read`, `commitTo`,
+  and `append` for the active file); `evictMapped` unmaps the LRU beyond
+  `maxMapped`, never the active or just-mapped file, msync'ing a victim first
+  (a batched commit may have left its header dirty). `df.data == nil` means
+  unmapped — `msync`/`sync`/`flushBatch`/`close` skip such files. `createFile`
+  msyncs the fresh header so a cycled-but-empty segment is a valid file on disk.
 
 ## Gotchas
 

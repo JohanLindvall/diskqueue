@@ -1,8 +1,8 @@
 # wal
 
 A generic, durable, FIFO **write-ahead log** (a persistent queue) for Go, backed
-by its own small memory-mapped file store (no third-party dependencies beyond
-`golang.org/x/sys`).
+by its own small memory-mapped file store (dependencies: `golang.org/x/sys` for
+mmap/msync and `cespare/xxhash/v2` for per-record checksums).
 
 Items are appended at the back with `Add` and consumed from the front through a
 `Reader`: a consumer either **takes** an item (read + commit in one step) or
@@ -28,13 +28,19 @@ BenchmarkAddTake-22    36 ns/op    0 B/op    0 allocs/op   (NoSync)
 
 The log lives in a directory of numbered files `data.00000001`, `data.00000002`,
 … each `SegmentSize` bytes, at most `maxSegments` of them at once. Each file
-begins with a 32-byte header of four little-endian uint64s — commit cursor
-(persisted read position), write cursor (data end), written record count and
-committed record count — followed by records, each `uvarint(len) || payload`.
-Because the cursors and counts all live in the header, reopening reads no records
-at all. A file is dropped once all its records are committed — but only while
-writing (a new write cycling to the next file); reads and commits never delete
-files.
+begins with a 64-byte header — a magic number, a format version, the commit
+cursor (persisted read position), write cursor (data end), written and committed
+record counts, and an `xxhash64` over the header itself — followed by records,
+each `uvarint(len) || payload || xxhash64(payload)` (an 8-byte little-endian
+checksum trailer). Because the cursors and counts all live in the header,
+reopening reads no records at all; the header checksum is verified on open (a
+mismatch is `ErrCorrupt`, a wrong magic/version is `ErrBadFormat`), and each
+record's checksum is verified on read (a mismatch returns `ErrCorrupt` without
+advancing the cursor). Segments are memory-mapped on demand and the
+least-recently-used are unmapped once `MaxMapped` are live, so a deep backlog does
+not hold an mmap and fd per retained file. A file is dropped once all its records
+are committed — but only while writing (a new write cycling to the next file);
+reads and commits never delete files.
 
 ## Install
 
@@ -193,8 +199,19 @@ processing (at-least-once), use `Reserve`/`Commit`.
   `Reserve`/`Commit` for explicit acknowledgement.
 - **Durability.** Writes go into the memory-mapped files and survive a process
   crash via the page cache. By default each write and commit is `msync`'d for
-  power-loss durability; set `NoSync` to skip that for throughput. `Sync` flushes
-  on demand.
+  power-loss durability; set `NoSync` to skip that entirely, or `SyncEvery: N` to
+  batch one fsync over N operations (optionally with a `SyncInterval` wall-clock
+  backstop). `Sync` flushes on demand.
+- **Integrity.** Every record and every file header stores an `xxhash64`, verified
+  on read and on open. A record mismatch (bit-rot or a torn write) returns
+  `ErrCorrupt` and leaves the read cursor in place, so the bad record surfaces
+  rather than being delivered as valid data; a bad header fails the open with
+  `ErrCorrupt`, and a foreign/garbage file fails with `ErrBadFormat`.
+- **Recovery.** With `RecoverCorrupt` set, corruption is recovered instead of
+  surfaced: a torn trailing segment (a crash mid-cycle) is dropped on open, and a
+  corrupt record quarantines the rest of its segment and the reader continues with
+  the next valid record. Recovery is lossy — dropped data is gone — so each event
+  is counted by `WAL.Corruptions()`. Without the flag the default is strict.
 - **Reclamation.** Disk is freed a whole file at a time, once every record in a
   file is committed, and only while writing. A read-only consumer never deletes
   files; reclamation happens on the next `Add` that cycles to a new file.
@@ -221,10 +238,21 @@ processing (at-least-once), use `Reserve`/`Commit`.
 
 ```go
 wal.New[T](path, maxSegments, marshal, unmarshal, wal.Options{
-	NoSync:      true, // skip msync per write/commit (faster, no power-loss durability)
-	SegmentSize: 0,    // 0 = 8 MiB default; floored at 4 KiB, rounded up to a page
+	NoSync:         true, // skip msync per write/commit (faster, no power-loss durability)
+	SyncEvery:      0,    // 0/1 = msync every op; N>1 = batch the fsync over N ops
+	SyncInterval:   0,    // >0 = background flush every interval (backstop for SyncEvery)
+	SegmentSize:    0,    // 0 = 8 MiB default; floored at 4 KiB, rounded up to a page
+	MaxMapped:      0,    // 0 = map every touched segment; N = cap mmaps (LRU), min 2
+	RecoverCorrupt: false, // true = drop corrupt data and continue instead of erroring
 })
 ```
+
+`SyncEvery` trades a bounded power-loss window for throughput: with `SyncEvery: N`
+the fsync cost is amortized over N writes/commits, so up to the last N unsynced
+operations can be lost on power loss (they still survive a process crash, and a
+torn tail is caught by the per-record checksum). `Close` and `Sync` always flush.
+The speed-up is large — on a laptop NVMe, durable `Add` goes from ~1.6 ms/op at
+`SyncEvery: 1` to ~9 µs at `SyncEvery: 100` and ~1.1 µs at `SyncEvery: 1000`.
 
 `SegmentSize` is fixed when the store is created. Reopening an existing store with
 a different (post-rounding) `SegmentSize` is rejected with `ErrSegmentSizeMismatch`

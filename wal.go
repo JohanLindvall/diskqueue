@@ -1,6 +1,6 @@
 // Package wal implements a generic, durable, FIFO write-ahead log (a persistent
-// queue) backed by its own mmap file store (see store.go); the only dependency
-// is golang.org/x/sys.
+// queue) backed by its own mmap file store (see store.go); its only dependencies
+// are golang.org/x/sys (mmap/msync) and cespare/xxhash/v2 (per-record checksums).
 //
 // Items are appended with Add and consumed through a Reader (WAL.NewReader): Take
 // reads + commits in one step, or Reserve reads and later Commits its offset.
@@ -32,6 +32,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"time"
 )
 
 // MarshalFunc serializes v by appending to dst and returning the extended slice
@@ -52,6 +53,14 @@ var (
 	ErrInvalidOffset = errors.New("wal: invalid offset")
 	// ErrRecordTooLarge is returned by Add when a record cannot fit one segment.
 	ErrRecordTooLarge = errors.New("wal: record too large")
+	// ErrCorrupt is returned when a stored xxhash64 does not match its data,
+	// indicating on-disk corruption — either a record's payload (the read cursor
+	// does not advance, so the bad record is reported on every subsequent read) or
+	// a file header (open fails).
+	ErrCorrupt = errors.New("wal: checksum mismatch")
+	// ErrBadFormat is returned by New when a file in the directory is not a WAL
+	// segment of a supported version (wrong magic or version).
+	ErrBadFormat = errors.New("wal: unrecognized file format")
 	// ErrSegmentSizeMismatch is returned by New when reopening a store with a
 	// different SegmentSize than it was created with (which would discard data).
 	ErrSegmentSizeMismatch = errors.New("wal: segment size mismatch")
@@ -65,11 +74,42 @@ type Options struct {
 	// survives a process crash via the page cache. Default false.
 	NoSync bool
 
+	// SyncEvery batches durability: msync once every N writes/commits instead of
+	// after each one, amortizing the fsync cost. 0 or 1 syncs every operation (the
+	// default). A larger N raises throughput but widens the power-loss window — up
+	// to the last N unsynced operations can be lost on power loss (they still
+	// survive a process crash via the page cache, and a torn tail is caught by the
+	// per-record checksum). Call Sync to flush on demand; Close always flushes.
+	// Ignored when NoSync is set.
+	SyncEvery int
+
 	// SegmentSize sets each segment file's capacity. Default 8 MiB, floored at
 	// 4 KiB and rounded up to a page. A record too big for one segment is
 	// rejected with ErrRecordTooLarge. Fixed at creation: reopening with a
 	// different (post-rounding) value is rejected with ErrSegmentSizeMismatch.
 	SegmentSize int64
+
+	// MaxMapped caps how many segment files are memory-mapped at once. Segments
+	// are mapped on demand and the least-recently-used are unmapped beyond the
+	// cap, bounding address space and msync work for deep backlogs; the active
+	// segment is always mapped. 0 means unbounded (map every touched segment).
+	// Values are raised to a minimum of 2 (the active segment plus one reader).
+	MaxMapped int
+
+	// SyncInterval, if > 0, runs a background goroutine that flushes to stable
+	// storage on that period — a wall-clock backstop for SyncEvery batching, so an
+	// idle queue's last writes become durable within the interval instead of
+	// waiting for SyncEvery more operations. Ignored when NoSync is set.
+	SyncInterval time.Duration
+
+	// RecoverCorrupt enables best-effort recovery instead of failing on
+	// corruption. On open, a torn trailing segment (a crash mid-cycle) is dropped
+	// rather than returning ErrCorrupt/ErrBadFormat. On read, a corrupt record
+	// quarantines the remainder of its segment and continues with the next valid
+	// record instead of returning ErrCorrupt. Recovery is lossy — the dropped data
+	// is gone — so each event is counted (see WAL.Corruptions). Default false
+	// (strict: corruption is surfaced as an error).
+	RecoverCorrupt bool
 }
 
 // WAL is a generic persistent FIFO queue of T.
@@ -87,6 +127,11 @@ type WAL[T any] struct {
 	// notify is lazily created by a blocked consumer and closed by Add to wake
 	// waiters; nil when nobody waits, keeping Add alloc-free.
 	notify chan struct{}
+
+	// syncStop/syncDone coordinate the optional background syncer (SyncInterval);
+	// both nil when it is not running.
+	syncStop chan struct{}
+	syncDone chan struct{}
 }
 
 // New opens (creating if necessary) a WAL under the directory path.
@@ -99,11 +144,17 @@ func New[T any](path string, maxSegments int, marshal MarshalFunc[T], unmarshal 
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	st, err := openStore(path, segmentCapacity(opt.SegmentSize), maxSegments, opt.NoSync)
+	st, err := openStore(path, segmentCapacity(opt.SegmentSize), maxSegments, opt.NoSync, opt.SyncEvery, opt.MaxMapped, opt.RecoverCorrupt)
 	if err != nil {
 		return nil, err
 	}
-	return &WAL[T]{marshal: marshal, unmarshal: unmarshal, st: st}, nil
+	w := &WAL[T]{marshal: marshal, unmarshal: unmarshal, st: st}
+	if opt.SyncInterval > 0 && !opt.NoSync {
+		w.syncStop = make(chan struct{})
+		w.syncDone = make(chan struct{})
+		go w.syncLoop(opt.SyncInterval)
+	}
+	return w, nil
 }
 
 func segmentCapacity(size int64) int64 {
@@ -160,6 +211,16 @@ func (w *WAL[T]) Size() int64 {
 	return w.st.size()
 }
 
+// Corruptions returns how many corruption events have been recovered from since
+// open (torn trailing segments dropped on open plus segments quarantined on
+// read). Always 0 unless RecoverCorrupt is set. A non-zero value means data was
+// dropped.
+func (w *WAL[T]) Corruptions() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.st.corruptionCount()
+}
+
 // Sync flushes buffered writes to stable storage.
 func (w *WAL[T]) Sync() error {
 	w.mu.Lock()
@@ -173,8 +234,8 @@ func (w *WAL[T]) Sync() error {
 // Close flushes and closes the WAL. Further use returns ErrClosed.
 func (w *WAL[T]) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.closed {
+		w.mu.Unlock()
 		return ErrClosed
 	}
 	w.closed = true
@@ -182,7 +243,39 @@ func (w *WAL[T]) Close() error {
 		close(w.notify)
 		w.notify = nil
 	}
+	w.mu.Unlock()
+
+	// Stop the background syncer before closing the store. The lock is released
+	// so the syncer (which takes it each tick) can observe closed and exit; it
+	// won't touch the store once closed is set.
+	if w.syncStop != nil {
+		close(w.syncStop)
+		<-w.syncDone
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.st.close()
+}
+
+// syncLoop flushes the store on a fixed interval until Close stops it; a
+// wall-clock backstop for SyncEvery batching.
+func (w *WAL[T]) syncLoop(d time.Duration) {
+	defer close(w.syncDone)
+	t := time.NewTicker(d)
+	defer t.Stop()
+	for {
+		select {
+		case <-w.syncStop:
+			return
+		case <-t.C:
+			w.mu.Lock()
+			if !w.closed {
+				_ = w.st.sync()
+			}
+			w.mu.Unlock()
+		}
+	}
 }
 
 // waitLocked releases the lock, blocks until Add signals or ctx is done, then

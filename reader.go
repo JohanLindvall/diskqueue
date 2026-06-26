@@ -188,12 +188,13 @@ func (r *Reader[T]) stream(ctx context.Context, follow bool) iter.Seq[T] {
 }
 
 // read takes the head record, copies it into scratch (so it never aliases the
-// mmap), and unmarshals it. ok is false when empty. The caller must hold r.w.mu.
+// mmap), and unmarshals it. ok is false when empty; a checksum mismatch returns
+// ErrCorrupt. The caller must hold r.w.mu.
 func (r *Reader[T]) read() (T, int64, bool, error) {
 	var zero T
-	payload, off, ok := r.w.st.takeHead()
-	if !ok {
-		return zero, 0, false, nil
+	payload, off, ok, err := r.w.st.takeHead()
+	if err != nil || !ok {
+		return zero, 0, false, err
 	}
 	r.scratch = append(r.scratch[:0], payload...) // copy out of the mmap
 	v, err := r.w.unmarshal(r.scratch)
