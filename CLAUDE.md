@@ -60,17 +60,22 @@ mirrors its own `written`/`committed` counts into its header.
   ([reader.go](reader.go)); each copies the record into `r.scratch` *under the
   lock*, so the value never aliases the mmap and survives unmapping. Valid until
   the reader's next read. A `Reader` is single-goroutine; use one per consumer.
-  Because of this copy the deferred-unmap below is now belt-and-suspenders, not
-  load-bearing for the public API.
+  This copy is load-bearing: since consume ops commit a record as they read it,
+  its file may be unmapped while the consumer still holds the value (see
+  "Immediate unmap is safe").
 - **Reclamation is write-only and whole-file.** `dropCommitted` (called only from
   `cycle`, i.e. from `append`) deletes files whose every record is committed
   (`base+size <= commitOff`), never the active file. Reads/commits must never
   delete a file — this is deliberate ("only writes can cycle").
 - **Immediate unmap is safe** because `Reader.read` copies the payload into
-  `r.scratch` *under the lock*, and a just-read record's file is never fully
-  committed (its `base+size > commitOff`), so `dropCommitted` can't unmap it. All
-  store ops hold the WAL mutex, so no munmap races a read. (Touching an mmap slice
-  after `munmap` is a SIGSEGV the GC can't prevent — that's why the copy matters.)
+  `r.scratch` *under the lock*; the value the consumer holds never aliases the
+  mapping. This is now the *only* guarantee: `Take`/`Drain`/`Follow` commit a
+  record as they read it, so a just-delivered record's file **can** be fully
+  committed and unmapped by a concurrent `Add`'s `dropCommitted` while the
+  consumer still holds the value — the scratch copy, not file retention, is what
+  keeps it valid. All store ops hold the WAL mutex, so no munmap races the read
+  itself. (Touching an mmap slice after `munmap` is a SIGSEGV the GC can't
+  prevent — that's why the copy matters.)
 - **`maxSegments` bounds the file count.** `cycle` drops committed files, then
   returns `ErrFull` if `len(files) >= maxSegments` (0 = unbounded). So the bound
   is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.

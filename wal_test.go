@@ -678,3 +678,106 @@ func TestStressConcurrentReserveCommit(t *testing.T) {
 		t.Fatalf("consumed %d, want %d", next, total)
 	}
 }
+
+// TestSegmentSizeMismatch verifies that reopening a store with a different
+// SegmentSize is rejected instead of truncating and discarding records.
+func TestSegmentSizeMismatch(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 8192})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(0); i < 100; i++ { // span more than one 8 KiB segment
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopening with a different size must fail loudly, not corrupt the files.
+	if _, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 16384}); !errors.Is(err, ErrSegmentSizeMismatch) {
+		t.Fatalf("reopen with wrong size: got %v, want ErrSegmentSizeMismatch", err)
+	}
+
+	// Reopening with the original size still works and preserves the data.
+	w2, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 8192})
+	if err != nil {
+		t.Fatalf("reopen with original size: %v", err)
+	}
+	defer w2.Close()
+	r := w2.NewReader()
+	for want := uint64(0); want < 100; want++ {
+		v, ok, err := r.TryTake()
+		if err != nil || !ok || v != want {
+			t.Fatalf("take: v=%d ok=%v err=%v want=%d", v, ok, err, want)
+		}
+	}
+}
+
+// TestConcurrentDrainCooperates verifies that two Drain iterations running
+// concurrently on the same WAL split the stream without loss or duplication —
+// safe now that Drain commits each item under the lock as it is read.
+func TestConcurrentDrainCooperates(t *testing.T) {
+	w, _ := openTest(t, 0)
+	const n = 5000
+	for i := uint64(0); i < n; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := context.Background()
+	var mu sync.Mutex
+	seen := make(map[uint64]bool, n)
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := w.NewReader()
+			for v := range r.Drain(ctx) {
+				mu.Lock()
+				if seen[v] {
+					t.Errorf("item %d delivered twice", v)
+				}
+				seen[v] = true
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if len(seen) != n {
+		t.Fatalf("saw %d distinct items, want %d", len(seen), n)
+	}
+	if !w.Empty() {
+		t.Fatal("queue should be fully drained")
+	}
+}
+
+// TestDrainCommitsBeforeYield verifies the at-most-once contract: the item the
+// loop stops on has already been committed and does not replay.
+func TestDrainCommitsBeforeYield(t *testing.T) {
+	w, r := openTest(t, 0)
+	for i := uint64(0); i < 10; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Break on the very first item. Because Drain commits before the body runs,
+	// that item is already committed and must not be seen again.
+	for range r.Drain(context.Background()) {
+		break
+	}
+
+	v, ok, err := r.TryTake()
+	if err != nil || !ok {
+		t.Fatalf("next take: ok=%v err=%v", ok, err)
+	}
+	if v != 1 {
+		t.Fatalf("after break-on-0 the next item is %d, want 1 (item 0 was committed)", v)
+	}
+}

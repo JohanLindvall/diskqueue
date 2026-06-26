@@ -12,7 +12,8 @@ import (
 // so the value never aliases an unmappable file and stays valid until the
 // Reader's next read (alloc-free once warm). A Reader is not safe for concurrent
 // use: use one per consuming goroutine. Readers share the read/commit cursor and
-// cooperate (each item delivered once).
+// cooperate (each item delivered once); see the package doc on which ops are safe
+// across concurrent readers.
 func (w *WAL[T]) NewReader() *Reader[T] {
 	return &Reader[T]{w: w}
 }
@@ -117,17 +118,17 @@ func (r *Reader[T]) Commit(offset int64) error {
 }
 
 // Drain iterates the items present when iteration begins, oldest first,
-// committing each once its yield returns.
+// committing each as it is read (like Take), so a loop that stops early does not
+// replay the item it stopped on. Use Reserve/Commit to ack after processing.
+// Safe for concurrent cooperating readers.
 func (r *Reader[T]) Drain(ctx context.Context) iter.Seq[T] {
 	return r.stream(ctx, false)
 }
 
 // Follow is like Drain but unbounded: after the existing items it waits for and
-// yields new ones until ctx is cancelled or the WAL is closed.
-//
-// Committing happens after the yield returns (at-least-once: an item left
-// uncommitted by an early stop replays). The lock is released across yields, so
-// other methods may be called from within the loop.
+// yields new ones until ctx is cancelled or the WAL is closed. Each item is
+// committed as it is read (at-most-once; see Drain). The lock is released across
+// yields, so other methods may be called from within the loop.
 func (r *Reader[T]) Follow(ctx context.Context) iter.Seq[T] {
 	return r.stream(ctx, true)
 }
@@ -174,19 +175,14 @@ func (r *Reader[T]) stream(ctx context.Context, follow bool) iter.Seq[T] {
 				w.mu.Unlock()
 				return
 			}
+			// Commit before yielding, under the read's lock (like Take): atomic and
+			// in cursor order, so concurrent iterations cooperate. Cost: at-most-once.
+			w.st.commitTo(off)
 			w.mu.Unlock()
 
 			if !yield(v) {
 				return
 			}
-
-			w.mu.Lock()
-			if w.closed {
-				w.mu.Unlock()
-				return
-			}
-			w.st.commitTo(off)
-			w.mu.Unlock()
 		}
 	}
 }

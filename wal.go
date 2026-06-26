@@ -17,7 +17,11 @@
 //
 // Concurrency: a WAL is safe for concurrent use; a single Reader is not — use one
 // per consuming goroutine. Readers share one read/commit cursor and cooperate
-// (each item delivered once). The blocking methods honour their context.
+// (each item delivered once). Take/TryTake and Drain/Follow commit under the lock
+// as they read, so they are safe for concurrent cooperating readers. Reserve/
+// Commit is the only deferred path: its commits must be issued in offset order
+// (single consumer) or one reader reclaims another's in-flight record. The
+// blocking methods honour their context.
 //
 // Crash semantics: at-least-once. On open the read cursor resets to the persisted
 // commit cursor, so uncommitted items replay.
@@ -48,6 +52,9 @@ var (
 	ErrInvalidOffset = errors.New("wal: invalid offset")
 	// ErrRecordTooLarge is returned by Add when a record cannot fit one segment.
 	ErrRecordTooLarge = errors.New("wal: record too large")
+	// ErrSegmentSizeMismatch is returned by New when reopening a store with a
+	// different SegmentSize than it was created with (which would discard data).
+	ErrSegmentSizeMismatch = errors.New("wal: segment size mismatch")
 )
 
 // Options tunes the behaviour of a WAL. The zero value is valid and selects
@@ -60,7 +67,8 @@ type Options struct {
 
 	// SegmentSize sets each segment file's capacity. Default 8 MiB, floored at
 	// 4 KiB and rounded up to a page. A record too big for one segment is
-	// rejected with ErrRecordTooLarge.
+	// rejected with ErrRecordTooLarge. Fixed at creation: reopening with a
+	// different (post-rounding) value is rejected with ErrSegmentSizeMismatch.
 	SegmentSize int64
 }
 

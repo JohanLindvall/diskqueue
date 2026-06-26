@@ -503,3 +503,59 @@ func TestStressStoreRandom(t *testing.T) {
 		})
 	}
 }
+
+// TestStoreCorruptLengthNoPanic verifies that a record with a corrupt length
+// prefix decodes as "not ok" rather than panicking past the mapping.
+func TestStoreCorruptLengthNoPanic(t *testing.T) {
+	s, _ := newTestStore(t, 4096, 0)
+	mustAppend(t, s, idxRec(1))
+
+	// Overwrite the first record's uvarint length with a huge value (0xFF…),
+	// which would slice far past the data region without the bounds guard.
+	for i := 0; i < 10; i++ {
+		s.files[0].data[headerSize+i] = 0xFF
+	}
+
+	if _, _, ok := s.read(0); ok {
+		t.Fatal("corrupt record should not decode ok")
+	}
+	// A commit walking the corrupt record must also stop cleanly, not panic.
+	s.commitTo(s.writeOff)
+}
+
+// TestStoreBatchedCommitAcrossSegments commits many records spanning several
+// segments in a single commitTo (with sync on, exercising the per-file header
+// flush and directory sync), then reopens to confirm the batch is durable.
+func TestStoreBatchedCommitAcrossSegments(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 16, 0, false) // tiny segments, sync enabled
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	const n = 20
+	for i := 0; i < n; i++ {
+		mustAppend(t, s, idxRec(i))
+	}
+	if got := s.count(); got != n {
+		t.Fatalf("count before commit = %d, want %d", got, n)
+	}
+	s.commitTo(s.writeOff) // one call crossing every segment
+	if got := s.count(); got != 0 {
+		t.Fatalf("count after commit = %d, want 0", got)
+	}
+	if err := s.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s2, err := openStore(dir, 16, 0, false)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer s2.close()
+	if got := s2.count(); got != 0 {
+		t.Fatalf("count after reopen = %d, want 0 (commit not durable)", got)
+	}
+	if !s2.empty() {
+		t.Fatal("store should be empty after reopen")
+	}
+}

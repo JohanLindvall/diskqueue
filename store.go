@@ -122,7 +122,30 @@ func (s *store) load() error {
 		}
 		s.files = []*dataFile{df}
 		s.nextNum = 2
+		if !s.noSync {
+			if err := s.syncDir(); err != nil {
+				return err
+			}
+		}
 		return nil
+	}
+
+	// Files are preallocated to headerSize+segmentSize, so the largest reveals
+	// the stored segment size; reopening with a different size would let
+	// openFile's Truncate discard records. Reject it. (Max ignores torn files.)
+	var storedFileSize int64
+	for _, num := range nums {
+		fi, serr := os.Stat(s.filePath(num))
+		if serr != nil {
+			return serr
+		}
+		if fi.Size() > storedFileSize {
+			storedFileSize = fi.Size()
+		}
+	}
+	if storedFileSize > 0 && storedFileSize != headerSize+s.segmentSize {
+		return fmt.Errorf("%w: store created with segment size %d, opened with %d",
+			ErrSegmentSizeMismatch, storedFileSize-headerSize, s.segmentSize)
 	}
 
 	var base int64
@@ -263,7 +286,7 @@ func (s *store) append(payload []byte) error {
 	af.setWrittenCount(af.written)
 	if !s.noSync {
 		s.msync(af, headerSize+int(old), headerSize+int(af.size)) // record bytes
-		s.msync(af, 8, 24)                                        // write cursor + written count
+		s.msync(af, 0, headerSize)                                // header: write cursor + written count
 	}
 	return nil
 }
@@ -281,13 +304,19 @@ func (s *store) cycle() error {
 	}
 	s.nextNum++
 	s.files = append(s.files, df)
+	// Persist the new (and removed) entries before records land in the file.
+	if !s.noSync {
+		if err := s.syncDir(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-// dropCommitted removes (and unmaps) every fully-committed file. Only called
-// from cycle, so no read is in flight and a recently-read record is never in a
-// committed file — unmapping here can't invalidate a live slice. It is the only
-// place files are deleted.
+// dropCommitted removes (and unmaps) every fully-committed file — the only place
+// files are deleted. Called from cycle under the WAL lock, so no store op races
+// it. A just-delivered record's file may be unmapped here; that's safe only
+// because read copied the payload into the Reader's scratch under the lock.
 func (s *store) dropCommitted() {
 	keep := s.files[:0]
 	for _, df := range s.files {
@@ -320,12 +349,20 @@ func (s *store) fileForOffset(off int64) *dataFile {
 // payload (a slice into the mmap), the offset past it, and whether it decoded.
 func (df *dataFile) recordAt(off int64) ([]byte, int64, bool) {
 	p := headerSize + int(off-df.base)
+	if p < headerSize || p >= len(df.data) {
+		return nil, 0, false
+	}
 	v, n := binary.Uvarint(df.data[p:])
 	if n <= 0 {
 		return nil, 0, false
 	}
 	L := int(v)
 	start := p + n
+	// A corrupt length must decode as "not ok", never panic (L wraps negative
+	// when v exceeds maxInt).
+	if L < 0 || L > len(df.data)-start {
+		return nil, 0, false
+	}
 	return df.data[start : start+L], off + int64(n+L), true
 }
 
@@ -360,6 +397,10 @@ func (s *store) commitTo(off int64) {
 	if off > s.writeOff {
 		off = s.writeOff
 	}
+	// Flush each file's header once, not once per record: commits cross files in
+	// order, so flush a file when the commit leaves it, and the last at the end.
+	// A crash before the flush replays the batch (at-least-once).
+	var dirty *dataFile
 	for s.commitOff < off {
 		df := s.fileForOffset(s.commitOff)
 		if df == nil {
@@ -369,15 +410,18 @@ func (s *store) commitTo(off int64) {
 		if !ok {
 			break
 		}
+		if !s.noSync && dirty != nil && dirty != df {
+			s.msync(dirty, 0, headerSize)
+		}
 		s.commitOff = next
 		s.nCommitted++
 		df.committed++
 		df.setCommitCursor(headerSize + (s.commitOff - df.base))
 		df.setCommittedCount(df.committed)
-		if !s.noSync {
-			s.msync(df, 0, 8)   // commit cursor
-			s.msync(df, 24, 32) // committed count
-		}
+		dirty = df
+	}
+	if !s.noSync && dirty != nil {
+		s.msync(dirty, 0, headerSize)
 	}
 }
 
@@ -394,6 +438,21 @@ func (s *store) sync() error {
 		}
 	}
 	return nil
+}
+
+// syncDir fsyncs the directory so segment creations/removals are durable: msync
+// flushes a file's data and inode but never its directory entry, which a power
+// loss would otherwise drop — stranding already-msync'd records.
+func (s *store) syncDir() error {
+	d, err := os.Open(s.dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		_ = d.Close()
+		return err
+	}
+	return d.Close()
 }
 
 func (s *store) close() error {

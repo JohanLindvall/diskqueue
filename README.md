@@ -126,27 +126,29 @@ if ok {
 
 ### Iterating (consuming)
 
-Both iterators **consume**: each item is committed once your loop body returns
-for it, drawing from the same cursor as `Reserve`/`Take`, so an item is never
-delivered twice.
+Both iterators **consume**: each item is committed as it is read (before your
+loop body runs), exactly like `Take`, drawing from the same cursor as
+`Reserve`/`Take`, so an item is never delivered twice.
 
 ```go
 r := w.NewReader()
 
 // Drain: drains the items present right now, oldest to newest, then ends.
 for v := range r.Drain(ctx) {
-	process(v) // committed after this returns
+	process(v) // already committed before this runs
 }
 
-// Follow: drains existing items, then blocks and yields/commits new ones as
-// they arrive, until ctx is cancelled.
+// Follow: drains existing items, then blocks and yields new ones as they
+// arrive, committing each as it is read, until ctx is cancelled.
 for v := range r.Follow(ctx) {
 	process(v)
 }
 ```
 
-If the loop stops early (`break` or ctx cancellation), the item being processed
-is left uncommitted and replays after a restart (at-least-once).
+Because the commit happens at read time, an item that fails (or a loop that
+stops early via `break` or ctx cancellation) is **not** replayed — `Drain`/`Follow`
+are at-most-once, like `Take`. If you need to acknowledge only after successful
+processing (at-least-once), use `Reserve`/`Commit`.
 
 ## API
 
@@ -205,9 +207,15 @@ is left uncommitted and replays after a restart (at-least-once).
 - **Concurrency.** A `WAL` is safe for concurrent use. A single `Reader` is *not*
   — use one `Reader` per consuming goroutine. Multiple Readers share the one
   read/commit cursor and cooperate to consume the stream (each item delivered
-  once). The blocking `Reserve`/`Take` and the `Follow` iterator wait for new data
-  and honour their context; `Drain`/`Follow` release the lock between yields, so
-  other methods may be called from inside the iteration.
+  once). `Take`/`TryTake` and the `Drain`/`Follow` iterators read and commit
+  atomically under the lock, in cursor order, so they are safe for *concurrent*
+  cooperating readers. `Reserve`/`Commit` is the only deferred path: it advances
+  the shared prefix cursor *after* an unlocked processing window, so its commits
+  must be issued in offset order (use a single consumer, or coordinate the
+  commits) — otherwise one consumer committing out of order reclaims another's
+  in-flight record. The blocking `Reserve`/`Take` and the `Follow` iterator wait
+  for new data and honour their context; `Drain`/`Follow` release the lock between
+  yields, so other methods may be called from inside the iteration.
 
 ## Options
 
@@ -217,6 +225,10 @@ wal.New[T](path, maxSegments, marshal, unmarshal, wal.Options{
 	SegmentSize: 0,    // 0 = 8 MiB default; floored at 4 KiB, rounded up to a page
 })
 ```
+
+`SegmentSize` is fixed when the store is created. Reopening an existing store with
+a different (post-rounding) `SegmentSize` is rejected with `ErrSegmentSizeMismatch`
+rather than truncating the files and discarding committed records.
 
 ## License
 
