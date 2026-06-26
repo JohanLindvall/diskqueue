@@ -1,0 +1,10 @@
+version: "2"
+
+linters:
+  exclusions:
+    rules:
+      # Tests intentionally ignore errors from cleanup (Close) and fire-and-forget
+      # helpers (Add/TryTake in goroutines and warm-up loops).
+      - path: _test\.go
+        linters:
+          - errcheck
