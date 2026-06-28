@@ -44,6 +44,14 @@ header checksum (`ErrCorrupt`), and takes data end, resume point and `Count()`
 from it. The write cursor / written count (and the header checksum) are published
 *after* the record bytes so only fully-written records are visible.
 
+Every header mutation goes through `df.header(mods ...func(*dataFile))`, which
+applies the modifiers, rebuilds the checksum, and sets `headerDirty` — so the
+checksum and dirty flag can't be forgotten. The field setters (`setCommitCursor`,
+`setWriteCursor`, `setWrittenCount`, `setCommittedCount`) **return** a modifier
+rather than writing in place, so they compose as `header()` arguments; nothing
+touches the header bytes until `header()` invokes them. The closures stay
+stack-allocated (escape analysis), keeping the hot path zero-alloc.
+
 Three cursors, all global byte offsets into the logical stream (file `F` holds
 offsets `[F.base, F.base+F.size)`):
 
@@ -110,17 +118,33 @@ mirrors its own `written`/`committed` counts into its header.
   readers. `Drain` is bounded by a `writeOff` snapshot; `Follow` waits via
   `waitLocked` (which lives on WAL, called as `r.w.waitLocked`).
 - **Sync policy.** `noSync` skips msync; `syncEvery <= 1` msyncs every write/
-  commit (ordered: data then header); `syncEvery > 1` (`batched()`) defers to
-  `flushBatch` every N ops. A torn tail from a power loss between batched flushes
-  is caught by the per-record xxhash on read. `sync()`/`Close` always flush; an
-  optional `SyncInterval` goroutine (`syncLoop`, stopped by `Close` via
+  commit inline (ordered: data then header); `syncEvery > 1` (`batched()`) defers
+  to `flushBatch` every N ops. A torn tail from a power loss between batched
+  flushes is caught by the per-record xxhash on read. `sync()`/`Close` always
+  flush; an optional `SyncInterval` goroutine (`syncLoop`, stopped by `Close` via
   `syncStop`/`syncDone`) flushes on a timer as a wall-clock backstop.
+- **Dirty tracking (header split from data).** Each `dataFile` tracks the header
+  (`headerDirty` bool — page 0, rewritten by every append/commit) separately from
+  the dirty data range `[dirtyLo,dirtyHi)` (`markDataDirty`/`clearDirty`; both
+  clean == the zero value). `flushDirtyErr` msyncs page 0 and the data range as
+  **two independent page-aligned syncs**, so the already-clean record pages
+  between the header and the freshly-written tail are never scanned — the win over
+  one merged `[0,tail]` range when a partly-full segment takes a batched commit.
+  The deferred paths (batched `append`/`commitTo`, `noSync`, `createFile`) only
+  mark; the inline per-op path msyncs precisely and never marks (so per-op files
+  stay clean). `flushDirty`/`flushBatch`/`sync`/`close`/`evictMapped` flush only
+  what's dirty and skip a clean file entirely — a file only read since its last
+  flush is unmapped with no msync. `noSync` writes are still marked so an explicit
+  `sync()`/`Close` flushes them; under `noSync` eviction just `clearDirty`s and
+  relies on kernel writeback. Don't widen the inline per-op path to a merged
+  range — that would msync `[0, end)` each append, O(size) per write.
 - **Lazy mapping.** Files map on demand via `ensureMapped` (`read`, `commitTo`,
   and `append` for the active file); `evictMapped` unmaps the LRU beyond
-  `maxMapped`, never the active or just-mapped file, msync'ing a victim first
-  (a batched commit may have left its header dirty). `df.data == nil` means
-  unmapped — `msync`/`sync`/`flushBatch`/`close` skip such files. `createFile`
-  msyncs the fresh header so a cycled-but-empty segment is a valid file on disk.
+  `maxMapped`, never the active or just-mapped file, flushing only a victim's
+  dirty range first (a batched commit may have left its header dirty; a clean
+  victim is unmapped without any msync). `df.data == nil` means unmapped —
+  `msync`/`sync`/`flushBatch`/`close` skip such files. `createFile` msyncs the
+  fresh header so a cycled-but-empty segment is a valid file on disk.
 
 ## Gotchas
 

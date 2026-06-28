@@ -44,32 +44,84 @@ type dataFile struct {
 	size      int64  // bytes of records written into the data region (excludes header)
 	written   int64  // number of records written (mirrors the header)
 	committed int64  // number of records committed (mirrors the header)
+
+	// Intrusive LRU links, valid only while mapped (data != nil). The store
+	// threads mapped files from mru (most-recently-used) toward lru via prev.
+	lruPrev *dataFile // toward the most-recently-used end
+	lruNext *dataFile // toward the least-recently-used end
+
+	// Dirty state modified since the last flush, so the batched/evict/sync paths
+	// msync just these bytes instead of the whole mapping. The header (page 0,
+	// rewritten by every append/commit) is tracked separately from the dirty
+	// data range [dirtyLo,dirtyHi) — flushing them as two small syncs skips the
+	// already-clean record pages between page 0 and the freshly-written tail.
+	// headerDirty false and dirtyLo >= dirtyHi means clean (the zero value).
+	headerDirty bool
+	dirtyLo     int
+	dirtyHi     int
 }
+
+// markDataDirty widens df's dirty data range (offsets >= headerSize) to include
+// [from,to). The deferred-flush paths (batched writes, eviction, sync) msync this
+// range rather than the whole file; the per-op sync path msyncs inline instead.
+func (df *dataFile) markDataDirty(from, to int) {
+	if df.dirtyLo >= df.dirtyHi { // currently clean
+		df.dirtyLo, df.dirtyHi = from, to
+		return
+	}
+	if from < df.dirtyLo {
+		df.dirtyLo = from
+	}
+	if to > df.dirtyHi {
+		df.dirtyHi = to
+	}
+}
+
+func (df *dataFile) clearDirty() { df.headerDirty, df.dirtyLo, df.dirtyHi = false, 0, 0 }
 
 // Header layout (little-endian): [0:8] magic, [8:16] commit cursor, [16:24] write
 // cursor, [24:32] written count, [32:40] committed count, [40] version, [41:56]
 // reserved, [56:64] xxhash64 of [0:56]. The checksum is rewritten on every header
 // update so torn/rotten headers are caught on open.
-func (df *dataFile) magic() uint64           { return binary.LittleEndian.Uint64(df.data[0:8]) }
-func (df *dataFile) version() byte           { return df.data[40] }
-func (df *dataFile) commitCursor() int64     { return int64(binary.LittleEndian.Uint64(df.data[8:16])) }
-func (df *dataFile) setCommitCursor(v int64) { binary.LittleEndian.PutUint64(df.data[8:16], uint64(v)) }
-func (df *dataFile) writeCursor() int64      { return int64(binary.LittleEndian.Uint64(df.data[16:24])) }
-func (df *dataFile) setWriteCursor(v int64)  { binary.LittleEndian.PutUint64(df.data[16:24], uint64(v)) }
+func (df *dataFile) magic() uint64         { return binary.LittleEndian.Uint64(df.data[0:8]) }
+func (df *dataFile) version() byte          { return df.data[40] }
+func (df *dataFile) commitCursor() int64    { return int64(binary.LittleEndian.Uint64(df.data[8:16])) }
+func (df *dataFile) writeCursor() int64     { return int64(binary.LittleEndian.Uint64(df.data[16:24])) }
+func (df *dataFile) writtenCount() int64    { return int64(binary.LittleEndian.Uint64(df.data[24:32])) }
+func (df *dataFile) committedCount() int64  { return int64(binary.LittleEndian.Uint64(df.data[32:40])) }
 
-func (df *dataFile) writtenCount() int64 { return int64(binary.LittleEndian.Uint64(df.data[24:32])) }
-func (df *dataFile) setWrittenCount(v int64) {
-	binary.LittleEndian.PutUint64(df.data[24:32], uint64(v))
+// The setters return a header modifier (a func(*dataFile)) rather than writing
+// in place, so they compose as arguments to header(), which applies them and
+// then rebuilds the checksum. They write nothing until header() invokes them.
+func setCommitCursor(v int64) func(*dataFile) {
+	return func(df *dataFile) { binary.LittleEndian.PutUint64(df.data[8:16], uint64(v)) }
 }
-func (df *dataFile) committedCount() int64 { return int64(binary.LittleEndian.Uint64(df.data[32:40])) }
-func (df *dataFile) setCommittedCount(v int64) {
-	binary.LittleEndian.PutUint64(df.data[32:40], uint64(v))
+func setWriteCursor(v int64) func(*dataFile) {
+	return func(df *dataFile) { binary.LittleEndian.PutUint64(df.data[16:24], uint64(v)) }
+}
+func setWrittenCount(v int64) func(*dataFile) {
+	return func(df *dataFile) { binary.LittleEndian.PutUint64(df.data[24:32], uint64(v)) }
+}
+func setCommittedCount(v int64) func(*dataFile) {
+	return func(df *dataFile) { binary.LittleEndian.PutUint64(df.data[32:40], uint64(v)) }
 }
 
 // initHeader stamps the magic and version into a fresh file.
 func (df *dataFile) initHeader() {
 	binary.LittleEndian.PutUint64(df.data[0:8], headerMagic)
 	df.data[40] = formatVersion
+}
+
+// header applies field mutations to the file header, then rebuilds the checksum
+// and marks the header dirty. Every header change goes through here so neither
+// the checksum nor the dirty flag can be forgotten; callers that flush inline
+// (per-op / createFile) clear the flag themselves after the msync.
+func (df *dataFile) header(mods ...func(*dataFile)) {
+	for _, mod := range mods {
+		mod(df)
+	}
+	df.setHeaderChecksum()
+	df.headerDirty = true
 }
 
 // setHeaderChecksum recomputes the header checksum; call after any header update,
@@ -95,8 +147,15 @@ type store struct {
 	pageSize       int64
 
 	files   []*dataFile // sorted by num ascending; last is the active write file
-	mapped  []*dataFile // currently mapped files, least-recently-used first
 	nextNum uint64
+
+	// Intrusive LRU list of currently mapped files, so touch/evict/remove are
+	// O(1) pointer splices rather than O(n) slice shifts. mappedMRU is the
+	// most-recently-used end (where touches and new maps go); mappedLRU is the
+	// eviction end. mappedLen tracks the length against maxMapped.
+	mappedMRU *dataFile
+	mappedLRU *dataFile
+	mappedLen int
 
 	writeOff  int64 // global offset of the next record to write (tail)
 	headOff   int64 // global offset of the next record to read (in memory only)
@@ -162,55 +221,84 @@ func (s *store) ensureMapped(df *dataFile) error {
 
 // trackMapped records df as mapped (most-recently-used) and evicts down to the cap.
 func (s *store) trackMapped(df *dataFile) {
-	s.mapped = append(s.mapped, df)
+	s.mappedPushMRU(df)
 	s.evictMapped(df)
 }
 
+// touchMapped moves an already-mapped df to the most-recently-used end.
 func (s *store) touchMapped(df *dataFile) {
-	for i, d := range s.mapped {
-		if d == df {
-			s.mapped = append(s.mapped[:i], s.mapped[i+1:]...)
-			s.mapped = append(s.mapped, df)
-			return
-		}
+	if df == s.mappedMRU {
+		return
 	}
+	s.mappedUnlink(df)
+	s.mappedPushMRU(df)
 }
 
+// removeMapped detaches df from the LRU list (its mapping is being torn down).
 func (s *store) removeMapped(df *dataFile) {
-	for i, d := range s.mapped {
-		if d == df {
-			s.mapped = append(s.mapped[:i], s.mapped[i+1:]...)
-			return
-		}
+	s.mappedUnlink(df)
+}
+
+// mappedPushMRU links df in at the most-recently-used end. df must not already
+// be in the list.
+func (s *store) mappedPushMRU(df *dataFile) {
+	df.lruPrev = nil
+	df.lruNext = s.mappedMRU
+	if s.mappedMRU != nil {
+		s.mappedMRU.lruPrev = df
+	} else {
+		s.mappedLRU = df
 	}
+	s.mappedMRU = df
+	s.mappedLen++
+}
+
+// mappedUnlink removes df from the LRU list and clears its links.
+func (s *store) mappedUnlink(df *dataFile) {
+	if df.lruPrev != nil {
+		df.lruPrev.lruNext = df.lruNext
+	} else {
+		s.mappedMRU = df.lruNext
+	}
+	if df.lruNext != nil {
+		df.lruNext.lruPrev = df.lruPrev
+	} else {
+		s.mappedLRU = df.lruPrev
+	}
+	df.lruPrev, df.lruNext = nil, nil
+	s.mappedLen--
 }
 
 // evictMapped unmaps least-recently-used segments until at most maxMapped remain,
-// never evicting the active file or keep (the one just mapped). A victim's header
-// may be dirty (a batched commit), so flush it before unmapping.
+// never evicting the active file or keep (the one just mapped). A victim's dirty
+// range (e.g. a batched commit's header) is flushed before unmapping; a clean
+// victim is unmapped without any msync.
 func (s *store) evictMapped(keep *dataFile) {
 	if s.maxMapped <= 0 {
 		return
 	}
 	active := s.active()
-	for len(s.mapped) > s.maxMapped {
-		victim := -1
-		for i, df := range s.mapped {
+	for s.mappedLen > s.maxMapped {
+		// Walk from the least-recently-used end toward the most-recently-used,
+		// skipping the active and just-mapped files (which are never evicted).
+		var victim *dataFile
+		for df := s.mappedLRU; df != nil; df = df.lruPrev {
 			if df != active && df != keep {
-				victim = i
+				victim = df
 				break
 			}
 		}
-		if victim < 0 {
+		if victim == nil {
 			return // only the active and just-mapped files remain
 		}
-		df := s.mapped[victim]
 		if !s.noSync {
-			_ = unix.Msync(df.data, unix.MS_SYNC)
+			s.flushDirty(victim) // flush just the dirty range, then drop the mapping
+		} else {
+			victim.clearDirty() // noSync: kernel writeback covers the dirty pages
 		}
-		_ = unix.Munmap(df.data)
-		df.data = nil
-		s.mapped = append(s.mapped[:victim], s.mapped[victim+1:]...)
+		_ = unix.Munmap(victim.data)
+		victim.data = nil
+		s.mappedUnlink(victim)
 	}
 }
 
@@ -227,13 +315,12 @@ func (s *store) recordOp() {
 	}
 }
 
-// flushBatch msyncs every mapped file (dirty pages only) and resets the counter.
-// A torn tail from a power loss between flushes is caught by the record checksum.
+// flushBatch msyncs each mapped file's dirty range (not the whole mapping) and
+// resets the counter. A torn tail from a power loss between flushes is caught by
+// the record checksum.
 func (s *store) flushBatch() {
 	for _, df := range s.files {
-		if df.data != nil {
-			_ = unix.Msync(df.data, unix.MS_SYNC)
-		}
+		s.flushDirty(df)
 	}
 	s.unsynced = 0
 }
@@ -428,15 +515,18 @@ func (s *store) createFile(num uint64, base int64) (*dataFile, error) {
 		return nil, err
 	}
 	df := &dataFile{num: num, data: data, base: base}
-	df.initHeader()
-	df.setCommitCursor(headerSize)
-	df.setWriteCursor(headerSize)
-	df.setHeaderChecksum()
+	df.header(
+		(*dataFile).initHeader,
+		setCommitCursor(headerSize),
+		setWriteCursor(headerSize),
+	)
 	// Persist the header so a freshly cycled segment is a valid file on disk
 	// (magic/checksum) even before its first record is written.
 	if !s.noSync {
 		_ = unix.Msync(df.data, unix.MS_SYNC)
+		df.headerDirty = false // flushed inline
 	}
+	// else: header() left it dirty so an explicit Sync flushes the fresh header.
 	return df, nil
 }
 
@@ -483,17 +573,20 @@ func (s *store) append(payload []byte) error {
 	s.writeOff += recLen
 	s.nWritten++
 	// Publish the data end and count after the record bytes, so recovery only
-	// sees fully-written records.
-	af.setWriteCursor(headerSize + af.size)
-	af.setWrittenCount(af.written)
-	af.setHeaderChecksum()
+	// sees fully-written records. header() rebuilds the checksum and marks the
+	// header dirty.
+	af.header(
+		setWriteCursor(headerSize+af.size),
+		setWrittenCount(af.written),
+	)
+	af.markDataDirty(headerSize+int(old), headerSize+int(af.size))
 	switch {
 	case s.noSync:
+		// No msync; the dirty marks let an explicit Sync/Close flush the bytes.
 	case s.batched():
 		s.recordOp()
 	default:
-		s.msync(af, headerSize+int(old), headerSize+int(af.size)) // record bytes
-		s.msync(af, 0, headerSize)                                // header: write cursor + written count
+		s.flushDirty(af) // per-op: msync the header and the new record bytes, clearing both
 	}
 	return nil
 }
@@ -653,11 +746,12 @@ func (s *store) skipCorruptSegment(off int64) {
 			s.commitOff = end
 		}
 		if df.data != nil {
-			df.setCommitCursor(headerSize + df.size)
-			df.setCommittedCount(df.committed)
-			df.setHeaderChecksum()
+			df.header(
+				setCommitCursor(headerSize+df.size),
+				setCommittedCount(df.committed),
+			)
 			if !s.noSync {
-				s.msync(df, 0, headerSize)
+				s.flushDirty(df) // recovery wants this durable now; clears the range
 			}
 		}
 	}
@@ -693,21 +787,24 @@ func (s *store) commitTo(off int64) {
 			break
 		}
 		if perOp && dirty != nil && dirty != df {
-			s.msync(dirty, 0, headerSize)
+			s.flushDirty(dirty) // previous file's header is final; flush it
 		}
 		s.commitOff = next
 		s.nCommitted++
 		df.committed++
-		df.setCommitCursor(headerSize + (s.commitOff - df.base))
-		df.setCommittedCount(df.committed)
-		df.setHeaderChecksum()
+		// header() rebuilds the checksum and marks the header dirty; per-op flushes
+		// each file's header once (here on leaving it, and the last below).
+		df.header(
+			setCommitCursor(headerSize+(s.commitOff-df.base)),
+			setCommittedCount(df.committed),
+		)
 		dirty = df
 	}
 	if dirty == nil {
 		return // nothing committed
 	}
 	if perOp {
-		s.msync(dirty, 0, headerSize)
+		s.flushDirty(dirty)
 	} else if s.batched() {
 		s.recordOp()
 	}
@@ -723,10 +820,7 @@ func (s *store) corruptionCount() int64 { return s.corruptions }
 func (s *store) sync() error {
 	s.unsynced = 0 // a full flush makes any batched-but-unsynced ops durable
 	for _, df := range s.files {
-		if df.data == nil {
-			continue // unmapped segments hold no dirty pages
-		}
-		if err := unix.Msync(df.data, unix.MS_SYNC); err != nil {
+		if err := s.flushDirtyErr(df); err != nil {
 			return err
 		}
 	}
@@ -755,32 +849,57 @@ func (s *store) close() error {
 			continue // not currently mapped
 		}
 		if !s.noSync {
-			if err := unix.Msync(df.data, unix.MS_SYNC); err != nil && first == nil {
+			if err := s.flushDirtyErr(df); err != nil && first == nil {
 				first = err
 			}
 		}
+		df.clearDirty()
 		if err := unix.Munmap(df.data); err != nil && first == nil {
 			first = err
 		}
 		df.data = nil
 	}
 	s.files = nil
-	s.mapped = nil
+	s.mappedMRU, s.mappedLRU, s.mappedLen = nil, nil, 0
 	return first
 }
 
-// msync flushes [from,to) of df, aligning the start down to a page boundary. A
-// no-op if df is currently unmapped (e.g. evicted after a batched commit, in
-// which case eviction already flushed it).
-func (s *store) msync(df *dataFile, from, to int) {
-	if df.data == nil {
-		return
-	}
+// msyncRange msyncs [from,to) of an already-mapped df, page-aligning the start,
+// and returns the error. Callers reach it through flushDirty/flushDirtyErr.
+func (s *store) msyncRange(df *dataFile, from, to int) error {
 	start := from - from%int(s.pageSize)
 	if start < 0 {
 		start = 0
 	}
-	_ = unix.Msync(df.data[start:to], unix.MS_SYNC)
+	return unix.Msync(df.data[start:to], unix.MS_SYNC)
+}
+
+// flushDirty msyncs df's dirty header and/or data range (each page-aligned) and
+// marks it clean, ignoring errors. No-op if df is unmapped or already clean —
+// that clean case is the "unmap/flush without sync" fast path: a file only read
+// (or already flushed) since its last sync has no dirty pages to write.
+func (s *store) flushDirty(df *dataFile) { _ = s.flushDirtyErr(df) }
+
+// flushDirtyErr is flushDirty returning the first msync error (for sync/close).
+// The header (page 0) and the dirty data range are flushed independently, so the
+// clean record pages between them are never scanned.
+func (s *store) flushDirtyErr(df *dataFile) error {
+	if df.data == nil {
+		return nil
+	}
+	if df.headerDirty {
+		if err := s.msyncRange(df, 0, headerSize); err != nil {
+			return err
+		}
+		df.headerDirty = false
+	}
+	if df.dirtyLo < df.dirtyHi {
+		if err := s.msyncRange(df, df.dirtyLo, df.dirtyHi); err != nil {
+			return err
+		}
+		df.dirtyLo, df.dirtyHi = 0, 0
+	}
+	return nil
 }
 
 func uvarintLen(x uint64) int {

@@ -655,8 +655,8 @@ func TestStoreLazyMappingBounded(t *testing.T) {
 	if got := countDataFiles(t, dir); got < 10 {
 		t.Fatalf("expected many segments, got %d", got)
 	}
-	if len(s.mapped) > 2 {
-		t.Fatalf("after writes %d segments mapped, cap is 2", len(s.mapped))
+	if s.mappedLen > 2 {
+		t.Fatalf("after writes %d segments mapped, cap is 2", s.mappedLen)
 	}
 
 	for i := 0; i < n; i++ {
@@ -665,8 +665,8 @@ func TestStoreLazyMappingBounded(t *testing.T) {
 			t.Fatalf("read %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
 		}
 		s.commitTo(off)
-		if len(s.mapped) > 2 {
-			t.Fatalf("during read %d: %d segments mapped, cap is 2", i, len(s.mapped))
+		if s.mappedLen > 2 {
+			t.Fatalf("during read %d: %d segments mapped, cap is 2", i, s.mappedLen)
 		}
 	}
 	if !s.empty() {
