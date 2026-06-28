@@ -1,4 +1,4 @@
-package wal
+package diskqueue
 
 import (
 	"encoding/binary"
@@ -15,7 +15,7 @@ import (
 func newTestStore(t *testing.T, segmentSize int64, maxSegments int) (*store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := openStore(dir, segmentSize, maxSegments, true)
+	s, err := openStore(dir, segmentSize, maxSegments, true, 0, 0, false)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -46,7 +46,7 @@ func readFileHeader(t *testing.T, dir string, num uint64) (commit, write, writte
 		t.Fatalf("short header: %d bytes", len(b))
 	}
 	g := func(i int) int64 { return int64(binary.LittleEndian.Uint64(b[i:])) }
-	return g(0), g(8), g(16), g(24)
+	return g(8), g(16), g(24), g(32) // commit, write, written, committed (after the 8-byte magic)
 }
 
 func TestStoreAppendReadCommit(t *testing.T) {
@@ -69,13 +69,13 @@ func TestStoreAppendReadCommit(t *testing.T) {
 	// takeHead reads in order and advances the head, but does not commit.
 	var last int64
 	for i := 0; i < 3; i++ {
-		p, off, ok := s.takeHead()
+		p, off, ok, _ := s.takeHead()
 		if !ok || recIdx(p) != i {
 			t.Fatalf("takeHead %d: idx=%d ok=%v", i, recIdx(p), ok)
 		}
 		last = off
 	}
-	if _, _, ok := s.takeHead(); ok {
+	if _, _, ok, _ := s.takeHead(); ok {
 		t.Fatal("takeHead past the tail should report empty")
 	}
 	if !s.empty() {
@@ -102,7 +102,7 @@ func TestStorePartialCommit(t *testing.T) {
 		mustAppend(t, s, idxRec(i))
 	}
 	for i := range offs {
-		_, off, ok := s.takeHead()
+		_, off, ok, _ := s.takeHead()
 		if !ok {
 			t.Fatalf("takeHead %d not ok", i)
 		}
@@ -113,9 +113,9 @@ func TestStorePartialCommit(t *testing.T) {
 	if got := s.count(); got != 3 {
 		t.Fatalf("count = %d, want 3", got)
 	}
-	// size = uncommitted bytes = records 2,3,4 = 3 * (uvarint(2)+2) = 9.
-	if got := s.size(); got != 9 {
-		t.Fatalf("size = %d, want 9", got)
+	// size = uncommitted bytes = records 2,3,4 = 3 * (uvarint(2)+2+checksum).
+	if want := int64(3 * (3 + checksumSize)); s.size() != want {
+		t.Fatalf("size = %d, want %d", s.size(), want)
 	}
 	// Committing an earlier offset is a no-op.
 	s.commitTo(offs[0])
@@ -125,7 +125,7 @@ func TestStorePartialCommit(t *testing.T) {
 }
 
 func TestStoreCycleAndOrder(t *testing.T) {
-	s, dir := newTestStore(t, 64, 0) // ~21 three-byte records per segment
+	s, dir := newTestStore(t, 64, 0) // ~5 eleven-byte records per segment
 	const n = 200
 	for i := 0; i < n; i++ {
 		mustAppend(t, s, idxRec(i))
@@ -134,7 +134,7 @@ func TestStoreCycleAndOrder(t *testing.T) {
 		t.Fatalf("expected multiple segments, got %d", got)
 	}
 	for i := 0; i < n; i++ {
-		p, off, ok := s.takeHead()
+		p, off, ok, _ := s.takeHead()
 		if !ok || recIdx(p) != i {
 			t.Fatalf("record %d: idx=%d ok=%v (spans files)", i, recIdx(p), ok)
 		}
@@ -145,7 +145,7 @@ func TestStoreCycleAndOrder(t *testing.T) {
 	}
 }
 
-func TestStoreReadsNeverDeleteWritesDrop(t *testing.T) {
+func TestStoreCommitsReclaimFiles(t *testing.T) {
 	s, dir := newTestStore(t, 64, 0)
 	const n = 200
 	for i := 0; i < n; i++ {
@@ -156,25 +156,29 @@ func TestStoreReadsNeverDeleteWritesDrop(t *testing.T) {
 		t.Fatalf("expected several segments, got %d", peak)
 	}
 
-	// Drain and commit everything via reads — this must not delete any file.
+	// Draining and committing via reads reclaims fully-committed files as they
+	// empty — no append required — leaving only the active (write) segment.
 	for i := 0; i < n; i++ {
-		_, off, ok := s.takeHead()
+		_, off, ok, _ := s.takeHead()
 		if !ok {
 			t.Fatalf("takeHead %d not ok", i)
 		}
 		s.commitTo(off)
 	}
-	if got := countDataFiles(t, dir); got != peak {
-		t.Fatalf("reads/commits deleted files: %d != %d", got, peak)
+	if !s.empty() {
+		t.Fatal("should be empty after reading all")
+	}
+	if got := countDataFiles(t, dir); got != 1 {
+		t.Fatalf("commits did not reclaim to the active file: %d files left (peak %d)", got, peak)
 	}
 
-	// A write cycles and reclaims the fully-committed files.
-	for i := 0; i < 100; i++ {
-		mustAppend(t, s, idxRec(i))
+	// The surviving active file still accepts appends and stays correct.
+	mustAppend(t, s, idxRec(999))
+	p, off, ok, _ := s.takeHead()
+	if !ok || recIdx(p) != 999 {
+		t.Fatalf("post-reclaim append/read: idx=%d ok=%v", recIdx(p), ok)
 	}
-	if got := countDataFiles(t, dir); got >= peak {
-		t.Fatalf("expected files dropped on cycle, got %d (peak %d)", got, peak)
-	}
+	s.commitTo(off)
 }
 
 func TestStoreMaxSegments(t *testing.T) {
@@ -200,7 +204,7 @@ func TestStoreMaxSegments(t *testing.T) {
 	}
 	// Draining and committing frees segments; appends resume.
 	for {
-		_, off, ok := s.takeHead()
+		_, off, ok, _ := s.takeHead()
 		if !ok {
 			break
 		}
@@ -216,25 +220,26 @@ func TestStoreRecordTooLarge(t *testing.T) {
 	if err := s.append(make([]byte, 64)); !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("expected ErrRecordTooLarge, got %v", err)
 	}
-	if err := s.append(make([]byte, 60)); err != nil { // uvarint(60)=1 byte, 61 <= 64
-		t.Fatalf("60-byte record should fit: %v", err)
+	if err := s.append(make([]byte, 50)); err != nil { // 1 + 50 + 8 checksum = 59 <= 64
+		t.Fatalf("50-byte record should fit: %v", err)
 	}
 }
 
 func TestStoreHeaderOnDisk(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, true)
+	s, err := openStore(dir, 4096, 0, true, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.close()
 
+	const recSize = 3 + checksumSize // uvarint(2)=1 + 2 payload + 8 checksum
 	for i := 0; i < 5; i++ {
-		mustAppend(t, s, idxRec(i)) // 3 bytes each
+		mustAppend(t, s, idxRec(i))
 	}
 	// Commit the first two records.
-	_, _, _ = s.takeHead()
-	_, off2, _ := s.takeHead()
+	_, _, _, _ = s.takeHead()
+	_, off2, _, _ := s.takeHead()
 	s.commitTo(off2)
 
 	commit, write, written, committed := readFileHeader(t, dir, 1)
@@ -244,17 +249,17 @@ func TestStoreHeaderOnDisk(t *testing.T) {
 	if committed != 2 {
 		t.Errorf("committed count on disk = %d, want 2", committed)
 	}
-	if write != headerSize+5*3 {
-		t.Errorf("write cursor = %d, want %d", write, headerSize+5*3)
+	if write != headerSize+5*recSize {
+		t.Errorf("write cursor = %d, want %d", write, headerSize+5*recSize)
 	}
-	if commit != headerSize+2*3 {
-		t.Errorf("commit cursor = %d, want %d", commit, headerSize+2*3)
+	if commit != headerSize+2*recSize {
+		t.Errorf("commit cursor = %d, want %d", commit, headerSize+2*recSize)
 	}
 }
 
 func TestStoreRecovery(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 64, 0, true)
+	s, err := openStore(dir, 64, 0, true, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +269,7 @@ func TestStoreRecovery(t *testing.T) {
 	}
 	// Commit the first 20.
 	for i := 0; i < 20; i++ {
-		_, off, ok := s.takeHead()
+		_, off, ok, _ := s.takeHead()
 		if !ok {
 			t.Fatalf("take %d not ok", i)
 		}
@@ -276,7 +281,7 @@ func TestStoreRecovery(t *testing.T) {
 
 	// Reopen: counts come from the header (no record scan), the read cursor is
 	// reset to the commit cursor, and the remaining records replay in order.
-	s2, err := openStore(dir, 64, 0, true)
+	s2, err := openStore(dir, 64, 0, true, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +290,7 @@ func TestStoreRecovery(t *testing.T) {
 		t.Fatalf("recovered count = %d, want %d", got, n-20)
 	}
 	for i := 20; i < n; i++ {
-		p, off, ok := s2.takeHead()
+		p, off, ok, _ := s2.takeHead()
 		if !ok || recIdx(p) != i {
 			t.Fatalf("after reopen record %d: idx=%d ok=%v", i, recIdx(p), ok)
 		}
@@ -298,20 +303,20 @@ func TestStoreRecovery(t *testing.T) {
 
 func TestStoreReopenFullyDrained(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, true)
+	s, err := openStore(dir, 4096, 0, true, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 10; i++ {
 		mustAppend(t, s, idxRec(i))
-		_, off, _ := s.takeHead()
+		_, off, _, _ := s.takeHead()
 		s.commitTo(off)
 	}
 	if err := s.close(); err != nil {
 		t.Fatal(err)
 	}
 
-	s2, err := openStore(dir, 4096, 0, true)
+	s2, err := openStore(dir, 4096, 0, true, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -350,7 +355,7 @@ func checkPayload(t *testing.T, got []byte, length int, fill byte) {
 func runStoreProgram(t *testing.T, segSize int64, maxSeg int, prog []byte) {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := openStore(dir, segSize, maxSeg, true)
+	s, err := openStore(dir, segSize, maxSeg, true, 0, 0, false)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -371,7 +376,7 @@ func runStoreProgram(t *testing.T, segSize int64, maxSeg int, prog []byte) {
 		reads  []readEnt
 		ubytes int64 // uncommitted encoded bytes (== store.size())
 	)
-	enc := func(n int) int64 { return int64(uvarintLen(uint64(n)) + n) }
+	enc := func(n int) int64 { return int64(uvarintLen(uint64(n)) + n + checksumSize) }
 
 	check := func() {
 		if got, want := s.count(), int64(len(recs)-commit); got != want {
@@ -410,7 +415,7 @@ func runStoreProgram(t *testing.T, segSize int64, maxSeg int, prog []byte) {
 				t.Fatalf("append: %v", err)
 			}
 		case b < 176: // reserve: read without committing (≈19%)
-			p, off, ok := s.takeHead()
+			p, off, ok, _ := s.takeHead()
 			if ok {
 				if head >= len(recs) {
 					t.Fatalf("takeHead returned data but model head=%d recs=%d", head, len(recs))
@@ -436,7 +441,7 @@ func runStoreProgram(t *testing.T, segSize int64, maxSeg int, prog []byte) {
 			if err := s.close(); err != nil {
 				t.Fatalf("close: %v", err)
 			}
-			ns, nerr := openStore(dir, segSize, maxSeg, true)
+			ns, nerr := openStore(dir, segSize, maxSeg, true, 0, 0, false)
 			if nerr != nil {
 				t.Fatalf("reopen: %v", nerr)
 			}
@@ -449,7 +454,7 @@ func runStoreProgram(t *testing.T, segSize int64, maxSeg int, prog []byte) {
 
 	// Drain whatever remains, verifying order and payloads.
 	for head < len(recs) {
-		p, off, ok := s.takeHead()
+		p, off, ok, _ := s.takeHead()
 		if !ok {
 			t.Fatalf("drain: expected record at head=%d", head)
 		}
@@ -516,7 +521,7 @@ func TestStoreCorruptLengthNoPanic(t *testing.T) {
 		s.files[0].data[headerSize+i] = 0xFF
 	}
 
-	if _, _, ok := s.read(0); ok {
+	if _, _, _, ok, _ := s.read(0); ok {
 		t.Fatal("corrupt record should not decode ok")
 	}
 	// A commit walking the corrupt record must also stop cleanly, not panic.
@@ -528,7 +533,7 @@ func TestStoreCorruptLengthNoPanic(t *testing.T) {
 // flush and directory sync), then reopens to confirm the batch is durable.
 func TestStoreBatchedCommitAcrossSegments(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 16, 0, false) // tiny segments, sync enabled
+	s, err := openStore(dir, 16, 0, false, 0, 0, false) // tiny segments, sync enabled
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -547,7 +552,7 @@ func TestStoreBatchedCommitAcrossSegments(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	s2, err := openStore(dir, 16, 0, false)
+	s2, err := openStore(dir, 16, 0, false, 0, 0, false)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -557,5 +562,246 @@ func TestStoreBatchedCommitAcrossSegments(t *testing.T) {
 	}
 	if !s2.empty() {
 		t.Fatal("store should be empty after reopen")
+	}
+}
+
+// TestStoreChecksumDetectsCorruption flips a payload byte in the mapping and
+// verifies the read fails with ErrCorrupt without advancing the head cursor.
+func TestStoreChecksumDetectsCorruption(t *testing.T) {
+	s, _ := newTestStore(t, 4096, 0)
+	mustAppend(t, s, idxRec(0))
+	mustAppend(t, s, idxRec(1))
+
+	// Corrupt the first record's payload (just past its 1-byte length prefix).
+	s.files[0].data[headerSize+1] ^= 0xFF
+
+	if _, _, _, err := s.takeHead(); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("takeHead on corrupt record: err=%v, want ErrCorrupt", err)
+	}
+	if s.headOff != 0 {
+		t.Fatalf("head advanced past corrupt record: headOff=%d, want 0", s.headOff)
+	}
+	// Repairing the byte lets the read succeed again — proof it was the checksum.
+	s.files[0].data[headerSize+1] ^= 0xFF
+	p, _, ok, err := s.takeHead()
+	if err != nil || !ok || recIdx(p) != 0 {
+		t.Fatalf("after repair: idx=%d ok=%v err=%v", recIdx(p), ok, err)
+	}
+}
+
+// TestStoreHeaderChecksumDetected corrupts a header field on disk and verifies
+// that reopening fails with ErrCorrupt rather than trusting a bad cursor.
+func TestStoreHeaderChecksumDetected(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, s, idxRec(0))
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "data.00000001")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[16] ^= 0xFF // flip a write-cursor byte, leaving magic/version intact
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openStore(dir, 4096, 0, false, 0, 0, false); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("reopen with corrupt header: got %v, want ErrCorrupt", err)
+	}
+}
+
+// TestStoreBadFormatRejected verifies that a file with the wrong magic is
+// rejected with ErrBadFormat (and that magic is checked before the checksum).
+func TestStoreBadFormatRejected(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, s, idxRec(0))
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "data.00000001")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[0] ^= 0xFF // corrupt the magic
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openStore(dir, 4096, 0, false, 0, 0, false); !errors.Is(err, ErrBadFormat) {
+		t.Fatalf("reopen with bad magic: got %v, want ErrBadFormat", err)
+	}
+}
+
+// TestStoreLazyMappingBounded checks that with MaxMapped set, a deep backlog
+// keeps at most that many segments mapped while every record stays readable in
+// order (old segments are remapped on demand).
+func TestStoreLazyMappingBounded(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 64, 0, true, 0, 2, false) // tiny segments, cap 2 mappings
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.close() })
+
+	const n = 500
+	for i := 0; i < n; i++ {
+		mustAppend(t, s, idxRec(i))
+	}
+	if got := countDataFiles(t, dir); got < 10 {
+		t.Fatalf("expected many segments, got %d", got)
+	}
+	if s.mappedLen > 2 {
+		t.Fatalf("after writes %d segments mapped, cap is 2", s.mappedLen)
+	}
+
+	for i := 0; i < n; i++ {
+		p, off, ok, err := s.takeHead()
+		if err != nil || !ok || recIdx(p) != i {
+			t.Fatalf("read %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
+		}
+		s.commitTo(off)
+		if s.mappedLen > 2 {
+			t.Fatalf("during read %d: %d segments mapped, cap is 2", i, s.mappedLen)
+		}
+	}
+	if !s.empty() {
+		t.Fatal("should be drained")
+	}
+}
+
+// highestDataFileNum returns the largest data.* segment number in dir.
+func highestDataFileNum(t *testing.T, dir string) uint64 {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, "data.*"))
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("glob: %v (n=%d)", err, len(paths))
+	}
+	var max uint64
+	for _, p := range paths {
+		var n uint64
+		if _, err := fmt.Sscanf(filepath.Base(p), "data.%08d", &n); err == nil && n > max {
+			max = n
+		}
+	}
+	return max
+}
+
+// TestStoreRecoverTornTail corrupts the highest segment's header and verifies
+// that, with recovery, the open drops it instead of failing and the earlier
+// segments stay readable in order.
+func TestStoreRecoverTornTail(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 64, 0, false, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 50
+	for i := 0; i < n; i++ {
+		mustAppend(t, s, idxRec(i))
+	}
+	if countDataFiles(t, dir) < 3 {
+		t.Fatal("need several segments")
+	}
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+
+	last := highestDataFileNum(t, dir)
+	path := filepath.Join(dir, fmt.Sprintf("data.%08d", last))
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[16] ^= 0xFF // corrupt the write-cursor byte of the tail header
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Strict open fails.
+	if _, err := openStore(dir, 64, 0, false, 0, 0, false); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("strict reopen: %v, want ErrCorrupt", err)
+	}
+	// Recovering open drops the torn tail and reports it.
+	s2, err := openStore(dir, 64, 0, false, 0, 0, true)
+	if err != nil {
+		t.Fatalf("recovering reopen: %v", err)
+	}
+	t.Cleanup(func() { s2.close() })
+	if got := s2.corruptionCount(); got != 1 {
+		t.Fatalf("corruptions=%d, want 1", got)
+	}
+	prev := -1
+	for {
+		p, off, ok, err := s2.takeHead()
+		if err != nil {
+			t.Fatalf("read after recovery: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if recIdx(p) <= prev {
+			t.Fatalf("out of order: %d after %d", recIdx(p), prev)
+		}
+		prev = recIdx(p)
+		s2.commitTo(off)
+	}
+	if prev < 0 {
+		t.Fatal("expected earlier segments to survive")
+	}
+}
+
+// TestStoreRecoverSkipsCorruptSegment corrupts a record in an early segment and
+// verifies that, with recovery, the reader quarantines that segment's remainder
+// and continues delivering later records in order (last record still arrives).
+func TestStoreRecoverSkipsCorruptSegment(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 128, 0, false, 0, 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.close() })
+	const n = 60
+	for i := 0; i < n; i++ {
+		mustAppend(t, s, idxRec(i))
+	}
+	// Corrupt a record's bytes inside the first segment (records after the first).
+	s.files[0].data[headerSize+20] ^= 0xFF
+
+	delivered := 0
+	prev := -1
+	var last int
+	for {
+		p, off, ok, err := s.takeHead()
+		if err != nil {
+			t.Fatalf("read with recovery returned error: %v", err)
+		}
+		if !ok {
+			break
+		}
+		if recIdx(p) <= prev {
+			t.Fatalf("out of order: %d after %d", recIdx(p), prev)
+		}
+		prev = recIdx(p)
+		last = recIdx(p)
+		delivered++
+		s.commitTo(off)
+	}
+	if s.corruptionCount() < 1 {
+		t.Fatal("expected at least one quarantined segment")
+	}
+	if delivered >= n {
+		t.Fatalf("expected some records dropped, delivered=%d of %d", delivered, n)
+	}
+	if last != n-1 {
+		t.Fatalf("last delivered=%d, want %d (later segments must survive)", last, n-1)
 	}
 }

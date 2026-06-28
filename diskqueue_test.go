@@ -1,4 +1,4 @@
-package wal
+package diskqueue
 
 import (
 	"context"
@@ -26,9 +26,12 @@ func unmarshalU64(data []byte) (uint64, error) {
 	return binary.LittleEndian.Uint64(data), nil
 }
 
-func openTest(t *testing.T, maxSegments int) (*WAL[uint64], *Reader[uint64]) {
+func openTest(t *testing.T, maxSegments int) (*DiskQueue[uint64], *Reader[uint64]) {
 	t.Helper()
-	w, err := New[uint64](t.TempDir(), maxSegments, marshalU64, unmarshalU64)
+	if maxSegments == 0 {
+		maxSegments = -1 // these tests pass 0 for "unbounded" (now a negative value)
+	}
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{MaxSegments: maxSegments})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -257,7 +260,7 @@ func TestBlockingReserveThenCommit(t *testing.T) {
 }
 
 func TestSync(t *testing.T) {
-	w, err := New[uint64](t.TempDir(), 0, marshalU64, unmarshalU64, Options{NoSync: true})
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{NoSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -274,7 +277,7 @@ func TestSync(t *testing.T) {
 // segment cycling and the dropping of fully-committed segments under steady
 // state.
 func TestChurn(t *testing.T) {
-	w, err := New[uint64](t.TempDir(), 0, marshalU64, unmarshalU64, Options{NoSync: true, SegmentSize: 4096})
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{NoSync: true, SegmentSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,12 +308,13 @@ func TestSizeAndCount(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Each uint64 entry is a 1-byte uvarint length prefix plus 8 payload bytes.
+	// Each uint64 entry is a 1-byte uvarint length prefix, 8 payload bytes, and an
+	// 8-byte checksum trailer.
 	if got := w.Count(); got != 5 {
 		t.Fatalf("count after adds = %d, want 5", got)
 	}
-	if got := w.Size(); got != 5*9 {
-		t.Fatalf("size after adds = %d, want %d", got, 5*9)
+	if want := int64(5 * (9 + checksumSize)); w.Size() != want {
+		t.Fatalf("size after adds = %d, want %d", w.Size(), want)
 	}
 	// Consuming every item drops both Count and Size to zero, regardless of when
 	// the disk space is actually reclaimed.
@@ -344,11 +348,11 @@ func countDataFiles(t *testing.T, dir string) int {
 	return n
 }
 
-// TestReopenMultiFile exercises WAL-level recovery when the commit cursor lands
+// TestReopenMultiFile exercises DiskQueue-level recovery when the commit cursor lands
 // inside a later segment (earlier ones fully consumed) and several files exist.
 func TestReopenMultiFile(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	w, err := New[uint64](dir, marshalU64, unmarshalU64, Options{SegmentSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +376,7 @@ func TestReopenMultiFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w2, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64, Options{SegmentSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +397,7 @@ func TestReopenMultiFile(t *testing.T) {
 }
 
 func TestRecordTooLarge(t *testing.T) {
-	w, err := New[[]byte](t.TempDir(), 0,
+	w, err := New[[]byte](t.TempDir(),
 		func(dst []byte, v []byte) ([]byte, error) { return append(dst, v...), nil },
 		func(data []byte) ([]byte, error) { return data, nil },
 		Options{NoSync: true, SegmentSize: 4096})
@@ -422,8 +426,8 @@ func TestContextCancel(t *testing.T) {
 
 func TestFull(t *testing.T) {
 	// At most 2 small segments may be live at once.
-	w, err := New[uint64](t.TempDir(), 2, marshalU64, unmarshalU64,
-		Options{NoSync: true, SegmentSize: 4096})
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64,
+		Options{MaxSegments: 2, NoSync: true, SegmentSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +466,7 @@ func TestFull(t *testing.T) {
 
 func TestPersistence(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New[uint64](dir, 0, marshalU64, unmarshalU64)
+	w, err := New[uint64](dir, marshalU64, unmarshalU64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -483,7 +487,7 @@ func TestPersistence(t *testing.T) {
 	}
 
 	// Reopen: committed items are gone, the rest replay in order.
-	w2, err := New[uint64](dir, 0, marshalU64, unmarshalU64)
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +536,7 @@ func TestZeroAlloc(t *testing.T) {
 }
 
 func BenchmarkAddTake(b *testing.B) {
-	w, err := New[uint64](b.TempDir(), 0, marshalU64, unmarshalU64, Options{NoSync: true})
+	w, err := New[uint64](b.TempDir(), marshalU64, unmarshalU64, Options{NoSync: true})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -546,13 +550,49 @@ func BenchmarkAddTake(b *testing.B) {
 	}
 }
 
-// TestStressConcurrent runs several producers and consumers against one WAL and
-// checks every value is delivered exactly once (and the WAL stays race-free).
+// TestAddTakeZeroAlloc guards the alloc-free hot path in the regular test suite
+// (not just the benchmark): the header()/setter-returns-a-closure pattern is only
+// zero-alloc because escape analysis stack-allocates those closures, so a compiler
+// or refactor regression that starts heap-allocating per Add/Take is caught here.
+func TestAddTakeZeroAlloc(t *testing.T) {
+	// Default 8 MiB segment so 1000 iterations never cycle a file (which would
+	// allocate a dataFile + mapping and is amortized away in the benchmark).
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{NoSync: true, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	r := w.NewReader()
+	for i := uint64(0); i < 100; i++ { // warm up scratch buffers and the active mapping
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := r.TryTake(); err != nil || !ok {
+			t.Fatalf("warmup take: ok=%v err=%v", ok, err)
+		}
+	}
+	var i uint64
+	allocs := testing.AllocsPerRun(1000, func() {
+		if err := w.Add(i); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		if _, ok, err := r.TryTake(); err != nil || !ok {
+			t.Fatalf("TryTake: ok=%v err=%v", ok, err)
+		}
+		i++
+	})
+	if allocs != 0 {
+		t.Fatalf("Add+TryTake allocated %v objects/op, want 0", allocs)
+	}
+}
+
+// TestStressConcurrent runs several producers and consumers against one DiskQueue and
+// checks every value is delivered exactly once (and the DiskQueue stays race-free).
 func TestStressConcurrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short mode")
 	}
-	w, err := New[uint64](t.TempDir(), 0, marshalU64, unmarshalU64, Options{NoSync: true})
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{NoSync: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +669,7 @@ func TestStressConcurrentReserveCommit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short mode")
 	}
-	w, err := New[uint64](t.TempDir(), 0, marshalU64, unmarshalU64,
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64,
 		Options{NoSync: true, SegmentSize: 8192})
 	if err != nil {
 		t.Fatal(err)
@@ -683,7 +723,7 @@ func TestStressConcurrentReserveCommit(t *testing.T) {
 // SegmentSize is rejected instead of truncating and discarding records.
 func TestSegmentSizeMismatch(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 8192})
+	w, err := New[uint64](dir, marshalU64, unmarshalU64, Options{SegmentSize: 8192})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -697,12 +737,12 @@ func TestSegmentSizeMismatch(t *testing.T) {
 	}
 
 	// Reopening with a different size must fail loudly, not corrupt the files.
-	if _, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 16384}); !errors.Is(err, ErrSegmentSizeMismatch) {
+	if _, err := New[uint64](dir, marshalU64, unmarshalU64, Options{SegmentSize: 16384}); !errors.Is(err, ErrSegmentSizeMismatch) {
 		t.Fatalf("reopen with wrong size: got %v, want ErrSegmentSizeMismatch", err)
 	}
 
 	// Reopening with the original size still works and preserves the data.
-	w2, err := New[uint64](dir, 0, marshalU64, unmarshalU64, Options{SegmentSize: 8192})
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64, Options{SegmentSize: 8192})
 	if err != nil {
 		t.Fatalf("reopen with original size: %v", err)
 	}
@@ -717,7 +757,7 @@ func TestSegmentSizeMismatch(t *testing.T) {
 }
 
 // TestConcurrentDrainCooperates verifies that two Drain iterations running
-// concurrently on the same WAL split the stream without loss or duplication —
+// concurrently on the same DiskQueue split the stream without loss or duplication —
 // safe now that Drain commits each item under the lock as it is read.
 func TestConcurrentDrainCooperates(t *testing.T) {
 	w, _ := openTest(t, 0)
@@ -779,5 +819,90 @@ func TestDrainCommitsBeforeYield(t *testing.T) {
 	}
 	if v != 1 {
 		t.Fatalf("after break-on-0 the next item is %d, want 1 (item 0 was committed)", v)
+	}
+}
+
+// TestSyncEveryBatchedDurable exercises the batched sync policy: records written
+// with SyncEvery>1 must survive a clean Close+reopen and stay in order.
+func TestSyncEveryBatchedDurable(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New[uint64](dir, marshalU64, unmarshalU64,
+		Options{SyncEvery: 64, SegmentSize: 4096}) // many records per flush, several segments
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 5000
+	for i := uint64(0); i < n; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := w.NewReader()
+	for i := uint64(0); i < 2000; i++ { // consume+commit some, leaving a remainder
+		if _, ok, err := r.TryTake(); err != nil || !ok {
+			t.Fatalf("take %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if err := w.Close(); err != nil { // Close must flush the pending batch
+		t.Fatal(err)
+	}
+
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64,
+		Options{SyncEvery: 64, SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if got := w2.Count(); got != n-2000 {
+		t.Fatalf("after reopen Count=%d, want %d", got, n-2000)
+	}
+	r2 := w2.NewReader()
+	for want := uint64(2000); want < n; want++ {
+		v, ok, err := r2.TryTake()
+		if err != nil || !ok || v != want {
+			t.Fatalf("after reopen: v=%d ok=%v err=%v want=%d", v, ok, err, want)
+		}
+	}
+	if !w2.Empty() {
+		t.Fatal("should be drained")
+	}
+}
+
+// TestSyncIntervalFlushes verifies that the background syncer durably persists
+// batched writes within the interval, and that Close stops it cleanly.
+func TestSyncIntervalFlushes(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New[uint64](dir, marshalU64, unmarshalU64,
+		Options{SyncEvery: 1 << 20, SyncInterval: 20 * time.Millisecond}) // batch huge; rely on the timer
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(0); i < 100; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Wait for the background syncer to flush (no explicit Sync/Close yet).
+	time.Sleep(80 * time.Millisecond)
+
+	// The unsynced counter should have been reset by a timer-driven flush.
+	w.mu.Lock()
+	unsynced := w.st.unsynced
+	w.mu.Unlock()
+	if unsynced != 0 {
+		t.Fatalf("background syncer did not flush: unsynced=%d", unsynced)
+	}
+	if err := w.Close(); err != nil { // must stop the goroutine and not hang
+		t.Fatal(err)
+	}
+
+	// Data is intact on reopen.
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if got := w2.Count(); got != 100 {
+		t.Fatalf("after reopen Count=%d, want 100", got)
 	}
 }
