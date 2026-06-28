@@ -84,11 +84,11 @@ func (df *dataFile) clearDirty() { df.headerDirty, df.dirtyLo, df.dirtyHi = fals
 // reserved, [56:64] xxhash64 of [0:56]. The checksum is rewritten on every header
 // update so torn/rotten headers are caught on open.
 func (df *dataFile) magic() uint64         { return binary.LittleEndian.Uint64(df.data[0:8]) }
-func (df *dataFile) version() byte          { return df.data[40] }
-func (df *dataFile) commitCursor() int64    { return int64(binary.LittleEndian.Uint64(df.data[8:16])) }
-func (df *dataFile) writeCursor() int64     { return int64(binary.LittleEndian.Uint64(df.data[16:24])) }
-func (df *dataFile) writtenCount() int64    { return int64(binary.LittleEndian.Uint64(df.data[24:32])) }
-func (df *dataFile) committedCount() int64  { return int64(binary.LittleEndian.Uint64(df.data[32:40])) }
+func (df *dataFile) version() byte         { return df.data[40] }
+func (df *dataFile) commitCursor() int64   { return int64(binary.LittleEndian.Uint64(df.data[8:16])) }
+func (df *dataFile) writeCursor() int64    { return int64(binary.LittleEndian.Uint64(df.data[16:24])) }
+func (df *dataFile) writtenCount() int64   { return int64(binary.LittleEndian.Uint64(df.data[24:32])) }
+func (df *dataFile) committedCount() int64 { return int64(binary.LittleEndian.Uint64(df.data[32:40])) }
 
 // The setters return a header modifier (a func(*dataFile)) rather than writing
 // in place, so they compose as arguments to header(), which applies them and

@@ -27,7 +27,7 @@ BenchmarkAddTake-22    36 ns/op    0 B/op    0 allocs/op   (NoSync)
 ## Storage layout
 
 The log lives in a directory of numbered files `data.00000001`, `data.00000002`,
-… each `SegmentSize` bytes, at most `maxSegments` of them at once. Each file
+… each `SegmentSize` bytes, at most `MaxSegments` of them at once. Each file
 begins with a 64-byte header — a magic number, a format version, the commit
 cursor (persisted read position), write cursor (data end), written and committed
 record counts, and an `xxhash64` over the header itself — followed by records,
@@ -78,8 +78,8 @@ func unmarshal(data []byte) (uint64, error) {
 }
 
 func main() {
-	// Keep at most 8 segment files on disk.
-	w, err := wal.New[uint64]("/tmp/myqueue", 8, marshal, unmarshal)
+	// Keep at most 8 segment files on disk (default is 32).
+	w, err := wal.New[uint64]("/tmp/myqueue", marshal, unmarshal, wal.Options{MaxSegments: 8})
 	if err != nil {
 		panic(err)
 	}
@@ -162,8 +162,8 @@ processing (at-least-once), use `Reserve`/`Commit`.
 
 | Method | Description |
 | --- | --- |
-| `New[T](path, maxSegments, marshal, unmarshal, ...Options)` | Open/create a WAL at `path`. |
-| `Add(v T) error` | Append an item. Returns `ErrFull` at `maxSegments`, `ErrRecordTooLarge` if it can't fit a segment. |
+| `New[T](path, marshal, unmarshal, ...Options)` | Open/create a WAL at `path` (segment cap via `Options.MaxSegments`, default 32). |
+| `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments`, `ErrRecordTooLarge` if it can't fit a segment. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
 | `Empty() bool` | Whether anything is available to read. |
 | `Count() int` | Number of items added but not yet committed. |
@@ -188,12 +188,12 @@ processing (at-least-once), use `Reserve`/`Commit`.
 - **Offsets.** `Reserve`/`TryReserve` return a monotonically increasing offset.
   Pass it to `Commit` to acknowledge that record and everything before it. `Take`
   commits implicitly.
-- **`maxSegments` bounds the number of segment files** kept on disk at once, so
-  the footprint is about `maxSegments × SegmentSize`. When the active segment
-  fills and that many segments are already live, `Add` returns `ErrFull` until a
-  whole segment is committed and reclaimed. A record (length prefix plus payload)
-  too large to fit one segment is rejected with `ErrRecordTooLarge`. `maxSegments
-  <= 0` means unbounded.
+- **`Options.MaxSegments` bounds the number of segment files** kept on disk at
+  once, so the footprint is about `MaxSegments × SegmentSize`. When the active
+  segment fills and that many segments are already live, `Add` returns `ErrFull`
+  until a whole segment is committed and reclaimed. A record (length prefix plus
+  payload) too large to fit one segment is rejected with `ErrRecordTooLarge`. The
+  default (a zero value) is 32; a negative value means unbounded.
 - **At-least-once.** The read cursor is reset to the persisted commit cursor on
   open, so after a restart any items added but not committed are replayed. Use
   `Reserve`/`Commit` for explicit acknowledgement.
@@ -237,7 +237,8 @@ processing (at-least-once), use `Reserve`/`Commit`.
 ## Options
 
 ```go
-wal.New[T](path, maxSegments, marshal, unmarshal, wal.Options{
+wal.New[T](path, marshal, unmarshal, wal.Options{
+	MaxSegments:    0,    // 0 = 32 default; N>0 = cap live files (ErrFull); <0 = unbounded
 	NoSync:         true, // skip msync per write/commit (faster, no power-loss durability)
 	SyncEvery:      0,    // 0/1 = msync every op; N>1 = batch the fsync over N ops
 	SyncInterval:   0,    // >0 = background flush every interval (backstop for SyncEvery)

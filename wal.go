@@ -89,6 +89,12 @@ type Options struct {
 	// different (post-rounding) value is rejected with ErrSegmentSizeMismatch.
 	SegmentSize int64
 
+	// MaxSegments caps how many segment files are kept at once; once reached, Add
+	// returns ErrFull until a segment is committed and reclaimed. The footprint is
+	// about MaxSegments × SegmentSize bytes. 0 selects the default of 32; a
+	// negative value means unbounded.
+	MaxSegments int
+
 	// MaxMapped caps how many segment files are memory-mapped at once. Segments
 	// are mapped on demand and the least-recently-used are unmapped beyond the
 	// cap, bounding address space and msync work for deep backlogs; the active
@@ -134,17 +140,15 @@ type WAL[T any] struct {
 	syncDone chan struct{}
 }
 
-// New opens (creating if necessary) a WAL under the directory path.
-//
-// maxSegments caps how many segment files are kept at once; once reached, Add
-// returns ErrFull until a segment is committed and reclaimed. The footprint is
-// about maxSegments × SegmentSize bytes. A value <= 0 means unbounded.
-func New[T any](path string, maxSegments int, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*WAL[T], error) {
+// New opens (creating if necessary) a WAL under the directory path. The segment
+// count, durability, and recovery behaviour are tuned via Options (see
+// Options.MaxSegments for the file-count cap, which defaults to 32).
+func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*WAL[T], error) {
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	st, err := openStore(path, segmentCapacity(opt.SegmentSize), maxSegments, opt.NoSync, opt.SyncEvery, opt.MaxMapped, opt.RecoverCorrupt)
+	st, err := openStore(path, segmentCapacity(opt.SegmentSize), resolveMaxSegments(opt.MaxSegments), opt.NoSync, opt.SyncEvery, opt.MaxMapped, opt.RecoverCorrupt)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +159,24 @@ func New[T any](path string, maxSegments int, marshal MarshalFunc[T], unmarshal 
 		go w.syncLoop(opt.SyncInterval)
 	}
 	return w, nil
+}
+
+// defaultMaxSegments bounds the live file count when Options.MaxSegments is left
+// at its zero value: ~32 × SegmentSize of footprint by default.
+const defaultMaxSegments = 32
+
+// resolveMaxSegments maps Options.MaxSegments to the store's convention, where 0
+// means unbounded: the zero value selects defaultMaxSegments, a negative value
+// requests unbounded, and a positive value is used as-is.
+func resolveMaxSegments(v int) int {
+	switch {
+	case v == 0:
+		return defaultMaxSegments
+	case v < 0:
+		return 0
+	default:
+		return v
+	}
 }
 
 func segmentCapacity(size int64) int64 {
