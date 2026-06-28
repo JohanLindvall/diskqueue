@@ -7,10 +7,10 @@ Guidance for working in this repository.
 `github.com/JohanLindvall/diskqueue` — a generic, durable FIFO disk-backed queue
 (a persistent work queue that doubles as a write-ahead log) for Go. The public API
 and behaviour are documented in [README.md](README.md); read it first. Its only
-dependencies are `golang.org/x/sys` (mmap/msync) and `cespare/xxhash/v2`
-(per-record checksums); it ships its own mmap-backed store.
+dependency is `cespare/xxhash/v2` (per-record checksums); it ships its own file
+store using plain `pread`/`pwrite`/`fsync` (no mmap).
 
-- [store.go](store.go) — the `store`: the mmap-backed, `[]byte`-only file backend.
+- [store.go](store.go) — the `store`: the `[]byte`-only file backend (ReadAt/WriteAt).
 - [diskqueue.go](diskqueue.go) — the generic `DiskQueue[T]` writer/owner (Add, Empty/Count/Size,
   Sync/Close, NewReader) on top of `store`.
 - [reader.go](reader.go) — `Reader[T]`: all consume ops (Reserve/Take/Commit/
@@ -31,26 +31,30 @@ go test -cover ./...
 ## Storage model (store.go)
 
 A directory of numbered files `data.00000001`, … each `SegmentSize` bytes,
-preallocated, capped at `maxSegments` live files, and mmap'd **on demand** (LRU,
-capped by `maxMapped`; the active file stays mapped, the fd is closed right after
-mmap). 64-byte LE header: `[0:8]` magic, `[8:16]` commit cursor (next uncommitted
-record), `[16:24]` write cursor (data end), `[24:32]` written count, `[32:40]`
-committed count, `[40]` version, `[56:64]` xxhash64 of `[0:56]`; then records,
-each `uvarint(len) || payload || xxhash64(payload)` (8-byte LE checksum trailer,
-verified on read — mismatch → `ErrCorrupt`, cursor not advanced). The header is
-the single source of truth — recovery reads **no records at all**: `load` preads
-each 64-byte header (no mapping), validates magic/version (`ErrBadFormat`) and the
-header checksum (`ErrCorrupt`), and takes data end, resume point and `Count()`
-from it. The write cursor / written count (and the header checksum) are published
-*after* the record bytes so only fully-written records are visible.
+preallocated, capped at `maxSegments` live files, with handles opened **on demand**
+(LRU, capped by `maxMapped`; the active file stays open). 64-byte LE header:
+`[0:8]` magic, `[8:16]` commit cursor (next uncommitted record), `[16:24]` write
+cursor (data end), `[24:32]` written count, `[32:40]` committed count, `[40]`
+version, `[56:64]` xxhash64 of `[0:56]`; then records, each
+`uvarint(len) || payload || xxhash64(payload)` (8-byte LE checksum trailer,
+verified on read — mismatch → `ErrCorrupt`, cursor not advanced). Records are
+written with one `WriteAt` (framed in the reused `s.writeBuf`) and read with
+`ReadAt` into the reused `s.readBuf`. The header is the single source of truth —
+recovery reads **no records at all**: `load` preads each 64-byte header, validates
+magic/version (`ErrBadFormat`) and the header checksum (`ErrCorrupt`), and takes
+data end, resume point and `Count()` from it. The write cursor / written count
+(and the header checksum) are published *after* the record bytes (a separate
+`writeHeader` + `fsync`) so only fully-written records are visible.
 
-Every header mutation goes through `df.header(mods ...func(*dataFile))`, which
-applies the modifiers, rebuilds the checksum, and sets `headerDirty` — so the
-checksum and dirty flag can't be forgotten. The field setters (`setCommitCursor`,
-`setWriteCursor`, `setWrittenCount`, `setCommittedCount`) **return** a modifier
-rather than writing in place, so they compose as `header()` arguments; nothing
-touches the header bytes until `header()` invokes them. The closures stay
-stack-allocated (escape analysis), keeping the hot path zero-alloc.
+Each `dataFile` keeps its 64-byte header resident in memory (`df.hdr`); accessors
+read `df.hdr`, and `writeHeader` writes it to page 0 with `WriteAt`. Every header
+mutation goes through `df.header(mods ...func(*dataFile))`, which applies the
+modifiers and rebuilds the checksum — so the checksum can't be forgotten. The
+field setters (`setCommitCursor`, `setWriteCursor`, `setWrittenCount`,
+`setCommittedCount`) **return** a modifier rather than writing in place, so they
+compose as `header()` arguments; nothing touches the header bytes until `header()`
+invokes them. The closures stay stack-allocated (escape analysis), keeping the hot
+path zero-alloc.
 
 Three cursors, all global byte offsets into the logical stream (file `F` holds
 offsets `[F.base, F.base+F.size)`):
@@ -64,18 +68,20 @@ mirrors its own `written`/`committed` counts into its header.
 
 ## Non-obvious invariants — keep these intact
 
-- **Zero-alloc hot path.** `append` writes straight into the mmap; `Add`
-  serializes via the reused `w.scratch` and the append-style `MarshalFunc`.
-  `Reader.read` copies the mmap payload into the reused `r.scratch` (one memcpy,
-  no alloc once warm) before `unmarshal`. Don't add per-op heap allocations on Add
-  / read / commitTo. The benchmark guards this.
+- **Zero-alloc hot path.** `append` frames the record in the reused `s.writeBuf`
+  and `WriteAt`s it; `Add` serializes via the reused `w.scratch` and the
+  append-style `MarshalFunc`. `Reader.read` copies the payload (a slice of the
+  reused `s.readBuf`, filled by `ReadAt`) into the reused `r.scratch` (one memcpy,
+  no alloc once warm) before `unmarshal`. The `s.writeBuf`/`s.readBuf` grow via
+  `growBuf` (allocates only when a bigger record appears). Don't add per-op heap
+  allocations on Add / read / commitTo. The benchmark guards this.
 - **Readers own the returned bytes.** All consume ops live on `Reader[T]`
   ([reader.go](reader.go)); each copies the record into `r.scratch` *under the
-  lock*, so the value never aliases the mmap and survives unmapping. Valid until
-  the reader's next read. A `Reader` is single-goroutine; use one per consumer.
-  This copy is load-bearing: since consume ops commit a record as they read it,
-  its file may be unmapped while the consumer still holds the value (see
-  "Immediate unmap is safe").
+  lock*, so the value never aliases `s.readBuf` (which the next read overwrites).
+  Valid until the reader's next read. A `Reader` is single-goroutine; use one per
+  consumer. This copy is load-bearing: since consume ops commit a record as they
+  read it, its file may be closed/removed while the consumer still holds the value
+  (see "Immediate close is safe").
 - **Reclamation is whole-file, on write *and* commit.** `dropCommitted(keep)`
   deletes files whose every record is committed (`base+size <= commitOff`), except
   `keep`. It runs from two places: `cycle` (from `append`) with `keep == nil` —
@@ -86,15 +92,14 @@ mirrors its own `written`/`committed` counts into its header.
   *not* `syncDir`'d, so reclamation is best-effort: a file lingering after a crash
   is re-dropped on the next drop and never re-delivered (its records stay
   committed), so correctness doesn't depend on the removal being durable.
-- **Immediate unmap is safe** because `Reader.read` copies the payload into
-  `r.scratch` *under the lock*; the value the consumer holds never aliases the
-  mapping. This is load-bearing now that **commits** reclaim too: `Take`/`Drain`/
-  `Follow` read-then-`commitTo` under the lock, and that same `commitTo` can fully
-  commit and unmap the just-delivered record's file via `dropCommitted` — but the
-  scratch copy already happened (read precedes commit), so the held value stays
-  valid. A concurrent `Add`'s `dropCommitted` can do the same. All store ops hold
-  the DiskQueue mutex, so no munmap races the read itself. (Touching an mmap slice after
-  `munmap` is a SIGSEGV the GC can't prevent — that's why the copy matters.)
+- **Immediate close is safe** because `Reader.read` copies the payload into
+  `r.scratch` *under the lock*; the value the consumer holds is its own copy, not a
+  slice of `s.readBuf`. This is load-bearing now that **commits** reclaim too:
+  `Take`/`Drain`/`Follow` read-then-`commitTo` under the lock, and that same
+  `commitTo` can fully commit and `dropCommitted` the just-delivered record's file
+  (closing its handle and removing it) — but the scratch copy already happened
+  (read precedes commit), so the held value stays valid. A concurrent `Add`'s
+  `dropCommitted` can do the same. All store ops hold the DiskQueue mutex.
 - **`maxSegments` bounds the file count.** `cycle` drops committed files, then
   returns `ErrFull` if `len(files) >= maxSegments` (0 = unbounded). So the bound
   is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.
@@ -104,7 +109,7 @@ mirrors its own `written`/`committed` counts into its header.
   (no mapping), validates it, and takes the data end from the write cursor and the
   `written`/`committed` counts from the header (summed into `nWritten`/
   `nCommitted`), with `commitOff` from the first file whose commit cursor is short
-  of its end; `headOff = commitOff`. Only the active file is mapped at the end of
+  of its end; `headOff = commitOff`. Only the active file is opened at the end of
   `load`. `dropCommitted` subtracts the dropped file's counts (it's fully
   committed, so `written == committed`, keeping `Count` exact). Fully-committed
   leading files are *not* dropped on open.
@@ -123,34 +128,37 @@ mirrors its own `written`/`committed` counts into its header.
   so they commit-on-read (at-most-once) and are safe for concurrent cooperating
   readers. `Drain` is bounded by a `writeOff` snapshot; `Follow` waits via
   `waitLocked` (which lives on DiskQueue, called as `r.w.waitLocked`).
-- **Sync policy.** `noSync` skips msync; `syncEvery <= 1` msyncs every write/
-  commit inline (ordered: data then header); `syncEvery > 1` (`batched()`) defers
-  to `flushBatch` every N ops. A torn tail from a power loss between batched
-  flushes is caught by the per-record xxhash on read. `sync()`/`Close` always
-  flush; an optional `SyncInterval` goroutine (`syncLoop`, stopped by `Close` via
-  `syncStop`/`syncDone`) flushes on a timer as a wall-clock backstop.
-- **Dirty tracking (header split from data).** Each `dataFile` tracks the header
-  (`headerDirty` bool — page 0, rewritten by every append/commit) separately from
-  the dirty data range `[dirtyLo,dirtyHi)` (`markDataDirty`/`clearDirty`; both
-  clean == the zero value). `flushDirtyErr` msyncs page 0 and the data range as
-  **two independent page-aligned syncs**, so the already-clean record pages
-  between the header and the freshly-written tail are never scanned — the win over
-  one merged `[0,tail]` range when a partly-full segment takes a batched commit.
-  The deferred paths (batched `append`/`commitTo`, `noSync`, `createFile`) only
-  mark; the inline per-op path msyncs precisely and never marks (so per-op files
-  stay clean). `flushDirty`/`flushBatch`/`sync`/`close`/`evictMapped` flush only
-  what's dirty and skip a clean file entirely — a file only read since its last
-  flush is unmapped with no msync. `noSync` writes are still marked so an explicit
-  `sync()`/`Close` flushes them; under `noSync` eviction just `clearDirty`s and
-  relies on kernel writeback. Don't widen the inline per-op path to a merged
-  range — that would msync `[0, end)` each append, O(size) per write.
-- **Lazy mapping.** Files map on demand via `ensureMapped` (`read`, `commitTo`,
-  and `append` for the active file); `evictMapped` unmaps the LRU beyond
-  `maxMapped`, never the active or just-mapped file, flushing only a victim's
-  dirty range first (a batched commit may have left its header dirty; a clean
-  victim is unmapped without any msync). `df.data == nil` means unmapped —
-  `msync`/`sync`/`flushBatch`/`close` skip such files. `createFile` msyncs the
-  fresh header so a cycled-but-empty segment is a valid file on disk.
+- **Sync policy.** `noSync` skips `fsync`; `syncEvery <= 1` syncs every write/
+  commit inline; `syncEvery > 1` (`batched()`) defers to `flushBatch` every N ops.
+  A torn tail from a power loss between batched flushes is caught by the per-record
+  xxhash on read. `sync()`/`Close` always flush; an optional `SyncInterval`
+  goroutine (`syncLoop`, stopped by `Close` via `syncStop`/`syncDone`) flushes on a
+  timer as a wall-clock backstop.
+- **Data-before-header durability.** The per-op `append` does **two** fsyncs:
+  `WriteAt` the record, `fsync` (record bytes durable), then `writeHeader` +
+  `fsync` (the write cursor that publishes them durable). Persisting the header
+  first would let a power loss leave a visible record whose payload never landed (a
+  torn tail the checksum flags); data-then-header guarantees a clean truncation
+  instead. The recovery-fault tests pin this. Don't collapse it to one fsync on the
+  per-op path.
+- **Dirty tracking.** Each `dataFile` has a single `dirty` bool: `writeRecord`/
+  `writeHeader` set it (page-cache writes not yet fsync'd); `flushFile` fsyncs and
+  clears it, and is a no-op for a clean or closed (`f == nil`) file. Batched
+  `append`/`commitTo` and `noSync` `writeHeader` the record/header into the page
+  cache (so a reopen-via-`load` and `readFileHeader` see them) but defer the fsync;
+  the per-op path fsyncs inline and clears `dirty`. `flushFile`/`flushBatch`/
+  `sync`/`close`/`evictMapped` fsync only dirty files and skip clean ones — a file
+  only read since its last flush is closed with no fsync. Under `noSync`, eviction
+  just clears `dirty` and relies on kernel writeback (the page-cache bytes survive
+  the handle being closed).
+- **Lazy open.** Files open on demand via `ensureMapped` (`read`, `commitTo`, and
+  `append` for the active file); `evictMapped` closes the LRU handle beyond
+  `maxMapped`, never the active or just-opened file, fsyncing a dirty victim first
+  (a clean victim is closed without fsync). `df.f == nil` means closed —
+  `flushFile`/`sync`/`flushBatch`/`close` skip such files; `df.hdr` stays resident
+  so accessors still work and a later `ensureMapped` just reopens the handle.
+  `createFile` writes (and, unless `noSync`, fsyncs) the fresh header so a
+  cycled-but-empty segment is a valid file on disk.
 
 ## Gotchas
 
@@ -158,5 +166,7 @@ mirrors its own `written`/`committed` counts into its header.
   `headOff` without committing (so `Empty()` can be true while `Count() > 0`).
 - Offsets are byte positions, monotonic within a session, not stable across a
   reopen (head resets to the recovered commit cursor).
-- mmap/msync are Linux/Unix via `golang.org/x/sys/unix`; this is not portable to
-  Windows as written.
+- I/O is `os.File` `ReadAt`/`WriteAt`/`Sync` plus a directory `fsync` (`syncDir`)
+  for durable creates/removes. No mmap, so no `golang.org/x/sys` dependency; the
+  directory fsync is POSIX (a no-op or error on some platforms, but fine on
+  Linux/Unix).
