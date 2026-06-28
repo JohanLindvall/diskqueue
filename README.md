@@ -1,9 +1,9 @@
 # diskqueue
 
 A generic, durable, FIFO **disk-backed queue** for Go — a persistent work queue
-that doubles as a write-ahead log — backed by its own small memory-mapped file
-store (dependencies: `golang.org/x/sys` for mmap/msync and `cespare/xxhash/v2`
-for per-record checksums).
+that doubles as a write-ahead log — backed by its own small file store using
+plain `pread`/`pwrite`/`fsync` (its only dependency is `cespare/xxhash/v2` for
+per-record checksums).
 
 Items are appended at the back with `Add` and consumed from the front through a
 `Reader`: a consumer either **takes** an item (read + commit in one step) or
@@ -19,7 +19,7 @@ allocation:
   buffer).
 - A `Reader` copies each record once into its own reusable scratch buffer before
   handing it to `UnmarshalFunc` — **no per-read allocation** once warm, and the
-  value is never backed by a file that may be unmapped.
+  value never aliases the store's reused read buffer.
 
 ```
 BenchmarkAddTake-22    36 ns/op    0 B/op    0 allocs/op   (NoSync)
@@ -37,11 +37,12 @@ checksum trailer). Because the cursors and counts all live in the header,
 reopening reads no records at all; the header checksum is verified on open (a
 mismatch is `ErrCorrupt`, a wrong magic/version is `ErrBadFormat`), and each
 record's checksum is verified on read (a mismatch returns `ErrCorrupt` without
-advancing the cursor). Segments are memory-mapped on demand and the
-least-recently-used are unmapped once `MaxMapped` are live, so a deep backlog does
-not hold an mmap and fd per retained file. A file is dropped once all its records
-are committed — but only while writing (a new write cycling to the next file);
-reads and commits never delete files.
+advancing the cursor). Records are written with `pwrite` and read back with
+`pread` into reused buffers; each file's handle is opened on demand and the
+least-recently-used handles are closed once `MaxMapped` are open, so a deep
+backlog does not hold an open descriptor per retained file. A file is dropped once
+all its records are committed — but only while writing (a new write cycling to the
+next file); reads and commits never delete files.
 
 ## Install
 
@@ -169,7 +170,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Empty() bool` | Whether anything is available to read. |
 | `Count() int` | Number of items added but not yet committed. |
 | `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
-| `Sync() error` | `msync` the files to stable storage. |
+| `Sync() error` | `fsync` the files to stable storage. |
 | `Close() error` | Flush and close. |
 
 `Reader[T]` — consume items (created via `NewReader`):
@@ -198,8 +199,8 @@ processing (at-least-once), use `Reserve`/`Commit`.
 - **At-least-once.** The read cursor is reset to the persisted commit cursor on
   open, so after a restart any items added but not committed are replayed. Use
   `Reserve`/`Commit` for explicit acknowledgement.
-- **Durability.** Writes go into the memory-mapped files and survive a process
-  crash via the page cache. By default each write and commit is `msync`'d for
+- **Durability.** Writes go into the page cache via `pwrite` and survive a
+  process crash. By default each write and commit is `fsync`'d for
   power-loss durability; set `NoSync` to skip that entirely, or `SyncEvery: N` to
   batch one fsync over N operations (optionally with a `SyncInterval` wall-clock
   backstop). `Sync` flushes on demand.
@@ -218,7 +219,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
   files; reclamation happens on the next `Add` that cycles to a new file.
 - **Value lifetime.** A `Reader` copies each record into its own reusable scratch
   buffer before calling `UnmarshalFunc`, so the value (and anything in `T` that
-  aliases it) is never backed by a file that may be unmapped. It is valid until
+  aliases it) never aliases the store's reused read buffer. It is valid until
   the next read on that same `Reader`; copy it inside `UnmarshalFunc` if you need
   it to outlive that. The copy reuses the buffer, so it allocates nothing once
   warm.
@@ -240,11 +241,11 @@ processing (at-least-once), use `Reserve`/`Commit`.
 ```go
 diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
 	MaxSegments:    0,    // 0 = 32 default; N>0 = cap live files (ErrFull); <0 = unbounded
-	NoSync:         true, // skip msync per write/commit (faster, no power-loss durability)
-	SyncEvery:      0,    // 0/1 = msync every op; N>1 = batch the fsync over N ops
+	NoSync:         true, // skip fsync per write/commit (faster, no power-loss durability)
+	SyncEvery:      0,    // 0/1 = fsync every op; N>1 = batch the fsync over N ops
 	SyncInterval:   0,    // >0 = background flush every interval (backstop for SyncEvery)
 	SegmentSize:    0,    // 0 = 8 MiB default; floored at 4 KiB, rounded up to a page
-	MaxMapped:      0,    // 0 = map every touched segment; N = cap mmaps (LRU), min 2
+	MaxMapped:      0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 2
 	RecoverCorrupt: false, // true = drop corrupt data and continue instead of erroring
 })
 ```

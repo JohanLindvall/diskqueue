@@ -34,8 +34,29 @@ func mustAppend(t *testing.T, s *store, p []byte) {
 func idxRec(i int) []byte { return []byte{byte(i), byte(i >> 8)} }
 func recIdx(p []byte) int { return int(p[0]) | int(p[1])<<8 }
 
-// readFileHeader reads the four header words straight off disk. mmap MAP_SHARED
-// writes are visible through the page cache, so this works without msync.
+// corruptData overwrites len(b) bytes of segment fileIdx's data region starting at
+// dataOff, writing through the store's open handle so the store's reads see it.
+func corruptData(t *testing.T, s *store, fileIdx, dataOff int, b []byte) {
+	t.Helper()
+	if _, err := s.files[fileIdx].f.WriteAt(b, int64(headerSize+dataOff)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// flipData XORs mask into the data-region byte at dataOff of segment fileIdx.
+func flipData(t *testing.T, s *store, fileIdx, dataOff int, mask byte) {
+	t.Helper()
+	one := make([]byte, 1)
+	if _, err := s.files[fileIdx].f.ReadAt(one, int64(headerSize+dataOff)); err != nil {
+		t.Fatal(err)
+	}
+	one[0] ^= mask
+	corruptData(t, s, fileIdx, dataOff, one)
+}
+
+// readFileHeader reads the four header words straight off disk. The store writes
+// each header to page 0 with WriteAt, so the bytes are visible through the page
+// cache here without an fsync.
 func readFileHeader(t *testing.T, dir string, num uint64) (commit, write, written, committed int64) {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(dir, fmt.Sprintf("data.%08d", num)))
@@ -516,10 +537,8 @@ func TestStoreCorruptLengthNoPanic(t *testing.T) {
 	mustAppend(t, s, idxRec(1))
 
 	// Overwrite the first record's uvarint length with a huge value (0xFF…),
-	// which would slice far past the data region without the bounds guard.
-	for i := 0; i < 10; i++ {
-		s.files[0].data[headerSize+i] = 0xFF
-	}
+	// which would read far past the data region without the bounds guard.
+	corruptData(t, s, 0, 0, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
 
 	if _, _, _, ok, _ := s.read(0); ok {
 		t.Fatal("corrupt record should not decode ok")
@@ -573,7 +592,7 @@ func TestStoreChecksumDetectsCorruption(t *testing.T) {
 	mustAppend(t, s, idxRec(1))
 
 	// Corrupt the first record's payload (just past its 1-byte length prefix).
-	s.files[0].data[headerSize+1] ^= 0xFF
+	flipData(t, s, 0, 1, 0xFF)
 
 	if _, _, _, err := s.takeHead(); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("takeHead on corrupt record: err=%v, want ErrCorrupt", err)
@@ -582,7 +601,7 @@ func TestStoreChecksumDetectsCorruption(t *testing.T) {
 		t.Fatalf("head advanced past corrupt record: headOff=%d, want 0", s.headOff)
 	}
 	// Repairing the byte lets the read succeed again — proof it was the checksum.
-	s.files[0].data[headerSize+1] ^= 0xFF
+	flipData(t, s, 0, 1, 0xFF)
 	p, _, ok, err := s.takeHead()
 	if err != nil || !ok || recIdx(p) != 0 {
 		t.Fatalf("after repair: idx=%d ok=%v err=%v", recIdx(p), ok, err)
@@ -774,7 +793,7 @@ func TestStoreRecoverSkipsCorruptSegment(t *testing.T) {
 		mustAppend(t, s, idxRec(i))
 	}
 	// Corrupt a record's bytes inside the first segment (records after the first).
-	s.files[0].data[headerSize+20] ^= 0xFF
+	flipData(t, s, 0, 20, 0xFF)
 
 	delivered := 0
 	prev := -1

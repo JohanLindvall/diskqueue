@@ -9,8 +9,8 @@ import (
 // are methods on it.
 //
 // A Reader copies each record into a private reused buffer before unmarshalling,
-// so the value never aliases an unmappable file and stays valid until the
-// Reader's next read (alloc-free once warm). A Reader is not safe for concurrent
+// so the value never aliases the store's reused read buffer and stays valid until
+// the Reader's next read (alloc-free once warm). A Reader is not safe for concurrent
 // use: use one per consuming goroutine. Readers share the read/commit cursor and
 // cooperate (each item delivered once); see the package doc on which ops are safe
 // across concurrent readers.
@@ -188,15 +188,15 @@ func (r *Reader[T]) stream(ctx context.Context, follow bool) iter.Seq[T] {
 }
 
 // read takes the head record, copies it into scratch (so it never aliases the
-// mmap), and unmarshals it. ok is false when empty; a checksum mismatch returns
-// ErrCorrupt. The caller must hold r.w.mu.
+// store's reused read buffer), and unmarshals it. ok is false when empty; a
+// checksum mismatch returns ErrCorrupt. The caller must hold r.w.mu.
 func (r *Reader[T]) read() (T, int64, bool, error) {
 	var zero T
 	payload, off, ok, err := r.w.st.takeHead()
 	if err != nil || !ok {
 		return zero, 0, false, err
 	}
-	r.scratch = append(r.scratch[:0], payload...) // copy out of the mmap
+	r.scratch = append(r.scratch[:0], payload...) // copy out of the store's read buffer
 	v, err := r.w.unmarshal(r.scratch)
 	if err != nil {
 		return zero, 0, false, err

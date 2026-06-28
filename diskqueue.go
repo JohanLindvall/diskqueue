@@ -1,7 +1,7 @@
 // Package diskqueue implements a generic, durable, FIFO disk-backed queue (a
-// persistent work queue that doubles as a write-ahead log) backed by its own mmap
-// file store (see store.go); its only dependencies are golang.org/x/sys
-// (mmap/msync) and cespare/xxhash/v2 (per-record checksums).
+// persistent work queue that doubles as a write-ahead log) backed by its own file
+// store (see store.go) using plain pread/pwrite/fsync; its only dependency is
+// cespare/xxhash/v2 (per-record checksums).
 //
 // Items are appended with Add and consumed through a Reader (DiskQueue.NewReader): Take
 // reads + commits in one step, or Reserve reads and later Commits its offset.
@@ -70,12 +70,12 @@ var (
 // Options tunes the behaviour of a DiskQueue. The zero value is valid and selects
 // sensible defaults.
 type Options struct {
-	// NoSync disables msync after every write and commit. This trades durability
-	// against a power loss for substantially higher throughput; data still
-	// survives a process crash via the page cache. Default false.
+	// NoSync disables the fsync after every write and commit. This trades
+	// durability against a power loss for substantially higher throughput; data
+	// still survives a process crash via the page cache. Default false.
 	NoSync bool
 
-	// SyncEvery batches durability: msync once every N writes/commits instead of
+	// SyncEvery batches durability: fsync once every N writes/commits instead of
 	// after each one, amortizing the fsync cost. 0 or 1 syncs every operation (the
 	// default). A larger N raises throughput but widens the power-loss window — up
 	// to the last N unsynced operations can be lost on power loss (they still
@@ -96,11 +96,11 @@ type Options struct {
 	// negative value means unbounded.
 	MaxSegments int
 
-	// MaxMapped caps how many segment files are memory-mapped at once. Segments
-	// are mapped on demand and the least-recently-used are unmapped beyond the
-	// cap, bounding address space and msync work for deep backlogs; the active
-	// segment is always mapped. 0 means unbounded (map every touched segment).
-	// Values are raised to a minimum of 2 (the active segment plus one reader).
+	// MaxMapped caps how many segment files are kept open at once. Segments are
+	// opened on demand and the least-recently-used handles are closed beyond the
+	// cap, bounding open descriptors for deep backlogs; the active segment is
+	// always open. 0 means unbounded (keep every touched segment open). Values are
+	// raised to a minimum of 2 (the active segment plus one reader).
 	MaxMapped int
 
 	// SyncInterval, if > 0, runs a background goroutine that flushes to stable
@@ -208,7 +208,7 @@ func (w *DiskQueue[T]) Add(data T) error {
 	w.scratch = b // retain grown capacity for reuse
 	before := w.st.writeOffset()
 	err = w.st.append(b)
-	// The record can land even when a per-op msync then fails (append advances the
+	// The record can land even when a per-op fsync then fails (append advances the
 	// write offset before flushing). Wake waiters whenever it did, so a durability
 	// error doesn't also strand a blocked consumer on a record that is in the log.
 	if w.st.writeOffset() != before {
