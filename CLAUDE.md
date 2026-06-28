@@ -5,158 +5,93 @@ Guidance for working in this repository.
 ## What this is
 
 `github.com/JohanLindvall/diskqueue` — a generic, durable FIFO disk-backed queue
-(a persistent work queue that doubles as a write-ahead log) for Go. The public API
-and behaviour are documented in [README.md](README.md); read it first. Its only
-dependencies are `golang.org/x/sys` (mmap/msync) and `cespare/xxhash/v2`
-(per-record checksums); it ships its own mmap-backed store.
+for Go. The public API and behaviour are documented in [README.md](README.md);
+read it first. It is a thin generic, typed layer over
+[nsqio/go-diskqueue](https://github.com/nsqio/go-diskqueue) (`v1.1.0`), which
+supplies the `[]byte`-only file backend; that is the only dependency.
 
-- [store.go](store.go) — the `store`: the mmap-backed, `[]byte`-only file backend.
-- [diskqueue.go](diskqueue.go) — the generic `DiskQueue[T]` writer/owner (Add, Empty/Count/Size,
-  Sync/Close, NewReader) on top of `store`.
-- [reader.go](reader.go) — `Reader[T]`: all consume ops (Reserve/Take/Commit/
-  Drain/Follow); copies each record into its own scratch buffer.
-- [store_test.go](store_test.go) — store-level unit tests (`TestStore*`).
-- [diskqueue_test.go](diskqueue_test.go) — DiskQueue-level tests and `BenchmarkAddTake`.
+- [diskqueue.go](diskqueue.go) — the generic `DiskQueue[T]` writer/owner (`New`,
+  `Add`, `Empty`/`Count`/`Size`/`Corruptions`, `Close`, `NewReader`) wrapping a
+  `godq.Interface`, plus the `MaxSegments` backpressure.
+- [reader.go](reader.go) — `Reader[T]`: the consume ops (`Take`/`TryTake`/
+  `Drain`/`Follow`) over the backend's shared read channel.
+- [diskqueue_test.go](diskqueue_test.go) — all tests and `BenchmarkAddTake`.
 
 ## Build / test
 
 ```sh
 go build ./...
-go test -race ./...
+go test ./...
 go vet ./...
-go test -run=^$ -bench=BenchmarkAddTake -benchtime=1s ./...   # must stay 0 allocs/op
-go test -cover ./...
+go test -run=^$ -bench=BenchmarkAddTake -benchtime=1s ./...
 ```
 
-## Storage model (store.go)
+Note: `-race` needs a C compiler (cgo); run it where one is available.
 
-A directory of numbered files `data.00000001`, … each `SegmentSize` bytes,
-preallocated, capped at `maxSegments` live files, and mmap'd **on demand** (LRU,
-capped by `maxMapped`; the active file stays mapped, the fd is closed right after
-mmap). 64-byte LE header: `[0:8]` magic, `[8:16]` commit cursor (next uncommitted
-record), `[16:24]` write cursor (data end), `[24:32]` written count, `[32:40]`
-committed count, `[40]` version, `[56:64]` xxhash64 of `[0:56]`; then records,
-each `uvarint(len) || payload || xxhash64(payload)` (8-byte LE checksum trailer,
-verified on read — mismatch → `ErrCorrupt`, cursor not advanced). The header is
-the single source of truth — recovery reads **no records at all**: `load` preads
-each 64-byte header (no mapping), validates magic/version (`ErrBadFormat`) and the
-header checksum (`ErrCorrupt`), and takes data end, resume point and `Count()`
-from it. The write cursor / written count (and the header checksum) are published
-*after* the record bytes so only fully-written records are visible.
+## How it maps onto go-diskqueue
 
-Every header mutation goes through `df.header(mods ...func(*dataFile))`, which
-applies the modifiers, rebuilds the checksum, and sets `headerDirty` — so the
-checksum and dirty flag can't be forgotten. The field setters (`setCommitCursor`,
-`setWriteCursor`, `setWrittenCount`, `setCommittedCount`) **return** a modifier
-rather than writing in place, so they compose as `header()` arguments; nothing
-touches the header bytes until `header()` invokes them. The closures stay
-stack-allocated (escape analysis), keeping the hot path zero-alloc.
+`godq.New(name, dir, maxBytesPerFile, minMsgSize, maxMsgSize, syncEvery,
+syncTimeout, logf)` is created once in `New`. The fixed `queueName` ("diskqueue")
+is the prefix for the backend's files (`diskqueue.diskqueue.NNNNNN.dat` and
+`diskqueue.diskqueue.meta.dat`).
 
-Three cursors, all global byte offsets into the logical stream (file `F` holds
-offsets `[F.base, F.base+F.size)`):
-
-- `writeOff` — tail; next record append position.
-- `headOff` — read cursor (in memory only; reset to `commitOff` on open).
-- `commitOff` — commit cursor, persisted into the header of the file it lands in.
-
-`nWritten`/`nCommitted` are global record counts for `Count()`; each file also
-mirrors its own `written`/`committed` counts into its header.
+- `Add` → `Put`. We marshal into the reused `w.scratch` under `w.mu`, pre-check
+  `len > maxMsgSize` (→ `ErrRecordTooLarge`, where `maxMsgSize = SegmentSize-4`),
+  enforce `MaxSegments`, then `Put`. `Put` is synchronous, so reusing `scratch`
+  afterwards is safe.
+- `Take`/`TryTake`/`Drain`/`Follow` → receive from `dq.ReadChan()`. The backend's
+  `ioLoop` surfaces records asynchronously, advancing the read cursor on delivery.
+- `Count`/`Empty` → `dq.Depth()`. **Never call `dq.Empty()` — it is destructive**
+  (it clears the queue). `Empty()` here means `Depth() == 0`.
+- `Close` → closes `w.done` (unblocks readers) then `dq.Close()` (flushes + meta).
 
 ## Non-obvious invariants — keep these intact
 
-- **Zero-alloc hot path.** `append` writes straight into the mmap; `Add`
-  serializes via the reused `w.scratch` and the append-style `MarshalFunc`.
-  `Reader.read` copies the mmap payload into the reused `r.scratch` (one memcpy,
-  no alloc once warm) before `unmarshal`. Don't add per-op heap allocations on Add
-  / read / commitTo. The benchmark guards this.
-- **Readers own the returned bytes.** All consume ops live on `Reader[T]`
-  ([reader.go](reader.go)); each copies the record into `r.scratch` *under the
-  lock*, so the value never aliases the mmap and survives unmapping. Valid until
-  the reader's next read. A `Reader` is single-goroutine; use one per consumer.
-  This copy is load-bearing: since consume ops commit a record as they read it,
-  its file may be unmapped while the consumer still holds the value (see
-  "Immediate unmap is safe").
-- **Reclamation is whole-file, on write *and* commit.** `dropCommitted(keep)`
-  deletes files whose every record is committed (`base+size <= commitOff`), except
-  `keep`. It runs from two places: `cycle` (from `append`) with `keep == nil` —
-  the soon-to-be-old active file may go since a new one follows immediately — and
-  the end of `commitTo` with `keep == s.active()`, so a consume-only or producer-
-  stopped workload reclaims disk without waiting for the next write, but never
-  drops the active file (it holds the write position). The commit-path removal is
-  *not* `syncDir`'d, so reclamation is best-effort: a file lingering after a crash
-  is re-dropped on the next drop and never re-delivered (its records stay
-  committed), so correctness doesn't depend on the removal being durable.
-- **Immediate unmap is safe** because `Reader.read` copies the payload into
-  `r.scratch` *under the lock*; the value the consumer holds never aliases the
-  mapping. This is load-bearing now that **commits** reclaim too: `Take`/`Drain`/
-  `Follow` read-then-`commitTo` under the lock, and that same `commitTo` can fully
-  commit and unmap the just-delivered record's file via `dropCommitted` — but the
-  scratch copy already happened (read precedes commit), so the held value stays
-  valid. A concurrent `Add`'s `dropCommitted` can do the same. All store ops hold
-  the DiskQueue mutex, so no munmap races the read itself. (Touching an mmap slice after
-  `munmap` is a SIGSEGV the GC can't prevent — that's why the copy matters.)
-- **`maxSegments` bounds the file count.** `cycle` drops committed files, then
-  returns `ErrFull` if `len(files) >= maxSegments` (0 = unbounded). So the bound
-  is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.
-- **Records never span files.** `append` cycles when `size+recLen > segmentSize`.
-  A record bigger than `segmentSize` is `ErrRecordTooLarge`.
-- **Recovery (`load`) reads no records.** Reopen preads each file's 64-byte header
-  (no mapping), validates it, and takes the data end from the write cursor and the
-  `written`/`committed` counts from the header (summed into `nWritten`/
-  `nCommitted`), with `commitOff` from the first file whose commit cursor is short
-  of its end; `headOff = commitOff`. Only the active file is mapped at the end of
-  `load`. `dropCommitted` subtracts the dropped file's counts (it's fully
-  committed, so `written == committed`, keeping `Count` exact). Fully-committed
-  leading files are *not* dropped on open.
-- **Corruption is strict by default, opt-in recovery via `recoverCorrupt`.**
-  `read` returns `ErrCorrupt` (not empty) for an undecodable record; `takeHead`
-  surfaces a bad length/checksum as `ErrCorrupt`. With `recoverCorrupt`: `load`
-  drops a torn *trailing* segment (only the highest num — earlier files hold
-  committed data) and recreates a fresh file if all were dropped; `takeHead`
-  calls `skipCorruptSegment`, which advances `headOff` past the segment and
-  force-commits its tail when `commitOff` is already inside it (auto-commit path),
-  reclaiming it. Recovery is lossy; `s.corruptions` counts events (`DiskQueue.Corruptions`).
-- **Blocking waiters.** `waitLocked`/`signal` use a lazily-created `notify`
-  channel, nil when nobody waits, so `Add` stays allocation-free.
-- **`Reader.Drain`/`Follow` consume** via the shared `headOff` (like iterator-
-  shaped `Take`): read **and `commitTo` under the lock**, then release and yield —
-  so they commit-on-read (at-most-once) and are safe for concurrent cooperating
-  readers. `Drain` is bounded by a `writeOff` snapshot; `Follow` waits via
-  `waitLocked` (which lives on DiskQueue, called as `r.w.waitLocked`).
-- **Sync policy.** `noSync` skips msync; `syncEvery <= 1` msyncs every write/
-  commit inline (ordered: data then header); `syncEvery > 1` (`batched()`) defers
-  to `flushBatch` every N ops. A torn tail from a power loss between batched
-  flushes is caught by the per-record xxhash on read. `sync()`/`Close` always
-  flush; an optional `SyncInterval` goroutine (`syncLoop`, stopped by `Close` via
-  `syncStop`/`syncDone`) flushes on a timer as a wall-clock backstop.
-- **Dirty tracking (header split from data).** Each `dataFile` tracks the header
-  (`headerDirty` bool — page 0, rewritten by every append/commit) separately from
-  the dirty data range `[dirtyLo,dirtyHi)` (`markDataDirty`/`clearDirty`; both
-  clean == the zero value). `flushDirtyErr` msyncs page 0 and the data range as
-  **two independent page-aligned syncs**, so the already-clean record pages
-  between the header and the freshly-written tail are never scanned — the win over
-  one merged `[0,tail]` range when a partly-full segment takes a batched commit.
-  The deferred paths (batched `append`/`commitTo`, `noSync`, `createFile`) only
-  mark; the inline per-op path msyncs precisely and never marks (so per-op files
-  stay clean). `flushDirty`/`flushBatch`/`sync`/`close`/`evictMapped` flush only
-  what's dirty and skip a clean file entirely — a file only read since its last
-  flush is unmapped with no msync. `noSync` writes are still marked so an explicit
-  `sync()`/`Close` flushes them; under `noSync` eviction just `clearDirty`s and
-  relies on kernel writeback. Don't widen the inline per-op path to a merged
-  range — that would msync `[0, end)` each append, O(size) per write.
-- **Lazy mapping.** Files map on demand via `ensureMapped` (`read`, `commitTo`,
-  and `append` for the active file); `evictMapped` unmaps the LRU beyond
-  `maxMapped`, never the active or just-mapped file, flushing only a victim's
-  dirty range first (a batched commit may have left its header dirty; a clean
-  victim is unmapped without any msync). `df.data == nil` means unmapped —
-  `msync`/`sync`/`flushBatch`/`close` skip such files. `createFile` msyncs the
-  fresh header so a cycled-but-empty segment is a valid file on disk.
+- **At-most-once, single cursor.** There is no commit cursor and no `Reserve`/
+  `Commit`. A record advances the persisted read position as it is *delivered*, so
+  it is not replayed after a crash. Don't reintroduce offset-addressed acks against
+  this backend — it has no place to store a second cursor.
+- **`MaxSegments` backpressure is best-effort and lives here, not in the backend**
+  (go-diskqueue is unbounded). `segmentsFull` globs the directory for live
+  `*.dat` segment files (excluding `meta.dat`), but caches the count: it only
+  re-globs when the cap is in reach or a `SegmentSize`'s worth of bytes has been
+  written since the last refresh (`bytesSinceGlob`). So the happy path globs ~once
+  per segment; the count may briefly overshoot the cap. The check runs under
+  `w.mu` in `Add`. `maxSeg == 0` means unbounded (skip the check).
+- **`TryTake` spins while `Depth() > 0`.** Because the backend surfaces records
+  from a background goroutine, a record can be on disk a moment before it reaches
+  `ReadChan()`. A naive non-blocking receive would report the queue empty while
+  records exist (breaking the synchronous `Add`/`TryTake` lockstep the tests rely
+  on). `TryTake` therefore retries (`runtime.Gosched()`) until a record arrives or
+  `Depth()` hits 0. Don't replace this with a bare `select { default: }`.
+- **`Drain` is serialized by `drainMu` and bounded by a `Depth()` snapshot.** It
+  consumes up to the depth observed when iteration begins, re-checking
+  `Depth() == 0` before each blocking receive so it never waits for a record
+  another consumer took. The mutex prevents two concurrent drainers both blocking
+  on the shared channel for the last record (which, with an uncancelled context,
+  would deadlock). `Follow` is unbounded and relies on context cancellation to
+  unblock.
+- **Reader values don't alias a reused buffer.** Each `ReadChan()` delivery is a
+  freshly allocated slice, passed straight to `unmarshal`; it stays valid
+  indefinitely. (The old per-reader scratch copy is gone — the hot path is no
+  longer zero-alloc, by nature of the channel backend.)
+- **`Corruptions()` is derived from the backend log.** `w.logf` increments an
+  atomic counter when go-diskqueue logs `"saving bad file"`. It is best-effort
+  string matching; if the backend's log wording changes, update the match.
+- **Sync mapping.** `NoSync` → a huge `syncEvery` plus a 24h `syncTimeout` (so the
+  backend rarely fsyncs; `Close` still flushes). `SyncEvery<=1` → `1` (fsync per
+  op). `SyncInterval` → `syncTimeout` (default 2s). go-diskqueue exposes **no
+  on-demand flush**, which is why there is no `Sync()` method.
 
 ## Gotchas
 
-- `Take`/`Drain`/`Follow` advance `headOff` and commit; `Reserve` advances
-  `headOff` without committing (so `Empty()` can be true while `Count() > 0`).
-- Offsets are byte positions, monotonic within a session, not stable across a
-  reopen (head resets to the recovered commit cursor).
-- mmap/msync are Linux/Unix via `golang.org/x/sys/unix`; this is not portable to
-  Windows as written.
+- `New` must `os.MkdirAll(path)` first — go-diskqueue does not create the
+  directory and silently fails writes if it is missing.
+- `Depth()` round-trips the backend `ioLoop` over a channel; it returns the last
+  value after close rather than blocking.
+- The backend is goroutine-safe for `Put`/`ReadChan`/`Depth`; `w.mu` only guards
+  this package's own state (`scratch`, `closed`, the segment-count cache).
+- Removed vs. the old mmap store: `Reserve`/`Commit`/`TryReserve`, `Sync`,
+  per-record checksums and strict `ErrCorrupt`/`ErrBadFormat`/
+  `ErrSegmentSizeMismatch`, `MaxMapped`, `RecoverCorrupt`, and the zero-alloc hot
+  path. `Size()` is now the physical on-disk footprint, not uncommitted bytes.

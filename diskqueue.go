@@ -1,122 +1,93 @@
-// Package diskqueue implements a generic, durable, FIFO disk-backed queue (a
-// persistent work queue that doubles as a write-ahead log) backed by its own mmap
-// file store (see store.go); its only dependencies are golang.org/x/sys
-// (mmap/msync) and cespare/xxhash/v2 (per-record checksums).
+// Package diskqueue implements a generic, durable, FIFO disk-backed queue on top
+// of nsqio/go-diskqueue (github.com/nsqio/go-diskqueue), which provides the
+// []byte-only file backend (numbered data files, a persisted read/write cursor,
+// and an ioLoop goroutine that exposes records over a channel).
 //
-// Items are appended with Add and consumed through a Reader (DiskQueue.NewReader): Take
-// reads + commits in one step, or Reserve reads and later Commits its offset.
-// Committing advances a persisted read cursor; data files are reclaimed once
-// fully committed.
+// Items are appended with Add and consumed through a Reader (DiskQueue.NewReader):
+// Take reads the next record (blocking), TryTake reads without blocking, and
+// Drain/Follow iterate. A read advances the persisted read cursor as the record
+// is delivered, and fully-read data files are reclaimed by the backend.
 //
-// It is built for high throughput and minimal allocation: Add serializes into a
-// reused buffer, and a Reader copies each record into its own reused buffer — so
-// both are alloc-free once warm.
+// Value lifetime: each consumed record is delivered as a freshly allocated slice
+// owned by the caller, so the value handed to UnmarshalFunc stays valid
+// indefinitely.
 //
-// Value lifetime: the slice passed to UnmarshalFunc (and anything in T aliasing
-// it) is owned by the Reader and valid only until that Reader's next read; copy
-// it if you need it longer.
+// Concurrency: a DiskQueue is safe for concurrent use. Readers share one
+// underlying read channel and cooperate — each record is delivered to exactly one
+// reader. A single Reader holds no mutable state, so it is also safe to share, but
+// one per consuming goroutine remains the clear idiom.
 //
-// Concurrency: a DiskQueue is safe for concurrent use; a single Reader is not — use one
-// per consuming goroutine. Readers share one read/commit cursor and cooperate
-// (each item delivered once). Take/TryTake and Drain/Follow commit under the lock
-// as they read, so they are safe for concurrent cooperating readers. Reserve/
-// Commit is the only deferred path: its commits must be issued in offset order
-// (single consumer) or one reader reclaims another's in-flight record. The
-// blocking methods honour their context.
-//
-// Crash semantics: at-least-once. On open the read cursor resets to the persisted
-// commit cursor, so uncommitted items replay.
+// Crash semantics: at-most-once. A record's read cursor advances as it is
+// delivered and is persisted by the backend (governed by SyncEvery/SyncInterval
+// and always on Close), so a delivered-but-unprocessed record is not replayed
+// after a crash. This is a deliberate change from the previous mmap store, which
+// offered at-least-once replay via a separate commit cursor; that two-phase
+// Reserve/Commit acknowledgement is no longer available.
 package diskqueue
 
 import (
-	"context"
 	"errors"
+	"math"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	godq "github.com/nsqio/go-diskqueue"
 )
 
 // MarshalFunc serializes v by appending to dst and returning the extended slice
-// (like the builtin append). Appending rather than allocating keeps Add alloc-free.
+// (like the builtin append).
 type MarshalFunc[T any] func(dst []byte, v T) ([]byte, error)
 
-// UnmarshalFunc decodes a value from data, a Reader-owned buffer valid only until
-// that Reader's next read; copy out of it if you need it longer.
+// UnmarshalFunc decodes a value from data. The slice is owned by the caller and
+// stays valid indefinitely.
 type UnmarshalFunc[T any] func(data []byte) (T, error)
 
 // Errors returned by the package.
 var (
 	// ErrClosed is returned once the DiskQueue has been closed.
 	ErrClosed = errors.New("diskqueue: closed")
-	// ErrFull is returned by Add when a new segment would exceed maxSegments.
+	// ErrFull is returned by Add when a new record would exceed MaxSegments live
+	// segment files.
 	ErrFull = errors.New("diskqueue: full")
-	// ErrInvalidOffset is returned by Commit for an offset beyond the last record.
-	ErrInvalidOffset = errors.New("diskqueue: invalid offset")
 	// ErrRecordTooLarge is returned by Add when a record cannot fit one segment.
 	ErrRecordTooLarge = errors.New("diskqueue: record too large")
-	// ErrCorrupt is returned when a stored xxhash64 does not match its data,
-	// indicating on-disk corruption — either a record's payload (the read cursor
-	// does not advance, so the bad record is reported on every subsequent read) or
-	// a file header (open fails).
-	ErrCorrupt = errors.New("diskqueue: checksum mismatch")
-	// ErrBadFormat is returned by New when a file in the directory is not a DiskQueue
-	// segment of a supported version (wrong magic or version).
-	ErrBadFormat = errors.New("diskqueue: unrecognized file format")
-	// ErrSegmentSizeMismatch is returned by New when reopening a store with a
-	// different SegmentSize than it was created with (which would discard data).
-	ErrSegmentSizeMismatch = errors.New("diskqueue: segment size mismatch")
 )
+
+// queueName is the fixed prefix go-diskqueue uses for the data and metadata files
+// it creates under the queue directory (e.g. "diskqueue.diskqueue.000001.dat").
+const queueName = "diskqueue"
 
 // Options tunes the behaviour of a DiskQueue. The zero value is valid and selects
 // sensible defaults.
 type Options struct {
-	// NoSync disables msync after every write and commit. This trades durability
-	// against a power loss for substantially higher throughput; data still
-	// survives a process crash via the page cache. Default false.
+	// NoSync minimizes fsync after writes. This trades durability against a power
+	// loss for higher throughput; data still survives a process crash via the page
+	// cache, and Close still flushes. Default false.
 	NoSync bool
 
-	// SyncEvery batches durability: msync once every N writes/commits instead of
-	// after each one, amortizing the fsync cost. 0 or 1 syncs every operation (the
-	// default). A larger N raises throughput but widens the power-loss window — up
-	// to the last N unsynced operations can be lost on power loss (they still
-	// survive a process crash via the page cache, and a torn tail is caught by the
-	// per-record checksum). Call Sync to flush on demand; Close always flushes.
-	// Ignored when NoSync is set.
+	// SyncEvery batches durability: fsync once every N writes/reads instead of after
+	// each one. 0 or 1 syncs every operation (the default). A larger N raises
+	// throughput but widens the power-loss window. Ignored when NoSync is set.
 	SyncEvery int
 
 	// SegmentSize sets each segment file's capacity. Default 8 MiB, floored at
-	// 4 KiB and rounded up to a page. A record too big for one segment is
-	// rejected with ErrRecordTooLarge. Fixed at creation: reopening with a
-	// different (post-rounding) value is rejected with ErrSegmentSizeMismatch.
+	// 4 KiB. A record too big for one segment is rejected with ErrRecordTooLarge.
 	SegmentSize int64
 
 	// MaxSegments caps how many segment files are kept at once; once reached, Add
-	// returns ErrFull until a segment is committed and reclaimed. The footprint is
-	// about MaxSegments × SegmentSize bytes. 0 selects the default of 32; a
-	// negative value means unbounded.
+	// returns ErrFull until reading reclaims a segment. The footprint is about
+	// MaxSegments × SegmentSize bytes. 0 selects the default of 32; a negative
+	// value means unbounded. The bound is best-effort (checked against the files on
+	// disk), so the live count may briefly overshoot by a segment.
 	MaxSegments int
 
-	// MaxMapped caps how many segment files are memory-mapped at once. Segments
-	// are mapped on demand and the least-recently-used are unmapped beyond the
-	// cap, bounding address space and msync work for deep backlogs; the active
-	// segment is always mapped. 0 means unbounded (map every touched segment).
-	// Values are raised to a minimum of 2 (the active segment plus one reader).
-	MaxMapped int
-
-	// SyncInterval, if > 0, runs a background goroutine that flushes to stable
-	// storage on that period — a wall-clock backstop for SyncEvery batching, so an
-	// idle queue's last writes become durable within the interval instead of
-	// waiting for SyncEvery more operations. Ignored when NoSync is set.
+	// SyncInterval, if > 0, sets how often the backend flushes to stable storage on
+	// a timer — a wall-clock backstop for SyncEvery batching. Defaults to 2s.
 	SyncInterval time.Duration
-
-	// RecoverCorrupt enables best-effort recovery instead of failing on
-	// corruption. On open, a torn trailing segment (a crash mid-cycle) is dropped
-	// rather than returning ErrCorrupt/ErrBadFormat. On read, a corrupt record
-	// quarantines the remainder of its segment and continues with the next valid
-	// record instead of returning ErrCorrupt. Recovery is lossy — the dropped data
-	// is gone — so each event is counted (see DiskQueue.Corruptions). Default false
-	// (strict: corruption is surfaced as an error).
-	RecoverCorrupt bool
 }
 
 // DiskQueue is a generic persistent FIFO queue of T.
@@ -124,51 +95,110 @@ type DiskQueue[T any] struct {
 	marshal   MarshalFunc[T]
 	unmarshal UnmarshalFunc[T]
 
-	mu     sync.Mutex
-	st     *store
-	closed bool
+	dir        string
+	segCap     int64
+	maxMsgSize int32
+	maxSeg     int // 0 == unbounded
 
-	// scratch is reused by Add to serialize values without allocating.
+	mu     sync.Mutex
+	dq     godq.Interface
+	closed bool
+	done   chan struct{} // closed by Close to unblock readers
+
+	// scratch is reused by Add to serialize values.
 	scratch []byte
 
-	// notify is lazily created by a blocked consumer and closed by Add to wake
-	// waiters; nil when nobody waits, keeping Add alloc-free.
-	notify chan struct{}
+	// segCount caches the live segment-file count and bytesSinceGlob tracks bytes
+	// appended since it was last refreshed, so MaxSegments backpressure does not
+	// stat the directory on every Add (see segmentsFull).
+	segCount       int
+	bytesSinceGlob int64
 
-	// syncStop/syncDone coordinate the optional background syncer (SyncInterval);
-	// both nil when it is not running.
-	syncStop chan struct{}
-	syncDone chan struct{}
+	// drainMu serializes Drain iterations so a bounded drain never deadlocks two
+	// readers competing for the last record on the shared read channel.
+	drainMu sync.Mutex
+
+	// corruptions counts backend recovery events (a torn file renamed .bad and
+	// skipped); incremented from the backend log callback.
+	corruptions int64
 }
 
-// New opens (creating if necessary) a DiskQueue under the directory path. The segment
-// count, durability, and recovery behaviour are tuned via Options (see
-// Options.MaxSegments for the file-count cap, which defaults to 32).
+// New opens (creating if necessary) a DiskQueue under the directory path.
 func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*DiskQueue[T], error) {
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	st, err := openStore(path, segmentCapacity(opt.SegmentSize), resolveMaxSegments(opt.MaxSegments), opt.NoSync, opt.SyncEvery, opt.MaxMapped, opt.RecoverCorrupt)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return nil, err
+	}
+
+	segCap := segmentCapacity(opt.SegmentSize)
+	maxMsg := segCap - 4 // go-diskqueue prefixes each record with a 4-byte length
+	if maxMsg > math.MaxInt32 {
+		maxMsg = math.MaxInt32
+	}
+
+	w := &DiskQueue[T]{
+		marshal:    marshal,
+		unmarshal:  unmarshal,
+		dir:        path,
+		segCap:     segCap,
+		maxMsgSize: int32(maxMsg),
+		maxSeg:     resolveMaxSegments(opt.MaxSegments),
+		done:       make(chan struct{}),
+	}
+
+	n, err := w.countSegments()
 	if err != nil {
 		return nil, err
 	}
-	w := &DiskQueue[T]{marshal: marshal, unmarshal: unmarshal, st: st}
-	if opt.SyncInterval > 0 && !opt.NoSync {
-		w.syncStop = make(chan struct{})
-		w.syncDone = make(chan struct{})
-		go w.syncLoop(opt.SyncInterval)
-	}
+	w.segCount = n
+
+	w.dq = godq.New(queueName, path, segCap, 0, int32(maxMsg),
+		syncEvery(opt), syncInterval(opt), w.logf)
 	return w, nil
 }
 
+// logf is the backend log callback; it counts corruption-recovery events.
+func (w *DiskQueue[T]) logf(lvl godq.LogLevel, f string, args ...interface{}) {
+	if strings.Contains(f, "saving bad file") {
+		atomic.AddInt64(&w.corruptions, 1)
+	}
+}
+
+// syncEvery maps Options onto go-diskqueue's per-write sync count.
+func syncEvery(opt Options) int64 {
+	switch {
+	case opt.NoSync:
+		return math.MaxInt64
+	case opt.SyncEvery <= 1:
+		return 1
+	default:
+		return int64(opt.SyncEvery)
+	}
+}
+
+// syncInterval maps Options onto go-diskqueue's timer-driven sync period
+// (which must be positive).
+func syncInterval(opt Options) time.Duration {
+	switch {
+	case opt.SyncInterval > 0:
+		return opt.SyncInterval
+	case opt.NoSync:
+		return 24 * time.Hour
+	default:
+		return 2 * time.Second
+	}
+}
+
 // defaultMaxSegments bounds the live file count when Options.MaxSegments is left
-// at its zero value: ~32 × SegmentSize of footprint by default.
+// at its zero value.
 const defaultMaxSegments = 32
 
-// resolveMaxSegments maps Options.MaxSegments to the store's convention, where 0
-// means unbounded: the zero value selects defaultMaxSegments, a negative value
-// requests unbounded, and a positive value is used as-is.
+// resolveMaxSegments maps Options.MaxSegments to the internal convention, where 0
+// means unbounded: the zero value selects defaultMaxSegments and a negative value
+// requests unbounded.
 func resolveMaxSegments(v int) int {
 	switch {
 	case v == 0:
@@ -188,10 +218,41 @@ func segmentCapacity(size int64) int64 {
 	if c < 4096 {
 		c = 4096
 	}
-	if ps := int64(os.Getpagesize()); c%ps != 0 {
-		c = (c/ps + 1) * ps
-	}
 	return c
+}
+
+// countSegments returns the number of live numbered segment files under the
+// queue directory (excluding the metadata file and any quarantined .bad files).
+func (w *DiskQueue[T]) countSegments() (int, error) {
+	matches, err := filepath.Glob(filepath.Join(w.dir, queueName+".diskqueue.*.dat"))
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, m := range matches {
+		if strings.HasSuffix(m, ".meta.dat") {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
+// segmentsFull reports whether the live segment count is at the MaxSegments cap,
+// refreshing the cached count when the cap is in reach or a segment's worth of
+// bytes has been written since the last refresh. The caller must hold w.mu.
+func (w *DiskQueue[T]) segmentsFull(recLen int) bool {
+	if w.maxSeg <= 0 {
+		return false
+	}
+	w.bytesSinceGlob += int64(recLen) + 4
+	if w.segCount >= w.maxSeg || w.bytesSinceGlob >= w.segCap {
+		if n, err := w.countSegments(); err == nil {
+			w.segCount = n
+			w.bytesSinceGlob = 0
+		}
+	}
+	return w.segCount >= w.maxSeg
 }
 
 // Add appends data to the back of the log.
@@ -206,56 +267,63 @@ func (w *DiskQueue[T]) Add(data T) error {
 		return err
 	}
 	w.scratch = b // retain grown capacity for reuse
-	before := w.st.writeOffset()
-	err = w.st.append(b)
-	// The record can land even when a per-op msync then fails (append advances the
-	// write offset before flushing). Wake waiters whenever it did, so a durability
-	// error doesn't also strand a blocked consumer on a record that is in the log.
-	if w.st.writeOffset() != before {
-		w.signal()
+	if int64(len(b)) > int64(w.maxMsgSize) {
+		return ErrRecordTooLarge
 	}
-	return err
+	if w.segmentsFull(len(b)) {
+		return ErrFull
+	}
+	return w.dq.Put(b)
 }
 
 // Empty reports whether there are no items available to read.
 func (w *DiskQueue[T]) Empty() bool {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.st.empty()
+	return w.depth() == 0
 }
 
-// Count returns the number of items added but not yet committed.
+// Count returns the number of items added but not yet read.
 func (w *DiskQueue[T]) Count() int {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return int(w.st.count())
+	return int(w.depth())
 }
 
-// Size returns the bytes of uncommitted records, roughly the data on disk.
+// depth returns the backend depth, or 0 once closed.
+func (w *DiskQueue[T]) depth() int64 {
+	w.mu.Lock()
+	closed, dq := w.closed, w.dq
+	w.mu.Unlock()
+	if closed {
+		return 0
+	}
+	return dq.Depth()
+}
+
+// Size returns the bytes the queue currently occupies on disk (its segment
+// files). This is the physical footprint, not the count of unread bytes: it
+// includes already-read records whose file has not yet been reclaimed.
 func (w *DiskQueue[T]) Size() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.st.size()
-}
-
-// Corruptions returns how many corruption events have been recovered from since
-// open (torn trailing segments dropped on open plus segments quarantined on
-// read). Always 0 unless RecoverCorrupt is set. A non-zero value means data was
-// dropped.
-func (w *DiskQueue[T]) Corruptions() int64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.st.corruptionCount()
-}
-
-// Sync flushes buffered writes to stable storage.
-func (w *DiskQueue[T]) Sync() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.closed {
-		return ErrClosed
+	matches, err := filepath.Glob(filepath.Join(w.dir, queueName+".diskqueue.*.dat"))
+	if err != nil {
+		return 0
 	}
-	return w.st.sync()
+	var total int64
+	for _, m := range matches {
+		if strings.HasSuffix(m, ".meta.dat") {
+			continue
+		}
+		if fi, err := os.Stat(m); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
+}
+
+// Corruptions returns how many corruption-recovery events the backend has logged
+// since open (a torn file renamed .bad and skipped). A non-zero value means data
+// was dropped.
+func (w *DiskQueue[T]) Corruptions() int64 {
+	return atomic.LoadInt64(&w.corruptions)
 }
 
 // Close flushes and closes the DiskQueue. Further use returns ErrClosed.
@@ -266,67 +334,8 @@ func (w *DiskQueue[T]) Close() error {
 		return ErrClosed
 	}
 	w.closed = true
-	if w.notify != nil {
-		close(w.notify)
-		w.notify = nil
-	}
+	close(w.done)
+	dq := w.dq
 	w.mu.Unlock()
-
-	// Stop the background syncer before closing the store. The lock is released
-	// so the syncer (which takes it each tick) can observe closed and exit; it
-	// won't touch the store once closed is set.
-	if w.syncStop != nil {
-		close(w.syncStop)
-		<-w.syncDone
-	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.st.close()
-}
-
-// syncLoop flushes the store on a fixed interval until Close stops it; a
-// wall-clock backstop for SyncEvery batching.
-func (w *DiskQueue[T]) syncLoop(d time.Duration) {
-	defer close(w.syncDone)
-	t := time.NewTicker(d)
-	defer t.Stop()
-	for {
-		select {
-		case <-w.syncStop:
-			return
-		case <-t.C:
-			w.mu.Lock()
-			if !w.closed {
-				_ = w.st.sync()
-			}
-			w.mu.Unlock()
-		}
-	}
-}
-
-// waitLocked releases the lock, blocks until Add signals or ctx is done, then
-// reacquires it. The caller must hold w.mu.
-func (w *DiskQueue[T]) waitLocked(ctx context.Context) error {
-	if w.notify == nil {
-		w.notify = make(chan struct{})
-	}
-	ch := w.notify
-	w.mu.Unlock()
-	select {
-	case <-ch:
-		w.mu.Lock()
-		return nil
-	case <-ctx.Done():
-		w.mu.Lock()
-		return ctx.Err()
-	}
-}
-
-// signal wakes any goroutines blocked in waitLocked. The caller must hold w.mu.
-func (w *DiskQueue[T]) signal() {
-	if w.notify != nil {
-		close(w.notify)
-		w.notify = nil
-	}
+	return dq.Close()
 }
