@@ -1,4 +1,4 @@
-module github.com/JohanLindvall/wal
+module github.com/JohanLindvall/diskqueue
 
 go 1.26.4
 

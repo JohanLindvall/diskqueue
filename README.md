@@ -1,8 +1,9 @@
-# wal
+# diskqueue
 
-A generic, durable, FIFO **write-ahead log** (a persistent queue) for Go, backed
-by its own small memory-mapped file store (dependencies: `golang.org/x/sys` for
-mmap/msync and `cespare/xxhash/v2` for per-record checksums).
+A generic, durable, FIFO **disk-backed queue** for Go — a persistent work queue
+that doubles as a write-ahead log — backed by its own small memory-mapped file
+store (dependencies: `golang.org/x/sys` for mmap/msync and `cespare/xxhash/v2`
+for per-record checksums).
 
 Items are appended at the back with `Add` and consumed from the front through a
 `Reader`: a consumer either **takes** an item (read + commit in one step) or
@@ -45,7 +46,7 @@ reads and commits never delete files.
 ## Install
 
 ```sh
-go get github.com/JohanLindvall/wal
+go get github.com/JohanLindvall/diskqueue
 ```
 
 Requires Go 1.23+ (uses `iter.Seq`).
@@ -61,7 +62,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/JohanLindvall/wal"
+	"github.com/JohanLindvall/diskqueue"
 )
 
 // A zero-allocation codec: marshal appends into the provided buffer, unmarshal
@@ -79,7 +80,7 @@ func unmarshal(data []byte) (uint64, error) {
 
 func main() {
 	// Keep at most 8 segment files on disk (default is 32).
-	w, err := wal.New[uint64]("/tmp/myqueue", marshal, unmarshal, wal.Options{MaxSegments: 8})
+	w, err := diskqueue.New[uint64]("/tmp/myqueue", marshal, unmarshal, diskqueue.Options{MaxSegments: 8})
 	if err != nil {
 		panic(err)
 	}
@@ -158,11 +159,11 @@ processing (at-least-once), use `Reserve`/`Commit`.
 
 ## API
 
-`WAL[T]` — produce and manage the log:
+`DiskQueue[T]` — produce and manage the log:
 
 | Method | Description |
 | --- | --- |
-| `New[T](path, marshal, unmarshal, ...Options)` | Open/create a WAL at `path` (segment cap via `Options.MaxSegments`, default 32). |
+| `New[T](path, marshal, unmarshal, ...Options)` | Open/create a DiskQueue at `path` (segment cap via `Options.MaxSegments`, default 32). |
 | `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments`, `ErrRecordTooLarge` if it can't fit a segment. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
 | `Empty() bool` | Whether anything is available to read. |
@@ -211,7 +212,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
   surfaced: a torn trailing segment (a crash mid-cycle) is dropped on open, and a
   corrupt record quarantines the rest of its segment and the reader continues with
   the next valid record. Recovery is lossy — dropped data is gone — so each event
-  is counted by `WAL.Corruptions()`. Without the flag the default is strict.
+  is counted by `DiskQueue.Corruptions()`. Without the flag the default is strict.
 - **Reclamation.** Disk is freed a whole file at a time, once every record in a
   file is committed, and only while writing. A read-only consumer never deletes
   files; reclamation happens on the next `Add` that cycles to a new file.
@@ -221,7 +222,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
   the next read on that same `Reader`; copy it inside `UnmarshalFunc` if you need
   it to outlive that. The copy reuses the buffer, so it allocates nothing once
   warm.
-- **Concurrency.** A `WAL` is safe for concurrent use. A single `Reader` is *not*
+- **Concurrency.** A `DiskQueue` is safe for concurrent use. A single `Reader` is *not*
   — use one `Reader` per consuming goroutine. Multiple Readers share the one
   read/commit cursor and cooperate to consume the stream (each item delivered
   once). `Take`/`TryTake` and the `Drain`/`Follow` iterators read and commit
@@ -237,7 +238,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 ## Options
 
 ```go
-wal.New[T](path, marshal, unmarshal, wal.Options{
+diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
 	MaxSegments:    0,    // 0 = 32 default; N>0 = cap live files (ErrFull); <0 = unbounded
 	NoSync:         true, // skip msync per write/commit (faster, no power-loss durability)
 	SyncEvery:      0,    // 0/1 = msync every op; N>1 = batch the fsync over N ops

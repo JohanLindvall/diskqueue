@@ -1,4 +1,4 @@
-package wal
+package diskqueue
 
 import (
 	"encoding/binary"
@@ -145,7 +145,7 @@ func TestStoreCycleAndOrder(t *testing.T) {
 	}
 }
 
-func TestStoreReadsNeverDeleteWritesDrop(t *testing.T) {
+func TestStoreCommitsReclaimFiles(t *testing.T) {
 	s, dir := newTestStore(t, 64, 0)
 	const n = 200
 	for i := 0; i < n; i++ {
@@ -156,7 +156,8 @@ func TestStoreReadsNeverDeleteWritesDrop(t *testing.T) {
 		t.Fatalf("expected several segments, got %d", peak)
 	}
 
-	// Drain and commit everything via reads — this must not delete any file.
+	// Draining and committing via reads reclaims fully-committed files as they
+	// empty — no append required — leaving only the active (write) segment.
 	for i := 0; i < n; i++ {
 		_, off, ok, _ := s.takeHead()
 		if !ok {
@@ -164,17 +165,20 @@ func TestStoreReadsNeverDeleteWritesDrop(t *testing.T) {
 		}
 		s.commitTo(off)
 	}
-	if got := countDataFiles(t, dir); got != peak {
-		t.Fatalf("reads/commits deleted files: %d != %d", got, peak)
+	if !s.empty() {
+		t.Fatal("should be empty after reading all")
+	}
+	if got := countDataFiles(t, dir); got != 1 {
+		t.Fatalf("commits did not reclaim to the active file: %d files left (peak %d)", got, peak)
 	}
 
-	// A write cycles and reclaims the fully-committed files.
-	for i := 0; i < 100; i++ {
-		mustAppend(t, s, idxRec(i))
+	// The surviving active file still accepts appends and stays correct.
+	mustAppend(t, s, idxRec(999))
+	p, off, ok, _ := s.takeHead()
+	if !ok || recIdx(p) != 999 {
+		t.Fatalf("post-reclaim append/read: idx=%d ok=%v", recIdx(p), ok)
 	}
-	if got := countDataFiles(t, dir); got >= peak {
-		t.Fatalf("expected files dropped on cycle, got %d (peak %d)", got, peak)
-	}
+	s.commitTo(off)
 }
 
 func TestStoreMaxSegments(t *testing.T) {

@@ -1,4 +1,4 @@
-package wal
+package diskqueue
 
 import (
 	"context"
@@ -26,7 +26,7 @@ func unmarshalU64(data []byte) (uint64, error) {
 	return binary.LittleEndian.Uint64(data), nil
 }
 
-func openTest(t *testing.T, maxSegments int) (*WAL[uint64], *Reader[uint64]) {
+func openTest(t *testing.T, maxSegments int) (*DiskQueue[uint64], *Reader[uint64]) {
 	t.Helper()
 	if maxSegments == 0 {
 		maxSegments = -1 // these tests pass 0 for "unbounded" (now a negative value)
@@ -348,7 +348,7 @@ func countDataFiles(t *testing.T, dir string) int {
 	return n
 }
 
-// TestReopenMultiFile exercises WAL-level recovery when the commit cursor lands
+// TestReopenMultiFile exercises DiskQueue-level recovery when the commit cursor lands
 // inside a later segment (earlier ones fully consumed) and several files exist.
 func TestReopenMultiFile(t *testing.T) {
 	dir := t.TempDir()
@@ -550,8 +550,44 @@ func BenchmarkAddTake(b *testing.B) {
 	}
 }
 
-// TestStressConcurrent runs several producers and consumers against one WAL and
-// checks every value is delivered exactly once (and the WAL stays race-free).
+// TestAddTakeZeroAlloc guards the alloc-free hot path in the regular test suite
+// (not just the benchmark): the header()/setter-returns-a-closure pattern is only
+// zero-alloc because escape analysis stack-allocates those closures, so a compiler
+// or refactor regression that starts heap-allocating per Add/Take is caught here.
+func TestAddTakeZeroAlloc(t *testing.T) {
+	// Default 8 MiB segment so 1000 iterations never cycle a file (which would
+	// allocate a dataFile + mapping and is amortized away in the benchmark).
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{NoSync: true, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	r := w.NewReader()
+	for i := uint64(0); i < 100; i++ { // warm up scratch buffers and the active mapping
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok, err := r.TryTake(); err != nil || !ok {
+			t.Fatalf("warmup take: ok=%v err=%v", ok, err)
+		}
+	}
+	var i uint64
+	allocs := testing.AllocsPerRun(1000, func() {
+		if err := w.Add(i); err != nil {
+			t.Fatalf("Add: %v", err)
+		}
+		if _, ok, err := r.TryTake(); err != nil || !ok {
+			t.Fatalf("TryTake: ok=%v err=%v", ok, err)
+		}
+		i++
+	})
+	if allocs != 0 {
+		t.Fatalf("Add+TryTake allocated %v objects/op, want 0", allocs)
+	}
+}
+
+// TestStressConcurrent runs several producers and consumers against one DiskQueue and
+// checks every value is delivered exactly once (and the DiskQueue stays race-free).
 func TestStressConcurrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short mode")
@@ -721,7 +757,7 @@ func TestSegmentSizeMismatch(t *testing.T) {
 }
 
 // TestConcurrentDrainCooperates verifies that two Drain iterations running
-// concurrently on the same WAL split the stream without loss or duplication —
+// concurrently on the same DiskQueue split the stream without loss or duplication —
 // safe now that Drain commits each item under the lock as it is read.
 func TestConcurrentDrainCooperates(t *testing.T) {
 	w, _ := openTest(t, 0)

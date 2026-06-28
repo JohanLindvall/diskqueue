@@ -1,8 +1,9 @@
-// Package wal implements a generic, durable, FIFO write-ahead log (a persistent
-// queue) backed by its own mmap file store (see store.go); its only dependencies
-// are golang.org/x/sys (mmap/msync) and cespare/xxhash/v2 (per-record checksums).
+// Package diskqueue implements a generic, durable, FIFO disk-backed queue (a
+// persistent work queue that doubles as a write-ahead log) backed by its own mmap
+// file store (see store.go); its only dependencies are golang.org/x/sys
+// (mmap/msync) and cespare/xxhash/v2 (per-record checksums).
 //
-// Items are appended with Add and consumed through a Reader (WAL.NewReader): Take
+// Items are appended with Add and consumed through a Reader (DiskQueue.NewReader): Take
 // reads + commits in one step, or Reserve reads and later Commits its offset.
 // Committing advances a persisted read cursor; data files are reclaimed once
 // fully committed.
@@ -15,7 +16,7 @@
 // it) is owned by the Reader and valid only until that Reader's next read; copy
 // it if you need it longer.
 //
-// Concurrency: a WAL is safe for concurrent use; a single Reader is not — use one
+// Concurrency: a DiskQueue is safe for concurrent use; a single Reader is not — use one
 // per consuming goroutine. Readers share one read/commit cursor and cooperate
 // (each item delivered once). Take/TryTake and Drain/Follow commit under the lock
 // as they read, so they are safe for concurrent cooperating readers. Reserve/
@@ -25,7 +26,7 @@
 //
 // Crash semantics: at-least-once. On open the read cursor resets to the persisted
 // commit cursor, so uncommitted items replay.
-package wal
+package diskqueue
 
 import (
 	"context"
@@ -45,28 +46,28 @@ type UnmarshalFunc[T any] func(data []byte) (T, error)
 
 // Errors returned by the package.
 var (
-	// ErrClosed is returned once the WAL has been closed.
-	ErrClosed = errors.New("wal: closed")
+	// ErrClosed is returned once the DiskQueue has been closed.
+	ErrClosed = errors.New("diskqueue: closed")
 	// ErrFull is returned by Add when a new segment would exceed maxSegments.
-	ErrFull = errors.New("wal: full")
+	ErrFull = errors.New("diskqueue: full")
 	// ErrInvalidOffset is returned by Commit for an offset beyond the last record.
-	ErrInvalidOffset = errors.New("wal: invalid offset")
+	ErrInvalidOffset = errors.New("diskqueue: invalid offset")
 	// ErrRecordTooLarge is returned by Add when a record cannot fit one segment.
-	ErrRecordTooLarge = errors.New("wal: record too large")
+	ErrRecordTooLarge = errors.New("diskqueue: record too large")
 	// ErrCorrupt is returned when a stored xxhash64 does not match its data,
 	// indicating on-disk corruption — either a record's payload (the read cursor
 	// does not advance, so the bad record is reported on every subsequent read) or
 	// a file header (open fails).
-	ErrCorrupt = errors.New("wal: checksum mismatch")
-	// ErrBadFormat is returned by New when a file in the directory is not a WAL
+	ErrCorrupt = errors.New("diskqueue: checksum mismatch")
+	// ErrBadFormat is returned by New when a file in the directory is not a DiskQueue
 	// segment of a supported version (wrong magic or version).
-	ErrBadFormat = errors.New("wal: unrecognized file format")
+	ErrBadFormat = errors.New("diskqueue: unrecognized file format")
 	// ErrSegmentSizeMismatch is returned by New when reopening a store with a
 	// different SegmentSize than it was created with (which would discard data).
-	ErrSegmentSizeMismatch = errors.New("wal: segment size mismatch")
+	ErrSegmentSizeMismatch = errors.New("diskqueue: segment size mismatch")
 )
 
-// Options tunes the behaviour of a WAL. The zero value is valid and selects
+// Options tunes the behaviour of a DiskQueue. The zero value is valid and selects
 // sensible defaults.
 type Options struct {
 	// NoSync disables msync after every write and commit. This trades durability
@@ -113,13 +114,13 @@ type Options struct {
 	// rather than returning ErrCorrupt/ErrBadFormat. On read, a corrupt record
 	// quarantines the remainder of its segment and continues with the next valid
 	// record instead of returning ErrCorrupt. Recovery is lossy — the dropped data
-	// is gone — so each event is counted (see WAL.Corruptions). Default false
+	// is gone — so each event is counted (see DiskQueue.Corruptions). Default false
 	// (strict: corruption is surfaced as an error).
 	RecoverCorrupt bool
 }
 
-// WAL is a generic persistent FIFO queue of T.
-type WAL[T any] struct {
+// DiskQueue is a generic persistent FIFO queue of T.
+type DiskQueue[T any] struct {
 	marshal   MarshalFunc[T]
 	unmarshal UnmarshalFunc[T]
 
@@ -140,10 +141,10 @@ type WAL[T any] struct {
 	syncDone chan struct{}
 }
 
-// New opens (creating if necessary) a WAL under the directory path. The segment
+// New opens (creating if necessary) a DiskQueue under the directory path. The segment
 // count, durability, and recovery behaviour are tuned via Options (see
 // Options.MaxSegments for the file-count cap, which defaults to 32).
-func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*WAL[T], error) {
+func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*DiskQueue[T], error) {
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -152,7 +153,7 @@ func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T],
 	if err != nil {
 		return nil, err
 	}
-	w := &WAL[T]{marshal: marshal, unmarshal: unmarshal, st: st}
+	w := &DiskQueue[T]{marshal: marshal, unmarshal: unmarshal, st: st}
 	if opt.SyncInterval > 0 && !opt.NoSync {
 		w.syncStop = make(chan struct{})
 		w.syncDone = make(chan struct{})
@@ -194,7 +195,7 @@ func segmentCapacity(size int64) int64 {
 }
 
 // Add appends data to the back of the log.
-func (w *WAL[T]) Add(data T) error {
+func (w *DiskQueue[T]) Add(data T) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -205,29 +206,33 @@ func (w *WAL[T]) Add(data T) error {
 		return err
 	}
 	w.scratch = b // retain grown capacity for reuse
-	if err := w.st.append(b); err != nil {
-		return err
+	before := w.st.writeOffset()
+	err = w.st.append(b)
+	// The record can land even when a per-op msync then fails (append advances the
+	// write offset before flushing). Wake waiters whenever it did, so a durability
+	// error doesn't also strand a blocked consumer on a record that is in the log.
+	if w.st.writeOffset() != before {
+		w.signal()
 	}
-	w.signal()
-	return nil
+	return err
 }
 
 // Empty reports whether there are no items available to read.
-func (w *WAL[T]) Empty() bool {
+func (w *DiskQueue[T]) Empty() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.st.empty()
 }
 
 // Count returns the number of items added but not yet committed.
-func (w *WAL[T]) Count() int {
+func (w *DiskQueue[T]) Count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return int(w.st.count())
 }
 
 // Size returns the bytes of uncommitted records, roughly the data on disk.
-func (w *WAL[T]) Size() int64 {
+func (w *DiskQueue[T]) Size() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.st.size()
@@ -237,14 +242,14 @@ func (w *WAL[T]) Size() int64 {
 // open (torn trailing segments dropped on open plus segments quarantined on
 // read). Always 0 unless RecoverCorrupt is set. A non-zero value means data was
 // dropped.
-func (w *WAL[T]) Corruptions() int64 {
+func (w *DiskQueue[T]) Corruptions() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.st.corruptionCount()
 }
 
 // Sync flushes buffered writes to stable storage.
-func (w *WAL[T]) Sync() error {
+func (w *DiskQueue[T]) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -253,8 +258,8 @@ func (w *WAL[T]) Sync() error {
 	return w.st.sync()
 }
 
-// Close flushes and closes the WAL. Further use returns ErrClosed.
-func (w *WAL[T]) Close() error {
+// Close flushes and closes the DiskQueue. Further use returns ErrClosed.
+func (w *DiskQueue[T]) Close() error {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -282,7 +287,7 @@ func (w *WAL[T]) Close() error {
 
 // syncLoop flushes the store on a fixed interval until Close stops it; a
 // wall-clock backstop for SyncEvery batching.
-func (w *WAL[T]) syncLoop(d time.Duration) {
+func (w *DiskQueue[T]) syncLoop(d time.Duration) {
 	defer close(w.syncDone)
 	t := time.NewTicker(d)
 	defer t.Stop()
@@ -302,7 +307,7 @@ func (w *WAL[T]) syncLoop(d time.Duration) {
 
 // waitLocked releases the lock, blocks until Add signals or ctx is done, then
 // reacquires it. The caller must hold w.mu.
-func (w *WAL[T]) waitLocked(ctx context.Context) error {
+func (w *DiskQueue[T]) waitLocked(ctx context.Context) error {
 	if w.notify == nil {
 		w.notify = make(chan struct{})
 	}
@@ -319,7 +324,7 @@ func (w *WAL[T]) waitLocked(ctx context.Context) error {
 }
 
 // signal wakes any goroutines blocked in waitLocked. The caller must hold w.mu.
-func (w *WAL[T]) signal() {
+func (w *DiskQueue[T]) signal() {
 	if w.notify != nil {
 		close(w.notify)
 		w.notify = nil

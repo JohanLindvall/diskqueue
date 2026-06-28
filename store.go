@@ -1,4 +1,4 @@
-package wal
+package diskqueue
 
 import (
 	"encoding/binary"
@@ -135,7 +135,7 @@ func (df *dataFile) headerChecksumOK() bool {
 }
 
 // store is the raw, []byte-oriented file backend. Not safe for concurrent use;
-// the WAL serializes access with its own mutex.
+// the DiskQueue serializes access with its own mutex.
 type store struct {
 	dir            string
 	segmentSize    int64 // capacity of each file's data region (excludes header)
@@ -521,9 +521,10 @@ func (s *store) createFile(num uint64, base int64) (*dataFile, error) {
 		setWriteCursor(headerSize),
 	)
 	// Persist the header so a freshly cycled segment is a valid file on disk
-	// (magic/checksum) even before its first record is written.
+	// (magic/checksum) even before its first record is written — just the header
+	// page, not the whole (otherwise-empty) mapping.
 	if !s.noSync {
-		_ = unix.Msync(df.data, unix.MS_SYNC)
+		_ = s.msyncRange(df, 0, headerSize)
 		df.headerDirty = false // flushed inline
 	}
 	// else: header() left it dirty so an explicit Sync flushes the fresh header.
@@ -586,7 +587,9 @@ func (s *store) append(payload []byte) error {
 	case s.batched():
 		s.recordOp()
 	default:
-		s.flushDirty(af) // per-op: msync the header and the new record bytes, clearing both
+		// Per-op: msync the new record bytes then the header, clearing both, and
+		// surface a flush failure rather than reporting a durable Add.
+		return s.flushDirtyErr(af)
 	}
 	return nil
 }
@@ -594,7 +597,7 @@ func (s *store) append(payload []byte) error {
 // cycle drops any now fully-committed files and starts a fresh active file. It
 // fails with ErrFull if creating the new file would exceed maxSegments.
 func (s *store) cycle() error {
-	s.dropCommitted()
+	s.dropCommitted(nil) // the soon-to-be-old active file may go; a new one follows
 	if s.maxSegments > 0 && len(s.files) >= s.maxSegments {
 		return ErrFull
 	}
@@ -614,14 +617,17 @@ func (s *store) cycle() error {
 	return nil
 }
 
-// dropCommitted removes (and unmaps) every fully-committed file — the only place
-// files are deleted. Called from cycle under the WAL lock, so no store op races
-// it. A just-delivered record's file may be unmapped here; that's safe only
-// because read copied the payload into the Reader's scratch under the lock.
-func (s *store) dropCommitted() {
-	keep := s.files[:0]
+// dropCommitted removes (and unmaps) every fully-committed file except keep.
+// Called from cycle (writes) with keep == nil — it recreates the active file
+// right after, so the old full one may go — and from commitTo (commits) with
+// keep == the active file, which holds the write position and must survive even
+// when fully drained. Both run under the DiskQueue lock, so no store op races it. A
+// just-delivered record's file may be unmapped here; that's safe only because
+// read copied the payload into the Reader's scratch under the lock.
+func (s *store) dropCommitted(keep *dataFile) {
+	survive := s.files[:0]
 	for _, df := range s.files {
-		if df.base+df.size <= s.commitOff {
+		if df != keep && df.base+df.size <= s.commitOff {
 			// written == committed here, so this keeps Count exact.
 			s.nWritten -= df.written
 			s.nCommitted -= df.committed
@@ -633,9 +639,9 @@ func (s *store) dropCommitted() {
 			_ = os.Remove(s.filePath(df.num))
 			continue
 		}
-		keep = append(keep, df)
+		survive = append(survive, df)
 	}
-	s.files = keep
+	s.files = survive
 }
 
 // fileForOffset returns the file holding the record that starts at the global
@@ -808,6 +814,12 @@ func (s *store) commitTo(off int64) {
 	} else if s.batched() {
 		s.recordOp()
 	}
+	// Reclaim any files this commit fully drained, so a consume-only or producer-
+	// stopped workload frees disk without waiting for the next append. Keep the
+	// active file (it holds the write position); the directory entry removal is
+	// not fsync'd here — a lingering file after a crash is re-dropped, never
+	// re-delivered (its records stay committed), so reclamation is best-effort.
+	s.dropCommitted(s.active())
 }
 
 func (s *store) empty() bool            { return s.headOff >= s.writeOff }
@@ -883,21 +895,34 @@ func (s *store) flushDirty(df *dataFile) { _ = s.flushDirtyErr(df) }
 // flushDirtyErr is flushDirty returning the first msync error (for sync/close).
 // The header (page 0) and the dirty data range are flushed independently, so the
 // clean record pages between them are never scanned.
+//
+// The data range is flushed *before* the header. The header carries the write
+// cursor that publishes those record bytes, so persisting it first would let a
+// power loss leave a visible record whose payload never reached disk (a torn tail
+// the checksum flags as corrupt). Data-then-header instead guarantees a clean
+// truncation: a crash mid-flush just leaves the record invisible.
 func (s *store) flushDirtyErr(df *dataFile) error {
 	if df.data == nil {
 		return nil
 	}
-	if df.headerDirty {
-		if err := s.msyncRange(df, 0, headerSize); err != nil {
-			return err
-		}
-		df.headerDirty = false
-	}
+	headerCovered := false
 	if df.dirtyLo < df.dirtyHi {
+		// A data range starting within page 0 page-aligns down to 0, so its msync
+		// already flushes the header page — no separate header sync is then needed
+		// (and the header bytes share that page anyway, so ordering is moot).
+		headerCovered = df.dirtyLo < int(s.pageSize)
 		if err := s.msyncRange(df, df.dirtyLo, df.dirtyHi); err != nil {
 			return err
 		}
 		df.dirtyLo, df.dirtyHi = 0, 0
+	}
+	if df.headerDirty {
+		if !headerCovered {
+			if err := s.msyncRange(df, 0, headerSize); err != nil {
+				return err
+			}
+		}
+		df.headerDirty = false
 	}
 	return nil
 }

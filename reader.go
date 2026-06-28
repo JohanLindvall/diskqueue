@@ -1,11 +1,11 @@
-package wal
+package diskqueue
 
 import (
 	"context"
 	"iter"
 )
 
-// NewReader returns a Reader that consumes from this WAL; all read operations
+// NewReader returns a Reader that consumes from this DiskQueue; all read operations
 // are methods on it.
 //
 // A Reader copies each record into a private reused buffer before unmarshalling,
@@ -14,13 +14,13 @@ import (
 // use: use one per consuming goroutine. Readers share the read/commit cursor and
 // cooperate (each item delivered once); see the package doc on which ops are safe
 // across concurrent readers.
-func (w *WAL[T]) NewReader() *Reader[T] {
+func (w *DiskQueue[T]) NewReader() *Reader[T] {
 	return &Reader[T]{w: w}
 }
 
-// Reader is a consuming view over a WAL; create it with WAL.NewReader.
+// Reader is a consuming view over a DiskQueue; create it with DiskQueue.NewReader.
 type Reader[T any] struct {
-	w       *WAL[T]
+	w       *DiskQueue[T]
 	scratch []byte // record copy, reused across reads
 }
 
@@ -126,7 +126,7 @@ func (r *Reader[T]) Drain(ctx context.Context) iter.Seq[T] {
 }
 
 // Follow is like Drain but unbounded: after the existing items it waits for and
-// yields new ones until ctx is cancelled or the WAL is closed. Each item is
+// yields new ones until ctx is cancelled or the DiskQueue is closed. Each item is
 // committed as it is read (at-most-once; see Drain). The lock is released across
 // yields, so other methods may be called from within the loop.
 func (r *Reader[T]) Follow(ctx context.Context) iter.Seq[T] {

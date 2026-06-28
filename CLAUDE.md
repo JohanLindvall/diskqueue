@@ -4,19 +4,19 @@ Guidance for working in this repository.
 
 ## What this is
 
-`github.com/JohanLindvall/wal` — a generic, durable FIFO queue (write-ahead log)
-for Go. The public API and behaviour are documented in [README.md](README.md);
-read it first. Its only dependencies are `golang.org/x/sys` (mmap/msync) and
-`cespare/xxhash/v2` (per-record checksums) — it used to wrap `tidwall/wal`, but
-now ships its own store.
+`github.com/JohanLindvall/diskqueue` — a generic, durable FIFO disk-backed queue
+(a persistent work queue that doubles as a write-ahead log) for Go. The public API
+and behaviour are documented in [README.md](README.md); read it first. Its only
+dependencies are `golang.org/x/sys` (mmap/msync) and `cespare/xxhash/v2`
+(per-record checksums); it ships its own mmap-backed store.
 
 - [store.go](store.go) — the `store`: the mmap-backed, `[]byte`-only file backend.
-- [wal.go](wal.go) — the generic `WAL[T]` writer/owner (Add, Empty/Count/Size,
+- [diskqueue.go](diskqueue.go) — the generic `DiskQueue[T]` writer/owner (Add, Empty/Count/Size,
   Sync/Close, NewReader) on top of `store`.
 - [reader.go](reader.go) — `Reader[T]`: all consume ops (Reserve/Take/Commit/
   Drain/Follow); copies each record into its own scratch buffer.
 - [store_test.go](store_test.go) — store-level unit tests (`TestStore*`).
-- [wal_test.go](wal_test.go) — WAL-level tests and `BenchmarkAddTake`.
+- [diskqueue_test.go](diskqueue_test.go) — DiskQueue-level tests and `BenchmarkAddTake`.
 
 ## Build / test
 
@@ -76,19 +76,25 @@ mirrors its own `written`/`committed` counts into its header.
   This copy is load-bearing: since consume ops commit a record as they read it,
   its file may be unmapped while the consumer still holds the value (see
   "Immediate unmap is safe").
-- **Reclamation is write-only and whole-file.** `dropCommitted` (called only from
-  `cycle`, i.e. from `append`) deletes files whose every record is committed
-  (`base+size <= commitOff`), never the active file. Reads/commits must never
-  delete a file — this is deliberate ("only writes can cycle").
+- **Reclamation is whole-file, on write *and* commit.** `dropCommitted(keep)`
+  deletes files whose every record is committed (`base+size <= commitOff`), except
+  `keep`. It runs from two places: `cycle` (from `append`) with `keep == nil` —
+  the soon-to-be-old active file may go since a new one follows immediately — and
+  the end of `commitTo` with `keep == s.active()`, so a consume-only or producer-
+  stopped workload reclaims disk without waiting for the next write, but never
+  drops the active file (it holds the write position). The commit-path removal is
+  *not* `syncDir`'d, so reclamation is best-effort: a file lingering after a crash
+  is re-dropped on the next drop and never re-delivered (its records stay
+  committed), so correctness doesn't depend on the removal being durable.
 - **Immediate unmap is safe** because `Reader.read` copies the payload into
   `r.scratch` *under the lock*; the value the consumer holds never aliases the
-  mapping. This is now the *only* guarantee: `Take`/`Drain`/`Follow` commit a
-  record as they read it, so a just-delivered record's file **can** be fully
-  committed and unmapped by a concurrent `Add`'s `dropCommitted` while the
-  consumer still holds the value — the scratch copy, not file retention, is what
-  keeps it valid. All store ops hold the WAL mutex, so no munmap races the read
-  itself. (Touching an mmap slice after `munmap` is a SIGSEGV the GC can't
-  prevent — that's why the copy matters.)
+  mapping. This is load-bearing now that **commits** reclaim too: `Take`/`Drain`/
+  `Follow` read-then-`commitTo` under the lock, and that same `commitTo` can fully
+  commit and unmap the just-delivered record's file via `dropCommitted` — but the
+  scratch copy already happened (read precedes commit), so the held value stays
+  valid. A concurrent `Add`'s `dropCommitted` can do the same. All store ops hold
+  the DiskQueue mutex, so no munmap races the read itself. (Touching an mmap slice after
+  `munmap` is a SIGSEGV the GC can't prevent — that's why the copy matters.)
 - **`maxSegments` bounds the file count.** `cycle` drops committed files, then
   returns `ErrFull` if `len(files) >= maxSegments` (0 = unbounded). So the bound
   is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.
@@ -109,14 +115,14 @@ mirrors its own `written`/`committed` counts into its header.
   committed data) and recreates a fresh file if all were dropped; `takeHead`
   calls `skipCorruptSegment`, which advances `headOff` past the segment and
   force-commits its tail when `commitOff` is already inside it (auto-commit path),
-  reclaiming it. Recovery is lossy; `s.corruptions` counts events (`WAL.Corruptions`).
+  reclaiming it. Recovery is lossy; `s.corruptions` counts events (`DiskQueue.Corruptions`).
 - **Blocking waiters.** `waitLocked`/`signal` use a lazily-created `notify`
   channel, nil when nobody waits, so `Add` stays allocation-free.
 - **`Reader.Drain`/`Follow` consume** via the shared `headOff` (like iterator-
   shaped `Take`): read **and `commitTo` under the lock**, then release and yield —
   so they commit-on-read (at-most-once) and are safe for concurrent cooperating
   readers. `Drain` is bounded by a `writeOff` snapshot; `Follow` waits via
-  `waitLocked` (which lives on WAL, called as `r.w.waitLocked`).
+  `waitLocked` (which lives on DiskQueue, called as `r.w.waitLocked`).
 - **Sync policy.** `noSync` skips msync; `syncEvery <= 1` msyncs every write/
   commit inline (ordered: data then header); `syncEvery > 1` (`batched()`) defers
   to `flushBatch` every N ops. A torn tail from a power loss between batched
