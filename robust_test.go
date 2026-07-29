@@ -602,7 +602,7 @@ func vanishSegment(t *testing.T, s *store, idx int) {
 	if df.f != nil {
 		_ = df.f.Close()
 		df.f = nil
-		s.removeMapped(df)
+		s.untrackOpen(df)
 	}
 	if err := os.Remove(s.filePath(df.num)); err != nil {
 		t.Fatal(err)

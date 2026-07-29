@@ -89,10 +89,10 @@ func BenchmarkAddDurable(b *testing.B) {
 // handle cap engaged, so segment lookup and handle churn are both in the path.
 func BenchmarkDeepBacklog(b *testing.B) {
 	for _, maxOpen := range []int{0, 3} {
-		b.Run("MaxMapped"+strconv.Itoa(maxOpen), func(b *testing.B) {
+		b.Run("MaxOpenFiles"+strconv.Itoa(maxOpen), func(b *testing.B) {
 			m, u := benchCodec()
 			w, err := New[[]byte](b.TempDir(), m, u, Options{
-				NoSync: true, SegmentSize: 4096, MaxSegments: -1, MaxMapped: maxOpen,
+				NoSync: true, SegmentSize: 4096, MaxSegments: -1, MaxOpenFiles: maxOpen,
 			})
 			if err != nil {
 				b.Fatal(err)

@@ -26,15 +26,15 @@ import (
 // 0 with WriteAt; recovery reads it back with a bare pread.
 
 // store is the raw, []byte-oriented file backend. Not safe for concurrent use;
-// the DiskQueue serializes access with its own mutex.
+// the Queue serializes access with its own mutex.
 type store struct {
-	dir         string
-	dirFile     *os.File // held open for the whole session: directory fsync + advisory lock
-	segmentSize int64    // capacity of each file's data region (excludes header)
-	maxSegments int      // max number of data files retained at once; 0 == unbounded
-	noSync      bool
-	syncEvery   int // fsync every N writes/commits; <=1 means every one
-	maxMapped   int // cap on simultaneously open segment files; 0 == unbounded
+	dir          string
+	dirFile      *os.File // held open for the whole session: directory fsync + advisory lock
+	segmentSize  int64    // capacity of each file's data region (excludes header)
+	maxSegments  int      // max number of data files retained at once; 0 == unbounded
+	noSync       bool
+	syncEvery    int // fsync every N writes/commits; <=1 means every one
+	maxOpenFiles int // cap on simultaneously open segment files; 0 == unbounded
 
 	// ioErr latches the first fsync failure (see failIO). Once set, every
 	// operation that would otherwise claim durability returns it.
@@ -44,12 +44,12 @@ type store struct {
 	nextNum uint64
 
 	// Intrusive LRU list of currently open files, so touch/evict/remove are O(1)
-	// pointer splices rather than O(n) slice shifts. mappedMRU is the
-	// most-recently-used end (where touches and new opens go); mappedLRU is the
-	// eviction end. mappedLen tracks the length against maxMapped.
-	mappedMRU *dataFile
-	mappedLRU *dataFile
-	mappedLen int
+	// pointer splices rather than O(n) slice shifts. lruMRU is the
+	// most-recently-used end (where touches and new opens go); lruLRU is the
+	// eviction end. nOpen tracks the length against maxOpenFiles.
+	lruMRU *dataFile
+	lruLRU *dataFile
+	nOpen  int
 
 	// lastFrameAt/lastFrameEnd cache the boundary of the record the most recent
 	// read crossed. Every consume path is read-then-commit under one lock, so the
@@ -104,11 +104,11 @@ type store struct {
 	nCommittedTotal uint64
 }
 
-func openStore(dir string, segmentSize int64, maxSegments int, noSync bool, syncEvery, maxMapped int) (*store, error) {
+func openStore(dir string, segmentSize int64, maxSegments int, noSync bool, syncEvery, maxOpenFiles int) (*store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	if maxMapped != 0 && maxMapped < 3 {
+	if maxOpenFiles != 0 && maxOpenFiles < 3 {
 		// Three cursors can each sit in a different segment: the write cursor, the
 		// read cursor, and the commit cursor that Reserve/Commit leaves behind it.
 		// A cap of 2 evicts one of them on every operation, so the file the next op
@@ -116,19 +116,19 @@ func openStore(dir string, segmentSize int64, maxSegments int, noSync bool, sync
 		//
 		// A negative value means the floor, not "unbounded": a caller computing a
 		// descriptor budget must never get an uncapped queue out of a bad number.
-		maxMapped = 3
+		maxOpenFiles = 3
 	}
 	s := &store{
-		dir:         dir,
-		segmentSize: segmentSize,
-		maxSegments: maxSegments,
-		noSync:      noSync,
-		syncEvery:   syncEvery,
-		maxMapped:   maxMapped,
+		dir:          dir,
+		segmentSize:  segmentSize,
+		maxSegments:  maxSegments,
+		noSync:       noSync,
+		syncEvery:    syncEvery,
+		maxOpenFiles: maxOpenFiles,
 	}
 	// Hold the directory open for the session: it is both the handle the segment
 	// creations/removals are fsync'd through and the thing the advisory lock hangs
-	// on, so no other DiskQueue can write into the same directory.
+	// on, so no other Queue can write into the same directory.
 	d, err := os.Open(dir)
 	if err != nil {
 		return nil, err
@@ -162,11 +162,11 @@ func (s *store) failIO(err error) error {
 	return s.ioErr
 }
 
-// ensureMapped opens df's file if needed and marks it most-recently-used; the
+// ensureOpen opens df's file if needed and marks it most-recently-used; the
 // active file stays open because every append touches it.
-func (s *store) ensureMapped(df *dataFile) error {
+func (s *store) ensureOpen(df *dataFile) error {
 	if df.f != nil {
-		s.touchMapped(df)
+		s.touchOpen(df)
 		return nil
 	}
 	f, err := os.OpenFile(s.filePath(df.num), os.O_RDWR, 0o644)
@@ -174,76 +174,76 @@ func (s *store) ensureMapped(df *dataFile) error {
 		return err
 	}
 	df.f = f
-	s.trackMapped(df)
+	s.trackOpen(df)
 	return nil
 }
 
-// trackMapped records df as open (most-recently-used) and evicts down to the cap.
-func (s *store) trackMapped(df *dataFile) {
-	s.mappedPushMRU(df)
-	s.evictMapped(df)
+// trackOpen records df as open (most-recently-used) and evicts down to the cap.
+func (s *store) trackOpen(df *dataFile) {
+	s.lruPushMRU(df)
+	s.evictOpen(df)
 }
 
-// touchMapped moves an already-open df to the most-recently-used end.
-func (s *store) touchMapped(df *dataFile) {
-	if df == s.mappedMRU {
+// touchOpen moves an already-open df to the most-recently-used end.
+func (s *store) touchOpen(df *dataFile) {
+	if df == s.lruMRU {
 		return
 	}
-	s.mappedUnlink(df)
-	s.mappedPushMRU(df)
+	s.lruUnlink(df)
+	s.lruPushMRU(df)
 }
 
-// removeMapped detaches df from the LRU list (its file is being closed/removed).
-func (s *store) removeMapped(df *dataFile) {
-	s.mappedUnlink(df)
+// untrackOpen detaches df from the LRU list (its file is being closed/removed).
+func (s *store) untrackOpen(df *dataFile) {
+	s.lruUnlink(df)
 }
 
-// mappedPushMRU links df in at the most-recently-used end. df must not already
+// lruPushMRU links df in at the most-recently-used end. df must not already
 // be in the list.
-func (s *store) mappedPushMRU(df *dataFile) {
+func (s *store) lruPushMRU(df *dataFile) {
 	df.lruPrev = nil
-	df.lruNext = s.mappedMRU
-	if s.mappedMRU != nil {
-		s.mappedMRU.lruPrev = df
+	df.lruNext = s.lruMRU
+	if s.lruMRU != nil {
+		s.lruMRU.lruPrev = df
 	} else {
-		s.mappedLRU = df
+		s.lruLRU = df
 	}
-	s.mappedMRU = df
-	s.mappedLen++
+	s.lruMRU = df
+	s.nOpen++
 }
 
-// mappedUnlink removes df from the LRU list and clears its links.
-func (s *store) mappedUnlink(df *dataFile) {
+// lruUnlink removes df from the LRU list and clears its links.
+func (s *store) lruUnlink(df *dataFile) {
 	if df.lruPrev != nil {
 		df.lruPrev.lruNext = df.lruNext
 	} else {
-		s.mappedMRU = df.lruNext
+		s.lruMRU = df.lruNext
 	}
 	if df.lruNext != nil {
 		df.lruNext.lruPrev = df.lruPrev
 	} else {
-		s.mappedLRU = df.lruPrev
+		s.lruLRU = df.lruPrev
 	}
 	df.lruPrev, df.lruNext = nil, nil
-	s.mappedLen--
+	s.nOpen--
 }
 
-// evictMapped closes least-recently-used files until at most maxMapped remain
+// evictOpen closes least-recently-used files until at most maxOpenFiles remain
 // open, never closing the active file or keep (the one just opened). A dirty
 // victim is fsync'd before its handle is closed (a failure there latches ioErr,
 // so it is not lost); under noSync nothing is fsync'd and the victim stays
 // marked dirty, so a later explicit Sync reopens it and flushes it rather than
 // mistaking a closed handle for a clean file.
-func (s *store) evictMapped(keep *dataFile) {
-	if s.maxMapped <= 0 {
+func (s *store) evictOpen(keep *dataFile) {
+	if s.maxOpenFiles <= 0 {
 		return
 	}
 	active := s.active()
-	for s.mappedLen > s.maxMapped {
+	for s.nOpen > s.maxOpenFiles {
 		// Walk from the least-recently-used end toward the most-recently-used,
 		// skipping the active and just-opened files (which are never evicted).
 		var victim *dataFile
-		for df := s.mappedLRU; df != nil; df = df.lruPrev {
+		for df := s.lruLRU; df != nil; df = df.lruPrev {
 			if df != active && df != keep {
 				victim = df
 				break
@@ -259,7 +259,7 @@ func (s *store) evictMapped(keep *dataFile) {
 		}
 		_ = victim.f.Close() // read-back errors, if any, are already accounted for
 		victim.f = nil
-		s.mappedUnlink(victim)
+		s.lruUnlink(victim)
 	}
 }
 
@@ -350,7 +350,7 @@ func (s *store) active() *dataFile {
 // durable) and marks the file dirty, reopening the file if it was evicted.
 func (s *store) writeHeader(df *dataFile) error {
 	if df.f == nil {
-		if err := s.ensureMapped(df); err != nil {
+		if err := s.ensureOpen(df); err != nil {
 			return err
 		}
 	}
@@ -373,7 +373,7 @@ func (s *store) flushFile(df *dataFile) error {
 		return nil
 	}
 	if df.f == nil {
-		if err := s.ensureMapped(df); err != nil {
+		if err := s.ensureOpen(df); err != nil {
 			return err
 		}
 	}
@@ -412,10 +412,15 @@ func (s *store) append(payload []byte) error {
 	}
 	// The active file stays open; this also marks it most-recently-used so the
 	// LRU never evicts it.
-	if err := s.ensureMapped(af); err != nil {
+	if err := s.ensureOpen(af); err != nil {
 		return err
 	}
 
+	if faultsEnabled {
+		if err := faultPoint("append.writeRecord"); err != nil {
+			return err
+		}
+	}
 	if err := s.writeRecord(af, af.size, payload); err != nil {
 		return err // nothing advanced; the bytes are unreferenced and overwritable
 	}
@@ -425,6 +430,11 @@ func (s *store) append(payload []byte) error {
 		// the data first guarantees a crash can only ever lose the header update (a
 		// clean truncation), never leave a published record whose payload never
 		// landed.
+		if faultsEnabled {
+			if err := faultPoint("append.syncData"); err != nil {
+				return s.failIO(err)
+			}
+		}
 		if err := datasync(af.f); err != nil {
 			return s.failIO(err)
 		}
@@ -440,18 +450,16 @@ func (s *store) append(payload []byte) error {
 		setWriteCursor(headerSize+af.size),
 		setWrittenCount(af.written),
 	)
+	if faultsEnabled {
+		if err := faultPoint("append.writeHeader"); err != nil {
+			s.rollbackAppend(af, recLen)
+			return err
+		}
+	}
 	if err := s.writeHeader(af); err != nil {
 		// The header never reached even the page cache, so the record is invisible
 		// to a reopen; roll the in-memory view back to match.
-		af.size -= recLen
-		af.written--
-		s.writeOff -= recLen
-		s.nWritten--
-		s.nAdded--
-		af.header(
-			setWriteCursor(headerSize+af.size),
-			setWrittenCount(af.written),
-		)
+		s.rollbackAppend(af, recLen)
 		return err
 	}
 	switch {
@@ -462,6 +470,11 @@ func (s *store) append(payload []byte) error {
 	case s.batched():
 		return s.recordOp()
 	default:
+		if faultsEnabled {
+			if err := faultPoint("append.syncHeader"); err != nil {
+				return s.failIO(err)
+			}
+		}
 		if err := datasync(af.f); err != nil {
 			// The header is in the page cache, so the record is real to anything
 			// short of a power loss: it stays, and the store is poisoned.
@@ -470,6 +483,23 @@ func (s *store) append(payload []byte) error {
 		af.dirty = false
 		return nil
 	}
+}
+
+// rollbackAppend undoes the in-memory advance for a record whose header never
+// reached even the page cache, so the record is invisible to a reopen and the
+// store's view matches it. Nothing on disk is touched: the record bytes sit in a
+// preallocated region past the write cursor, where the next append overwrites
+// them and no reader can address them.
+func (s *store) rollbackAppend(af *dataFile, recLen int64) {
+	af.size -= recLen
+	af.written--
+	s.writeOff -= recLen
+	s.nWritten--
+	s.nAdded--
+	af.header(
+		setWriteCursor(headerSize+af.size),
+		setWrittenCount(af.written),
+	)
 }
 
 // cycle drops any now fully-committed files and starts a fresh active file. It
@@ -485,7 +515,7 @@ func (s *store) cycle() error {
 	}
 	s.nextNum++
 	s.files = append(s.files, df)
-	s.trackMapped(df)
+	s.trackOpen(df)
 	// Persist the new (and removed) entries before records land in the file.
 	if !s.noSync {
 		if err := s.syncDir(); err != nil {
@@ -499,9 +529,10 @@ func (s *store) cycle() error {
 // Called from cycle (writes) with keep == nil — it recreates the active file
 // right after, so the old full one may go — and from commitTo (commits) with
 // keep == the active file, which holds the write position and must survive even
-// when fully drained. Both run under the DiskQueue lock, so no store op races it. A
-// just-delivered record's file may be closed here; that's safe only because
-// read copied the payload into the Reader's scratch under the lock.
+// when fully drained. Both run under the Queue lock, so no store op races it. A
+// just-delivered record's file may be closed and unlinked here, in the very call
+// that delivered it — the consumer's value is unaffected, because the payload it
+// holds is a copy in the Reader's own buffer and was never this file's memory.
 //
 // A file that will not unlink stays in the live set — its records are committed,
 // so it is never re-delivered, but leaving it counted keeps maxSegments a truthful
@@ -522,7 +553,7 @@ func (s *store) dropCommitted(keep *dataFile) {
 			if df.f != nil {
 				_ = df.f.Close() // read-only from here on; nothing left to lose
 				df.f = nil
-				s.removeMapped(df)
+				s.untrackOpen(df)
 			}
 			if err := os.Remove(s.filePath(df.num)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				s.unreclaimed++
@@ -562,7 +593,7 @@ func (s *store) read(off int64) ([]byte, uint64, int64, bool, error) {
 	if df == nil {
 		return nil, 0, 0, false, ErrCorrupt
 	}
-	if err := s.ensureMapped(df); err != nil {
+	if err := s.ensureOpen(df); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// The segment the header says holds this record is gone: those bytes are
 			// not coming back, which is what ErrCorrupt means and what the recovery
@@ -658,6 +689,19 @@ func (s *store) rewindHead(off int64) {
 	}
 }
 
+// rewindToCommit puts the read cursor back to the commit cursor, so every record
+// that was delivered but never acknowledged is offered again. It returns the
+// bytes made readable.
+//
+// Unlike rewindHead this does NOT un-count the deliveries: those records really
+// were handed to a consumer, and the redelivery will be counted again. That is
+// what Stats.Delivered means by "redeliveries included".
+func (s *store) rewindToCommit() int64 {
+	n := s.headOff - s.commitOff
+	s.headOff = s.commitOff
+	return n
+}
+
 // progress is the pair a consume operation has to move for an iteration to be
 // getting anywhere: the read cursor, and the backlog of corruption reports still
 // owed (paid down one per takeHead call, without the cursor moving).
@@ -723,7 +767,7 @@ func (s *store) skipCorruptSegment(off int64) error {
 	}
 	end := df.base + df.size
 	if s.commitOff >= df.base {
-		err := s.ensureMapped(df)
+		err := s.ensureOpen(df)
 		switch {
 		case err == nil:
 			prevCursor, prevCount := df.commitCursor(), df.committedCount()
@@ -810,7 +854,7 @@ func (s *store) commitTo(off int64) error {
 			}
 			cur = nil
 		}
-		if err := s.ensureMapped(df); err != nil {
+		if err := s.ensureOpen(df); err != nil {
 			stop = err // can't open the file to advance the cursor; replay later
 			break
 		}
@@ -907,7 +951,7 @@ func (s *store) headOffset() int64      { return s.headOff }
 func (s *store) corruptionCount() int64 { return s.corruptions }
 func (s *store) failure() error         { return s.ioErr }
 
-// stats snapshots the counters. The caller holds the DiskQueue lock.
+// stats snapshots the counters. The caller holds the Queue lock.
 func (s *store) stats() Stats {
 	return Stats{
 		BacklogBytes: s.size(),
@@ -995,7 +1039,7 @@ func (s *store) close() error {
 	// live — but Stats stays readable after Close, and a shutdown scrape that
 	// reported "0 segments, 0 bytes on disk" for a directory still holding a
 	// backlog would be the one number an operator most needs to be true.
-	s.mappedMRU, s.mappedLRU, s.mappedLen = nil, nil, 0
+	s.lruMRU, s.lruLRU, s.nOpen = nil, nil, 0
 	if s.dirFile != nil {
 		if err := s.dirFile.Close(); err != nil && first == nil {
 			first = err

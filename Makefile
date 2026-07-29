@@ -7,14 +7,19 @@ export PATH
 
 all: fix check
 
-# Lint + the full test suite.
-check: lint test
+# Lint + the full test suite, including the fault-injection build.
+check: lint test faults
 
 # Unit tests, raced and with coverage. The race detector is not optional here:
 # the queue hands a reused buffer to user code under a mutex, and the iterators
 # release that mutex across yields.
 test:
 	go test -race -cover ./...
+
+# The durability invariants that need an injection seam the default build does
+# not carry: append's fsync ordering and each of its failure arms.
+faults:
+	go test -tags diskqueue_faults -run 'Fault|Sync|Append|Crash|Header|WriteRecord' ./...
 
 lint: $(GOBIN)/golangci-lint
 	golangci-lint run ./...

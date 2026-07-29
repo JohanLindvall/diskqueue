@@ -23,8 +23,8 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
   deliberately *not* split further: pulling `writeHeader`/`flushFile` away from `append` and
   `commitTo` would separate the calls whose order is the whole point (see the
   data-before-header invariant below).
-- [diskqueue.go](diskqueue.go) — the generic `DiskQueue[T]` writer/owner (Add, Empty/Count/Size,
-  Sync/Err/Close, NewReader) on top of `store`.
+- [diskqueue.go](diskqueue.go) — the generic `Queue[T]` writer/owner (Add, Empty/Count/Size,
+  Stats/Rewind/Sync/Err/Close, NewReader) on top of `store`.
 - [reader.go](reader.go) — `Reader[T]`: all consume ops (Reserve/Take/Commit/
   Drain/Follow/Err); copies each record into its own scratch buffer.
 - [prealloc_linux.go](prealloc_linux.go) / [prealloc_other.go](prealloc_other.go) — `preallocate`:
@@ -36,7 +36,15 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
 - [syncdir_unix.go](syncdir_unix.go) / [syncdir_other.go](syncdir_other.go) — `fsyncDir`: a
   directory fsync is POSIX-only; off Unix it must be a no-op or every cycle would fail.
 - [store_test.go](store_test.go) — store-level unit tests (`TestStore*`).
-- [diskqueue_test.go](diskqueue_test.go) — DiskQueue-level tests and `BenchmarkAddTake`.
+- [diskqueue_test.go](diskqueue_test.go) — Queue-level tests and `BenchmarkAddTake`.
+- [faults_test.go](faults_test.go) — `//go:build diskqueue_faults`. The tests that need a seam
+  the default build does not have: `append`'s fsync ordering and each of its failure arms.
+  Run with `go test -tags diskqueue_faults ./...` (`make faults`).
+- [aliasing_test.go](aliasing_test.go) — why the Reader copies: `s.readBuf` is shared by every
+  Reader, so the copy is about *sharing*, not file lifetime.
+- [progress_test.go](progress_test.go) — no consume op may report damage it did not step past.
+- [bench_test.go](bench_test.go) / [stats_test.go](stats_test.go) — the syscall-bound paths, and
+  the counters-vs-gauges distinction.
 - [recovery_test.go](recovery_test.go) — the recovery contract from the public API:
   never wedged, never delivered as data, every loss counted in `Stats`.
 - [robust_test.go](robust_test.go) — live fault injection (`breakHandle`/`reopenReadOnly`/
@@ -59,7 +67,7 @@ go test -cover ./...
 A directory of numbered files `data.00000001`, … each `SegmentSize` bytes,
 preallocated (real blocks via `fallocate`, see `preallocate`), capped at
 `maxSegments` live files, with handles opened **on demand**
-(LRU, capped by `maxMapped`; the active file stays open). The directory itself is
+(LRU, capped by `maxOpenFiles`; the active file stays open). The directory itself is
 opened once in `openStore` and held in `s.dirFile` for the session: it is both the
 handle `syncDir` fsyncs and the thing the advisory `flock` hangs on, so closing the
 store releases the lock. 64-byte LE header:
@@ -139,13 +147,17 @@ mirrors its own `written`/`committed` counts into its header.
   no alloc once warm) before `unmarshal`. The `s.writeBuf`/`s.readBuf` grow via
   `growBuf` (allocates only when a bigger record appears). Don't add per-op heap
   allocations on Add / read / commitTo. The benchmark guards this.
-- **Readers own the returned bytes.** All consume ops live on `Reader[T]`
-  ([reader.go](reader.go)); each copies the record into `r.scratch` *under the
-  lock*, so the value never aliases `s.readBuf` (which the next read overwrites).
-  Valid until the reader's next read. A `Reader` is single-goroutine; use one per
-  consumer. This copy is load-bearing: since consume ops commit a record as they
-  read it, its file may be closed/removed while the consumer still holds the value
-  (see "Immediate close is safe").
+- **Readers own the returned bytes, because `s.readBuf` is shared.** All consume
+  ops live on `Reader[T]` ([reader.go](reader.go)); each copies the record into
+  its own `r.scratch` *under the lock*. The reason is **sharing, not lifetime**:
+  `s.readBuf` belongs to the store and *every* Reader on the queue reads through
+  it, so without a per-Reader copy one consumer holding its value while another
+  reads gets its bytes rewritten from a different goroutine — a data race, which
+  `TestConcurrentReadersRace` reports under `-race`. (The bytes are ordinary Go
+  memory filled by `ReadAt`; closing or unlinking the segment cannot invalidate
+  them. That was mmap-era reasoning and it is no longer the operative reason,
+  though the conclusion it reached is still true.) Valid until that Reader's next
+  read. A `Reader` is single-goroutine; use one per consumer.
 - **Reclamation is whole-file, on write *and* commit.** `dropCommitted(keep)`
   deletes files whose every record is committed (`base+size <= commitOff`), except
   `keep`. A file whose `os.Remove` fails stays in `s.files` (counts not subtracted,
@@ -166,7 +178,7 @@ mirrors its own `written`/`committed` counts into its header.
   `commitTo` can fully commit and `dropCommitted` the just-delivered record's file
   (closing its handle and removing it) — but the scratch copy already happened
   (read precedes commit), so the held value stays valid. A concurrent `Add`'s
-  `dropCommitted` can do the same. All store ops hold the DiskQueue mutex.
+  `dropCommitted` can do the same. All store ops hold the Queue mutex.
 - **`maxSegments` bounds the file count.** `cycle` drops committed files, then
   returns `ErrFull` if `len(files) >= maxSegments` (0 = unbounded). So the bound
   is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.
@@ -247,7 +259,7 @@ mirrors its own `written`/`committed` counts into its header.
   shaped `Take`): read **and `commitTo` under the lock**, then release and yield —
   so they commit-on-read (at-most-once) and are safe for concurrent cooperating
   readers. `Drain` is bounded by a `writeOff` snapshot; `Follow` waits via
-  `waitLocked` (which lives on DiskQueue, called as `r.w.waitLocked`). The locked
+  `waitLocked` (which lives on Queue, called as `r.w.waitLocked`). The locked
   half lives in `Reader.next`, which takes the mutex with a **`defer` unlock** — the
   old hand-unlocked loop held `w.mu` across the user's `UnmarshalFunc`, so a panic
   there left the whole queue deadlocked. A failed read or commit ends the iteration
@@ -265,8 +277,11 @@ mirrors its own `written`/`committed` counts into its header.
   `fsync` (the write cursor that publishes them durable). Persisting the header
   first would let a power loss leave a visible record whose payload never landed (a
   torn tail the checksum flags); data-then-header guarantees a clean truncation
-  instead. The recovery-fault tests pin this. Don't collapse it to one fsync on the
-  per-op path.
+  instead. [faults_test.go](faults_test.go) pins the ordering itself — build with
+  `-tags diskqueue_faults` — and `TestAppendOrdersDataBeforeHeader` fails if the
+  data fsync is removed. The recovery-fault tests do NOT pin it: they forge
+  on-disk residue and check what a reopen makes of it, which is a different (also
+  valuable) property. Don't collapse it to one fsync on the per-op path.
 - **`append` advances the cursors only once the record cannot be un-published.**
   Order: `writeRecord` → (per-op) data `fsync` → advance `size`/`written`/`writeOff`/
   `nWritten` + `header()` → `writeHeader` → (per-op) header `fsync`. A failure before
@@ -291,7 +306,7 @@ mirrors its own `written`/`committed` counts into its header.
   the handle being closed).
 - **Lazy open.** Files open on demand via `ensureMapped` (`read`, `commitTo`, and
   `append` for the active file); `evictMapped` closes the LRU handle beyond
-  `maxMapped`, never the active or just-opened file, fsyncing a dirty victim first
+  `maxOpenFiles`, never the active or just-opened file, fsyncing a dirty victim first
   (a clean victim is closed without fsync). `df.f == nil` means closed —
   `flushFile`/`sync`/`flushBatch`/`close` skip such files; `df.hdr` stays resident
   so accessors still work and a later `ensureMapped` just reopens the handle.
@@ -317,7 +332,7 @@ mirrors its own `written`/`committed` counts into its header.
   cursor past the whole segment instead of freezing it forever (which would also
   stop all reclamation, so the disk fills behind the stuck cursor).
 - `commitTo` finalizes the outgoing file's header *before* `ensureMapped` opens the
-  next one: with a small `maxMapped`, opening the next segment can evict the one
+  next one: with a small `maxOpenFiles`, opening the next segment can evict the one
   whose header is about to be written. `writeHeader` also self-heals a nil handle,
   so this is belt and braces — but the ordering avoids reopening a file just to
   write 64 bytes.

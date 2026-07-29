@@ -45,7 +45,7 @@ reopening reads no records at all; the header checksum is verified on open (a
 segment that fails it is dropped and counted — see **Recovery**), and each
 record's checksum is verified on read. Records are written with `pwrite` and read back with
 `pread` into reused buffers; each file's handle is opened on demand and the
-least-recently-used handles are closed once `MaxMapped` are open, so a deep
+least-recently-used handles are closed once `MaxOpenFiles` are open, so a deep
 backlog does not hold an open descriptor per retained file. A file is dropped once
 all its records are committed: on the next write that cycles to a new file, and
 also at the end of a commit — so a consume-only or producer-stopped workload
@@ -167,11 +167,11 @@ processing (at-least-once), use `Reserve`/`Commit`.
 
 ## API
 
-`DiskQueue[T]` — produce and manage the log:
+`Queue[T]` — produce and manage the log:
 
 | Method | Description |
 | --- | --- |
-| `New[T](path, marshal, unmarshal, ...Options)` | Open/create a DiskQueue at `path` (segment cap via `Options.MaxSegments`, default 32). |
+| `New[T](path, marshal, unmarshal, ...Options)` | Open/create a Queue at `path` (segment cap via `Options.MaxSegments`, default 32). |
 | `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments`, `ErrRecordTooLarge` if it can't fit a segment. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
 | `Empty() bool` | Whether anything is available to read. |
@@ -179,7 +179,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
 | `Sync() error` | `fsync` the files to stable storage. |
 | `Stats() Stats` | Gauges and lifetime counters, including every loss path. See **Recovery**. |
-| `Corruptions() int64` | Corruption events since `New`; each was surfaced as one `ErrCorrupt`. Same number as `Stats().Corruptions`. |
+| `Rewind() (int64, error)` | Return every delivered-but-uncommitted record to the queue. The nack for `Reserve`. |
 | `Err() error` | The latched durability failure, or nil. See **Failure handling**. |
 | `Close() error` | Flush and close (releases the directory lock). |
 
@@ -310,7 +310,7 @@ and the queue is left in a state you can reason about.
   data that is already gone. Rather than claim a durability it cannot deliver, the
   queue latches the first such failure: `Add`, `Commit` and `Sync` all return an
   error wrapping `ErrIO` from then on (the original errno is wrapped too, so
-  `errors.Is(err, syscall.ENOSPC)` still works), and `DiskQueue.Err()` reports it
+  `errors.Is(err, syscall.ENOSPC)` still works), and `Queue.Err()` reports it
   without performing an operation. **Reads keep working**, so a consumer can drain
   what is there; to write again, `Close` and reopen — whatever was durable is
   still on disk and uncommitted records replay.
@@ -344,7 +344,7 @@ and the queue is left in a state you can reason about.
   the next read on that same `Reader`; copy it inside `UnmarshalFunc` if you need
   it to outlive that. The copy reuses the buffer, so it allocates nothing once
   warm.
-- **Concurrency.** A `DiskQueue` is safe for concurrent use. A single `Reader` is *not*
+- **Concurrency.** A `Queue` is safe for concurrent use. A single `Reader` is *not*
   — use one `Reader` per consuming goroutine. Multiple Readers share the one
   read/commit cursor and cooperate to consume the stream (each item delivered
   once). `Take`/`TryTake` and the `Drain`/`Follow` iterators read and commit
@@ -366,7 +366,7 @@ diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
 	SyncEvery:      0,    // 0/1 = fsync every op; N>1 = batch the fsync over N ops
 	SyncInterval:   0,    // >0 = background flush every interval (backstop for SyncEvery)
 	SegmentSize:    0,    // 0 = 8 MiB default; floored and rounded up to 4 KiB
-	MaxMapped:      0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 2
+	MaxOpenFiles:      0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 2
 })
 ```
 

@@ -19,7 +19,7 @@ import (
 // same rules at the store level.
 
 // openRecoveryTest opens a small-segment queue whose store the test can reach.
-func openRecoveryTest(t *testing.T) (*DiskQueue[uint64], *Reader[uint64], string) {
+func openRecoveryTest(t *testing.T) (*Queue[uint64], *Reader[uint64], string) {
 	t.Helper()
 	dir := t.TempDir()
 	w, err := New[uint64](dir, marshalU64, unmarshalU64,
@@ -32,7 +32,7 @@ func openRecoveryTest(t *testing.T) (*DiskQueue[uint64], *Reader[uint64], string
 }
 
 // flipPayload corrupts one byte inside segment idx's data region.
-func flipPayload(t *testing.T, w *DiskQueue[uint64], idx, dataOff int) {
+func flipPayload(t *testing.T, w *Queue[uint64], idx, dataOff int) {
 	t.Helper()
 	flipData(t, w.st, idx, dataOff, 0xFF)
 }
@@ -342,5 +342,89 @@ func TestStatsFullCounter(t *testing.T) {
 	}
 	if got := w.Stats().Full; got != 3 {
 		t.Fatalf("Full=%d, want 3", got)
+	}
+}
+
+// TestRewindReplaysUncommitted: Reserve/Commit is an acknowledgement protocol,
+// and Rewind is its nack. Without it, a consumer that reserved records and then
+// could not process them left the read cursor ahead of the commit cursor with no
+// way back — Empty reported true and the records were unreachable until the
+// process restarted, though they were still on disk and still uncommitted.
+func TestRewindReplaysUncommitted(t *testing.T) {
+	w, r, _ := openRecoveryTest(t)
+	const n = 5
+	for i := uint64(0); i < n; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Reserve everything without committing: the classic stuck-consumer state.
+	for i := uint64(0); i < n; i++ {
+		v, ok, _, err := r.TryReserve()
+		if !ok || err != nil || v != i {
+			t.Fatalf("reserve %d: v=%d ok=%v err=%v", i, v, ok, err)
+		}
+	}
+	if !w.Empty() {
+		t.Fatal("the queue should read empty with everything reserved")
+	}
+	if got := w.Count(); got != n {
+		t.Fatalf("Count=%d, want %d: nothing was committed", got, n)
+	}
+
+	got, err := w.Rewind()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != w.Size() {
+		t.Fatalf("Rewind reported %d bytes, want Size()=%d", got, w.Size())
+	}
+	if w.Empty() {
+		t.Fatal("the queue should be readable again after Rewind")
+	}
+
+	// Everything comes back, in order, exactly once.
+	for i := uint64(0); i < n; i++ {
+		v, ok, err := r.TryTake()
+		if !ok || err != nil || v != i {
+			t.Fatalf("replay %d: v=%d ok=%v err=%v", i, v, ok, err)
+		}
+	}
+	if got := w.Count(); got != 0 {
+		t.Fatalf("Count=%d after committing the replay, want 0", got)
+	}
+	// The redelivery is counted as a delivery, which is what "redeliveries
+	// included" means; the records were genuinely handed over twice.
+	if st := w.Stats(); st.Delivered != 2*n {
+		t.Fatalf("Delivered=%d, want %d", st.Delivered, 2*n)
+	}
+}
+
+// TestRewindCannotUncommit: Rewind moves the read cursor, never the commit
+// cursor. Records already acknowledged stay acknowledged.
+func TestRewindCannotUncommit(t *testing.T) {
+	w, r, _ := openRecoveryTest(t)
+	for i := uint64(0); i < 4; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Take (commit) two, reserve the rest.
+	for i := 0; i < 2; i++ {
+		if _, ok, err := r.TryTake(); !ok || err != nil {
+			t.Fatalf("take %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	if _, ok, _, err := r.TryReserve(); !ok || err != nil {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+
+	if _, err := w.Rewind(); err != nil {
+		t.Fatal(err)
+	}
+	// The two committed records must NOT come back.
+	v, ok, err := r.TryTake()
+	if !ok || err != nil || v != 2 {
+		t.Fatalf("after Rewind: v=%d ok=%v err=%v, want the first uncommitted record", v, ok, err)
 	}
 }

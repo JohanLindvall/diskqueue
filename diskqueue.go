@@ -3,7 +3,7 @@
 // store (see store.go) using plain pread/pwrite/fsync; its only dependency is
 // cespare/xxhash/v2 (per-record checksums).
 //
-// Items are appended with Add and consumed through a Reader (DiskQueue.NewReader): Take
+// Items are appended with Add and consumed through a Reader (Queue.NewReader): Take
 // reads + commits in one step, or Reserve reads and later Commits its offset.
 // Committing advances a persisted read cursor; data files are reclaimed once
 // fully committed.
@@ -16,7 +16,7 @@
 // it) is owned by the Reader and valid only until that Reader's next read; copy
 // it if you need it longer.
 //
-// Concurrency: a DiskQueue is safe for concurrent use; a single Reader is not — use one
+// Concurrency: a Queue is safe for concurrent use; a single Reader is not — use one
 // per consuming goroutine. Readers share one read/commit cursor and cooperate
 // (each item delivered once). Take/TryTake and Drain/Follow commit under the lock
 // as they read, so they are safe for concurrent cooperating readers. Reserve/
@@ -38,15 +38,15 @@ import (
 // MarshalFunc serializes v by appending to dst and returning the extended slice
 // (like the builtin append). Appending rather than allocating keeps Add alloc-free.
 //
-// It is called with the DiskQueue's internal lock held, so it must not call back
-// into the DiskQueue or any of its Readers — the mutex is not reentrant and doing
+// It is called with the Queue's internal lock held, so it must not call back
+// into the Queue or any of its Readers — the mutex is not reentrant and doing
 // so deadlocks.
 type MarshalFunc[T any] func(dst []byte, v T) ([]byte, error)
 
 // UnmarshalFunc decodes a value from data, a Reader-owned buffer valid only until
 // that Reader's next read; copy out of it if you need it longer.
 //
-// Like MarshalFunc it runs under the DiskQueue's lock and must not call back into
+// Like MarshalFunc it runs under the Queue's lock and must not call back into
 // the queue. Returning an error leaves the record at the head of the queue rather
 // than consuming it, so the same record is offered again; use Reader.Skip to step
 // over one the codec will never accept.
@@ -54,7 +54,7 @@ type UnmarshalFunc[T any] func(data []byte) (T, error)
 
 // Errors returned by the package.
 var (
-	// ErrClosed is returned once the DiskQueue has been closed.
+	// ErrClosed is returned once the Queue has been closed.
 	ErrClosed = errors.New("diskqueue: closed")
 	// ErrFull is returned by Add when a new segment would exceed maxSegments.
 	ErrFull = errors.New("diskqueue: full")
@@ -75,7 +75,7 @@ var (
 	// ErrSegmentSizeMismatch is returned by New when reopening a store with a
 	// different SegmentSize than it was created with (which would discard data).
 	ErrSegmentSizeMismatch = errors.New("diskqueue: segment size mismatch")
-	// ErrLocked is returned by New when another DiskQueue — in this process or
+	// ErrLocked is returned by New when another Queue — in this process or
 	// another — already holds the directory's advisory lock.
 	ErrLocked = errors.New("diskqueue: directory already in use")
 	// ErrIO wraps a durability failure that the queue cannot recover from in
@@ -87,7 +87,7 @@ var (
 	ErrIO = errors.New("diskqueue: durability failure")
 )
 
-// Options tunes the behaviour of a DiskQueue. The zero value is valid and selects
+// Options tunes the behaviour of a Queue. The zero value is valid and selects
 // sensible defaults.
 type Options struct {
 	// NoSync disables the fsync after every write and commit. This trades
@@ -116,7 +116,7 @@ type Options struct {
 	// negative value means unbounded.
 	MaxSegments int
 
-	// MaxMapped caps how many segment files are kept open at once. Segments are
+	// MaxOpenFiles caps how many segment files are kept open at once. Segments are
 	// opened on demand and the least-recently-used handles are closed beyond the
 	// cap, bounding open descriptors for deep backlogs; the active segment is
 	// always open. 0 means unbounded (keep every touched segment open).
@@ -125,7 +125,7 @@ type Options struct {
 	// cursors can each be in a different segment; a smaller cap evicts the handle
 	// the next operation needs. Note that the open-file count is already bounded
 	// by MaxSegments, so this is only worth setting when MaxSegments is unbounded.
-	MaxMapped int
+	MaxOpenFiles int
 
 	// SyncInterval, if > 0, runs a background goroutine that flushes to stable
 	// storage on that period — a wall-clock backstop for SyncEvery batching, so an
@@ -134,7 +134,7 @@ type Options struct {
 	SyncInterval time.Duration
 }
 
-// Stats is a snapshot of a DiskQueue's gauges and lifetime counters, for
+// Stats is a snapshot of a Queue's gauges and lifetime counters, for
 // monitoring. It is a plain struct on purpose: no registry model is imposed on
 // callers, and no callback of theirs runs under the queue's lock.
 //
@@ -166,11 +166,16 @@ type Stats struct {
 	ForeignSegments uint64 // dropped for a format version this build cannot read
 	ForeignBytes    uint64
 	DiscardedBytes  uint64 // trailing bytes a segment lost to truncation
-	Corruptions     uint64 // corruption events, each surfaced as one ErrCorrupt
+	// Corruptions counts corruption events since New: segments dropped at open,
+	// records dropped for a bad checksum, and segments abandoned for unusable
+	// framing. Each one was, or will be, surfaced as exactly one ErrCorrupt from a
+	// read — this is the number an operator alerts on, and the Lost* fields above
+	// say how much each event cost.
+	Corruptions uint64
 }
 
-// DiskQueue is a generic persistent FIFO queue of T.
-type DiskQueue[T any] struct {
+// Queue is a generic persistent FIFO queue of T.
+type Queue[T any] struct {
 	marshal   MarshalFunc[T]
 	unmarshal UnmarshalFunc[T]
 
@@ -191,10 +196,10 @@ type DiskQueue[T any] struct {
 	syncDone chan struct{}
 }
 
-// New opens (creating if necessary) a DiskQueue under the directory path. The segment
+// New opens (creating if necessary) a Queue under the directory path. The segment
 // count, durability, and recovery behaviour are tuned via Options (see
 // Options.MaxSegments for the file-count cap, which defaults to 32).
-func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*DiskQueue[T], error) {
+func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*Queue[T], error) {
 	if marshal == nil || unmarshal == nil {
 		// Caught here rather than as a nil call on the first Add: construction is
 		// the last point where the caller can still do something about it.
@@ -204,11 +209,11 @@ func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T],
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	st, err := openStore(path, segmentCapacity(opt.SegmentSize), resolveMaxSegments(opt.MaxSegments), opt.NoSync, opt.SyncEvery, opt.MaxMapped)
+	st, err := openStore(path, segmentCapacity(opt.SegmentSize), resolveMaxSegments(opt.MaxSegments), opt.NoSync, opt.SyncEvery, opt.MaxOpenFiles)
 	if err != nil {
 		return nil, err
 	}
-	w := &DiskQueue[T]{marshal: marshal, unmarshal: unmarshal, st: st}
+	w := &Queue[T]{marshal: marshal, unmarshal: unmarshal, st: st}
 	if opt.SyncInterval > 0 && !opt.NoSync {
 		w.syncStop = make(chan struct{})
 		w.syncDone = make(chan struct{})
@@ -264,7 +269,7 @@ func segmentCapacity(size int64) int64 {
 // and the header publishing them did reach the page cache, so the item is in the
 // log and readable, and only its power-loss durability is in doubt; the queue is
 // then poisoned and every later operation repeats the error.
-func (w *DiskQueue[T]) Add(data T) error {
+func (w *Queue[T]) Add(data T) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -288,14 +293,14 @@ func (w *DiskQueue[T]) Add(data T) error {
 }
 
 // Empty reports whether there are no items available to read.
-func (w *DiskQueue[T]) Empty() bool {
+func (w *Queue[T]) Empty() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.st.empty()
 }
 
 // Count returns the number of items added but not yet committed.
-func (w *DiskQueue[T]) Count() int {
+func (w *Queue[T]) Count() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return int(w.st.count())
@@ -308,28 +313,15 @@ func (w *DiskQueue[T]) Count() int {
 // geometry and never smaller than this.
 //
 // It remains readable after Close and reports the final observed state.
-func (w *DiskQueue[T]) Size() int64 {
+func (w *Queue[T]) Size() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.st.size()
 }
 
-// Corruptions returns how many corruption events have been recovered from since
-// New: segments dropped at open, records dropped for a bad checksum, and
-// segments abandoned for unusable framing. Each one was, or will be, surfaced as
-// one ErrCorrupt from a read. A non-zero value means data was dropped; Stats
-// says how much.
-//
-// It remains readable after Close and reports the final observed state.
-func (w *DiskQueue[T]) Corruptions() int64 {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.st.corruptionCount()
-}
-
 // Stats returns a snapshot of the queue's gauges and lifetime counters. It
 // remains readable after Close and reports the final observed state.
-func (w *DiskQueue[T]) Stats() Stats {
+func (w *Queue[T]) Stats() Stats {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.st.stats()
@@ -342,17 +334,44 @@ func (w *DiskQueue[T]) Stats() Stats {
 // fsync would report success over data that is already gone. Close it and reopen
 // to continue; whatever was durable is still there, and uncommitted records
 // replay.
-func (w *DiskQueue[T]) Err() error {
+func (w *Queue[T]) Err() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.st == nil {
-		return nil
-	}
 	return w.st.failure()
 }
 
+// Rewind returns every delivered-but-uncommitted record to the queue, so the
+// next read starts from the commit cursor again. It reports the bytes made
+// readable, and wakes any blocked reader.
+//
+// Reserve/Commit is an acknowledgement protocol, and this is its nack. Without
+// it, a consumer that reserved records and then could not process them — a
+// downstream that stayed down, a worker that gave up — left the read cursor
+// ahead of the commit cursor with no way back: Empty reported true, Follow
+// blocked, and the records were unreachable until the process restarted, even
+// though they were still on disk and still uncommitted.
+//
+// It moves the *shared* cursor, which is why it is here and not on Reader. With
+// cooperating readers it replays records other readers may still be working on,
+// and those will be delivered a second time; that is within the at-least-once
+// contract, but it means Rewind belongs to whoever owns the consumer group, not
+// to one worker. Records already committed are unaffected — this cannot un-commit
+// anything.
+func (w *Queue[T]) Rewind() (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, ErrClosed
+	}
+	n := w.st.rewindToCommit()
+	if n > 0 {
+		w.signal()
+	}
+	return n, nil
+}
+
 // Sync flushes buffered writes to stable storage.
-func (w *DiskQueue[T]) Sync() error {
+func (w *Queue[T]) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -361,8 +380,8 @@ func (w *DiskQueue[T]) Sync() error {
 	return w.st.sync()
 }
 
-// Close flushes and closes the DiskQueue. Further use returns ErrClosed.
-func (w *DiskQueue[T]) Close() error {
+// Close flushes and closes the Queue. Further use returns ErrClosed.
+func (w *Queue[T]) Close() error {
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
@@ -390,7 +409,7 @@ func (w *DiskQueue[T]) Close() error {
 
 // syncLoop flushes the store on a fixed interval until Close stops it; a
 // wall-clock backstop for SyncEvery batching.
-func (w *DiskQueue[T]) syncLoop(d time.Duration) {
+func (w *Queue[T]) syncLoop(d time.Duration) {
 	defer close(w.syncDone)
 	t := time.NewTicker(d)
 	defer t.Stop()
@@ -412,7 +431,7 @@ func (w *DiskQueue[T]) syncLoop(d time.Duration) {
 
 // waitLocked releases the lock, blocks until Add signals or ctx is done, then
 // reacquires it. The caller must hold w.mu.
-func (w *DiskQueue[T]) waitLocked(ctx context.Context) error {
+func (w *Queue[T]) waitLocked(ctx context.Context) error {
 	if w.notify == nil {
 		w.notify = make(chan struct{})
 	}
@@ -434,7 +453,7 @@ func (w *DiskQueue[T]) waitLocked(ctx context.Context) error {
 }
 
 // signal wakes any goroutines blocked in waitLocked. The caller must hold w.mu.
-func (w *DiskQueue[T]) signal() {
+func (w *Queue[T]) signal() {
 	if w.notify != nil {
 		close(w.notify)
 		w.notify = nil

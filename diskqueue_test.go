@@ -26,7 +26,7 @@ func unmarshalU64(data []byte) (uint64, error) {
 	return binary.LittleEndian.Uint64(data), nil
 }
 
-func openTest(t *testing.T, maxSegments int) (*DiskQueue[uint64], *Reader[uint64]) {
+func openTest(t *testing.T, maxSegments int) (*Queue[uint64], *Reader[uint64]) {
 	t.Helper()
 	if maxSegments == 0 {
 		maxSegments = -1 // these tests pass 0 for "unbounded" (now a negative value)
@@ -348,7 +348,7 @@ func countDataFiles(t *testing.T, dir string) int {
 	return n
 }
 
-// TestReopenMultiFile exercises DiskQueue-level recovery when the commit cursor lands
+// TestReopenMultiFile exercises Queue-level recovery when the commit cursor lands
 // inside a later segment (earlier ones fully consumed) and several files exist.
 func TestReopenMultiFile(t *testing.T) {
 	dir := t.TempDir()
@@ -586,8 +586,8 @@ func TestAddTakeZeroAlloc(t *testing.T) {
 	}
 }
 
-// TestStressConcurrent runs several producers and consumers against one DiskQueue and
-// checks every value is delivered exactly once (and the DiskQueue stays race-free).
+// TestStressConcurrent runs several producers and consumers against one Queue and
+// checks every value is delivered exactly once (and the Queue stays race-free).
 func TestStressConcurrent(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping stress test in -short mode")
@@ -757,7 +757,7 @@ func TestSegmentSizeMismatch(t *testing.T) {
 }
 
 // TestConcurrentDrainCooperates verifies that two Drain iterations running
-// concurrently on the same DiskQueue split the stream without loss or duplication —
+// concurrently on the same Queue split the stream without loss or duplication —
 // safe now that Drain commits each item under the lock as it is read.
 func TestConcurrentDrainCooperates(t *testing.T) {
 	w, _ := openTest(t, 0)

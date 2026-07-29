@@ -6,7 +6,7 @@ import (
 	"iter"
 )
 
-// NewReader returns a Reader that consumes from this DiskQueue; all read operations
+// NewReader returns a Reader that consumes from this Queue; all read operations
 // are methods on it.
 //
 // A Reader copies each record into a private reused buffer before unmarshalling,
@@ -15,20 +15,20 @@ import (
 // use: use one per consuming goroutine. Readers share the read/commit cursor and
 // cooperate (each item delivered once); see the package doc on which ops are safe
 // across concurrent readers.
-func (w *DiskQueue[T]) NewReader() *Reader[T] {
+func (w *Queue[T]) NewReader() *Reader[T] {
 	return &Reader[T]{w: w}
 }
 
-// Reader is a consuming view over a DiskQueue; create it with DiskQueue.NewReader.
+// Reader is a consuming view over a Queue; create it with Queue.NewReader.
 type Reader[T any] struct {
-	w       *DiskQueue[T]
+	w       *Queue[T]
 	scratch []byte // record copy, reused across reads
 	err     error  // why the last Drain/Follow stopped; reported by Err
 }
 
 // Err reports what went wrong during the most recent Drain or Follow: nil when
 // the iteration simply ran out of items, the context was cancelled, or the
-// DiskQueue was closed. An iter.Seq cannot carry an error, so check this after
+// Queue was closed. An iter.Seq cannot carry an error, so check this after
 // the loop — otherwise a failure is indistinguishable from an empty queue.
 //
 // A read, decode or commit failure ends the iteration and is reported here.
@@ -171,7 +171,7 @@ func (r *Reader[T]) Drain(ctx context.Context) iter.Seq[T] {
 }
 
 // Follow is like Drain but unbounded: after the existing items it waits for and
-// yields new ones until ctx is cancelled or the DiskQueue is closed. Each item is
+// yields new ones until ctx is cancelled or the Queue is closed. Each item is
 // committed as it is read (at-most-once; see Drain). The lock is released across
 // yields, so other methods may be called from within the loop.
 func (r *Reader[T]) Follow(ctx context.Context) iter.Seq[T] {

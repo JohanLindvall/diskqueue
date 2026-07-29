@@ -779,7 +779,7 @@ func assertSegmentLoss(t *testing.T, s *store, n int) {
 	}
 }
 
-// TestStoreLazyMappingBounded checks that with MaxMapped set, a deep backlog
+// TestStoreLazyMappingBounded checks that with MaxOpenFiles set, a deep backlog
 // keeps at most that many segments mapped while every record stays readable in
 // order (old segments are remapped on demand).
 func TestStoreLazyMappingBounded(t *testing.T) {
@@ -800,8 +800,8 @@ func TestStoreLazyMappingBounded(t *testing.T) {
 	if got := countDataFiles(t, dir); got < 10 {
 		t.Fatalf("expected many segments, got %d", got)
 	}
-	if s.mappedLen > cap {
-		t.Fatalf("after writes %d segments mapped, cap is %d", s.mappedLen, cap)
+	if s.nOpen > cap {
+		t.Fatalf("after writes %d segments mapped, cap is %d", s.nOpen, cap)
 	}
 
 	for i := 0; i < n; i++ {
@@ -810,8 +810,8 @@ func TestStoreLazyMappingBounded(t *testing.T) {
 			t.Fatalf("read %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
 		}
 		s.commitTo(off)
-		if s.mappedLen > cap {
-			t.Fatalf("during read %d: %d segments mapped, cap is %d", i, s.mappedLen, cap)
+		if s.nOpen > cap {
+			t.Fatalf("during read %d: %d segments mapped, cap is %d", i, s.nOpen, cap)
 		}
 	}
 	if !s.empty() {

@@ -106,7 +106,7 @@ func (s *store) load() error {
 
 	// Open the active file so appends can write into it; the rest open on demand.
 	af := s.active()
-	if err := s.ensureMapped(af); err != nil {
+	if err := s.ensureOpen(af); err != nil {
 		return err
 	}
 	// A truncated active segment has had its size clamped to what survived, but its
@@ -147,7 +147,7 @@ func (s *store) startFresh(num uint64) error {
 	}
 	s.nextNum = num + 1
 	s.files = append(s.files, df)
-	s.trackMapped(df)
+	s.trackOpen(df)
 	if !s.noSync {
 		return s.syncDir()
 	}

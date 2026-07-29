@@ -9,7 +9,7 @@ import (
 )
 
 // tryLockDir takes a non-blocking exclusive advisory lock on the open queue
-// directory, so a second DiskQueue — in this process or another — cannot open the
+// directory, so a second Queue — in this process or another — cannot open the
 // same directory and interleave writes into it. It returns ErrLocked when someone
 // else already holds the lock. The lock is released when the handle is closed
 // (store.close), including when the process dies.
