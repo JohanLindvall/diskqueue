@@ -31,8 +31,14 @@ import (
 // 0 with WriteAt; recovery reads it back with a bare pread.
 
 const (
-	headerSize    = 64 // [magic][cursors+counts][version][reserved][header checksum]
-	checksumSize  = 8  // xxhash64 trailer per record
+	headerSize    = 64               // [magic][cursors+counts][version][reserved][header checksum]
+	checksumSize  = 8                // xxhash64 trailer per record
+	minRecordSize = 1 + checksumSize // smallest frame: 1-byte uvarint 0 + checksum
+	// readAhead is how much of a segment a read fetches in its first pread. It is
+	// sized so that a whole record of ordinary size arrives in one syscall instead
+	// of a length probe followed by a re-read of the same bytes; the kernel serves
+	// a page either way, so the extra bytes are free.
+	readAhead     = 4096
 	formatVersion = 1
 	hdrSumCovered = 56 // header bytes the header checksum is computed over ([0:56])
 	filePrefix    = "data."
@@ -66,6 +72,13 @@ type dataFile struct {
 	// not yet fsync'd, so the batched/evict/sync/close paths fsync only files that
 	// need it and skip a file that was merely read since its last flush.
 	dirty bool
+
+	// truncated marks a segment whose file was found shorter than the write cursor
+	// its header publishes: the bytes past the cut are gone. size is clamped to
+	// what survived, so the published cursor must be rewritten before anything
+	// re-extends the file — otherwise the next open reads the zero fill back as
+	// records.
+	truncated bool
 }
 
 // Header layout (little-endian): [0:8] magic, [8:16] commit cursor, [16:24] write
@@ -148,6 +161,15 @@ type store struct {
 	mappedLRU *dataFile
 	mappedLen int
 
+	// lastFrameAt/lastFrameEnd cache the boundary of the record the most recent
+	// read crossed. Every consume path is read-then-commit under one lock, so the
+	// commit walk starts exactly where that read started and would otherwise pread
+	// the length prefix of a record it just read in full. Only a boundary a read
+	// established is ever cached, so trusting it costs nothing in integrity: it is
+	// the same number recordLen would return, without the syscall.
+	lastFrameAt  int64
+	lastFrameEnd int64
+
 	// Reused I/O buffers: writeBuf frames a record before a single WriteAt; readBuf
 	// receives a record (or just its length prefix) on ReadAt. Reusing them keeps
 	// append/read alloc-free once warm.
@@ -161,8 +183,8 @@ type store struct {
 	nWritten   int64 // total records appended
 	nCommitted int64 // total records committed
 
-	unsynced    int   // writes/commits accumulated since the last batched flush
-	unreclaimed int64 // fully-committed segments that would not unlink (retried later)
+	unsynced    int    // writes/commits accumulated since the last batched flush
+	unreclaimed uint64 // failed attempts to unlink a fully-committed segment
 
 	// Loss accounting. Corruption is never allowed to wedge the queue, so the
 	// only way a consumer learns what a bad byte cost is through these: each
@@ -183,14 +205,28 @@ type store struct {
 	nAdded     uint64 // records accepted by append
 	nDelivered uint64 // records handed out by takeHead
 	nFull      uint64 // appends refused with ErrFull
+
+	// nCommittedTotal is the lifetime count of records retired by a commit.
+	// It is deliberately NOT nCommitted, which is a gauge: nCommitted is paired
+	// with nWritten to compute Count() and is decremented when a fully-committed
+	// segment is reclaimed, so it falls as the queue does its job and resets on
+	// reopen. Reporting that as a counter made rate() go negative.
+	nCommittedTotal uint64
 }
 
 func openStore(dir string, segmentSize int64, maxSegments int, noSync bool, syncEvery, maxMapped int) (*store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	if maxMapped > 0 && maxMapped < 2 {
-		maxMapped = 2 // need the active file plus the one being read open at once
+	if maxMapped != 0 && maxMapped < 3 {
+		// Three cursors can each sit in a different segment: the write cursor, the
+		// read cursor, and the commit cursor that Reserve/Commit leaves behind it.
+		// A cap of 2 evicts one of them on every operation, so the file the next op
+		// needs is always the one just closed — reopening a handle per record.
+		//
+		// A negative value means the floor, not "unbounded": a caller computing a
+		// descriptor budget must never get an uncapped queue out of a bad number.
+		maxMapped = 3
 	}
 	s := &store{
 		dir:         dir,
@@ -461,15 +497,36 @@ func (s *store) load() error {
 	}
 
 	// Open the active file so appends can write into it; the rest open on demand.
-	if err := s.ensureMapped(s.active()); err != nil {
+	af := s.active()
+	if err := s.ensureMapped(af); err != nil {
 		return err
+	}
+	// A truncated active segment has had its size clamped to what survived, but its
+	// header still publishes the old write cursor. Republish the clamped one BEFORE
+	// the reservation below re-extends the file, or the next open finds a full-size
+	// file whose header points past the surviving records and reads the zero fill
+	// back as a phantom backlog — re-reporting the same loss on every open.
+	if af.truncated {
+		af.header(
+			setWriteCursor(headerSize+af.size),
+			setWrittenCount(af.written),
+		)
+		if err := s.writeHeader(af); err != nil {
+			return err
+		}
+		if !s.noSync {
+			if err := s.flushFile(af); err != nil {
+				return err
+			}
+		}
+		af.truncated = false
 	}
 	// A segment written by an older build — or while the filesystem had no
 	// fallocate — is sparse, and the active one is the one about to be appended to.
 	// Reserving it again is a no-op if it is already allocated. Deliberately
 	// best-effort: making this fatal would stop a queue on a full disk from being
 	// opened to drain it, which is exactly when opening it matters most.
-	_ = preallocate(s.active().f, headerSize+s.segmentSize)
+	_ = preallocate(af.f, headerSize+s.segmentSize)
 	return nil
 }
 
@@ -567,8 +624,17 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	if truncated && w > size {
 		w = size // never address bytes past the real end of the file
 	}
-	df := &dataFile{num: num, hdr: h, base: base, size: w - headerSize}
+	df := &dataFile{num: num, hdr: h, base: base, size: w - headerSize, truncated: truncated}
 	df.written = max64(th.writtenCount(), 0)
+	if truncated {
+		// The header counts records the file no longer holds. Count() would then
+		// promise a backlog a full drain can never deliver, so believe the bytes
+		// that survived rather than the header: at most one record per the smallest
+		// frame that fits in what is left.
+		if fit := df.size / int64(minRecordSize); df.written > fit {
+			df.written = fit
+		}
+	}
 	df.committed = th.committedCount()
 	if df.committed < 0 {
 		df.committed = 0
@@ -749,7 +815,7 @@ func (s *store) flushFile(df *dataFile) error {
 			return err
 		}
 	}
-	if err := df.f.Sync(); err != nil {
+	if err := datasync(df.f); err != nil {
 		return s.failIO(err)
 	}
 	df.dirty = false
@@ -797,7 +863,7 @@ func (s *store) append(payload []byte) error {
 		// the data first guarantees a crash can only ever lose the header update (a
 		// clean truncation), never leave a published record whose payload never
 		// landed.
-		if err := af.f.Sync(); err != nil {
+		if err := datasync(af.f); err != nil {
 			return s.failIO(err)
 		}
 	}
@@ -834,7 +900,7 @@ func (s *store) append(payload []byte) error {
 	case s.batched():
 		return s.recordOp()
 	default:
-		if err := af.f.Sync(); err != nil {
+		if err := datasync(af.f); err != nil {
 			// The header is in the page cache, so the record is real to anything
 			// short of a power loss: it stays, and the store is poisoned.
 			return s.failIO(err)
@@ -879,6 +945,15 @@ func (s *store) cycle() error {
 // so it is never re-delivered, but leaving it counted keeps maxSegments a truthful
 // statement about what is on disk, and the next drop retries the removal.
 func (s *store) dropCommitted(keep *dataFile) {
+	// Files ascend by base and never overlap, so anything fully committed is a
+	// prefix of the slice: if the first file is not reclaimable, none are. This
+	// runs on every commit, so the common no-op case should not walk the backlog.
+	if len(s.files) == 0 || s.files[0] == keep || s.files[0].base+s.files[0].size > s.commitOff {
+		return
+	}
+	// A reclaim invalidates the cached frame boundary: offsets it named may belong
+	// to a segment that is about to stop existing.
+	s.lastFrameAt, s.lastFrameEnd = 0, 0
 	survive := s.files[:0]
 	for _, df := range s.files {
 		if df != keep && df.base+df.size <= s.commitOff {
@@ -919,10 +994,16 @@ func (s *store) fileForOffset(off int64) *dataFile {
 // says, and what the recovery path knows how to quarantine. A real device error is
 // left alone so it is never mistaken for recoverable corruption.
 func shortReadIsCorrupt(err error) error {
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+	if isShortRead(err) {
 		return fmt.Errorf("%w: %w", ErrCorrupt, err)
 	}
 	return err
+}
+
+// isShortRead reports whether err means "the file ended before the read did",
+// as opposed to a device or permission failure.
+func isShortRead(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // recordAt preads the record at global offset off (which must lie in df) into the
@@ -936,14 +1017,28 @@ func (s *store) recordAt(df *dataFile, off int64) ([]byte, uint64, int64, bool, 
 	}
 	avail := df.size - dataOff
 
-	// Read the length prefix (at most MaxVarintLen64 bytes, never past the data).
-	hn := int64(binary.MaxVarintLen64)
+	// Read a block up front rather than probing for the length and then re-reading
+	// the same bytes: a whole record under readAhead arrives in one pread, which is
+	// the common case by a wide margin, and the length prefix is decoded out of
+	// bytes already in hand. Only a record too big for the block costs the second
+	// syscall — and then the first read was not wasted either, since the kernel has
+	// the page.
+	hn := int64(readAhead)
 	if hn > avail {
 		hn = avail
 	}
 	s.readBuf = growBuf(s.readBuf, int(hn))
 	if _, err := df.f.ReadAt(s.readBuf[:hn], headerSize+dataOff); err != nil {
-		return nil, 0, 0, false, shortReadIsCorrupt(err)
+		// Short of the block is fine as long as the record itself is whole: the
+		// segment's data region simply ends there. Re-read exactly the prefix and
+		// let the framing checks below decide.
+		if !isShortRead(err) {
+			return nil, 0, 0, false, err
+		}
+		hn = min(int64(binary.MaxVarintLen64), avail)
+		if _, err := df.f.ReadAt(s.readBuf[:hn], headerSize+dataOff); err != nil {
+			return nil, 0, 0, false, shortReadIsCorrupt(err)
+		}
 	}
 	v, n := binary.Uvarint(s.readBuf[:hn])
 	if n <= 0 {
@@ -954,12 +1049,28 @@ func (s *store) recordAt(df *dataFile, off int64) ([]byte, uint64, int64, bool, 
 	}
 	L := int(v)
 	total := n + L + checksumSize
-	s.readBuf = growBuf(s.readBuf, total)
-	if _, err := df.f.ReadAt(s.readBuf[:total], headerSize+dataOff); err != nil {
-		return nil, 0, 0, false, shortReadIsCorrupt(err)
+	if int64(total) > hn { // the record ran past the block: fetch the whole frame
+		s.readBuf = growBuf(s.readBuf, total)
+		if _, err := df.f.ReadAt(s.readBuf[:total], headerSize+dataOff); err != nil {
+			return nil, 0, 0, false, shortReadIsCorrupt(err)
+		}
 	}
 	sum := binary.LittleEndian.Uint64(s.readBuf[n+L : total])
 	return s.readBuf[n : n+L], sum, off + int64(total), true, nil
+}
+
+// frameEnd returns the offset just past the record at off, using the boundary
+// the last read established when it is the same one. Consume ops read and then
+// commit the same record under one lock, so this is the common case, and it
+// turns the commit half of a Take into pure bookkeeping — no syscall at all.
+//
+// The cache is only ever written by a read that successfully framed a record, so
+// a hit returns exactly what recordLen would have re-derived from the bytes.
+func (s *store) frameEnd(df *dataFile, off int64) (int64, bool, error) {
+	if s.lastFrameEnd != 0 && s.lastFrameAt == off {
+		return s.lastFrameEnd, true, nil
+	}
+	return s.recordLen(df, off)
 }
 
 // recordLen preads only the length prefix of the record at off, returning the
@@ -998,7 +1109,13 @@ func (s *store) recordLen(df *dataFile, off int64) (int64, bool, error) {
 // bounds check and panicking in growBuf's reslice. Since avail never exceeds
 // segmentSize, the first comparison makes the second one overflow-free.
 func fitsInRecord(v uint64, n int, avail int64) bool {
-	return v <= uint64(avail) && uint64(n)+v+checksumSize <= uint64(avail)
+	// maxInt matters on 32-bit builds: avail can be up to segmentSize, so a
+	// segment above 2 GiB would let a length through that int cannot hold, and the
+	// narrowing in the caller would wrap negative again. Bounding by both keeps
+	// the guard true on every word size.
+	const maxInt = uint64(^uint(0) >> 1)
+	return v <= uint64(avail) && v <= maxInt &&
+		uint64(n)+v+checksumSize <= uint64(avail)
 }
 
 // read locates and decodes the record at global offset off, opening its file on
@@ -1061,7 +1178,16 @@ func (s *store) takeHead() ([]byte, int64, bool, error) {
 		if !errors.Is(err, ErrCorrupt) {
 			return nil, 0, false, err // transient: retry, don't destroy
 		}
-		if serr := s.skipCorruptSegment(s.headOff); serr != nil {
+		head := s.headOff
+		if serr := s.skipCorruptSegment(head); serr != nil {
+			if s.headOff == head {
+				// The quarantine could not be recorded and nothing moved. Reporting
+				// ErrCorrupt here would tell the caller the queue had stepped past
+				// the damage, and the documented recovery loop ("count it and go
+				// round again") would re-read the same bytes forever. It is a
+				// retriable I/O failure, so hand back the failure itself.
+				return nil, 0, false, serr
+			}
 			return nil, 0, false, errors.Join(err, serr)
 		}
 		return nil, 0, false, err
@@ -1076,6 +1202,9 @@ func (s *store) takeHead() ([]byte, int64, bool, error) {
 		s.headOff = next
 		return nil, 0, false, fmt.Errorf("%w: record checksum", ErrCorrupt)
 	}
+	// Hand the boundary to the commit that is about to follow: every consume path
+	// reads and then commits this same record while still holding the lock.
+	s.lastFrameAt, s.lastFrameEnd = s.headOff, next
 	s.headOff = next
 	s.nDelivered++
 	return payload, next, true, nil
@@ -1085,11 +1214,38 @@ func (s *store) takeHead() ([]byte, int64, bool, error) {
 // just returned. Used when the value could not be handed over after all, so a
 // failure does not quietly swallow a record that was never delivered. off must be
 // a cursor takeHead was called at, so it can never precede the commit cursor.
+//
+// The delivery count is rolled back with it: takeHead counted the record on its
+// way out, and it never reached the consumer.
 func (s *store) rewindHead(off int64) {
 	if off < s.headOff {
 		s.headOff = off
+		if s.nDelivered > 0 {
+			s.nDelivered--
+		}
 	}
 }
+
+// progress is the pair a consume operation has to move for an iteration to be
+// getting anywhere: the read cursor, and the backlog of corruption reports still
+// owed (paid down one per takeHead call, without the cursor moving).
+//
+// A caller that treats "damage was dropped, go round again" as a reason to retry
+// must check this first. Damage the store could not actually step past reports
+// the same error from the same offset forever, and a loop that keeps going on the
+// error alone spins — under the queue lock, in the iterators' case.
+type progress struct {
+	head    int64
+	pending int
+}
+
+func (s *store) progress() progress { return progress{head: s.headOff, pending: s.pendingCorrupt} }
+
+// drained reports whether the read cursor has reached end with no corruption
+// report still owed. The backlog is part of the question: a segment dropped at
+// open destroys records that no read will ever fail on, so a consumer that
+// watched the cursor alone would never collect those reports.
+func (s *store) drained(end int64) bool { return s.headOff >= end && s.pendingCorrupt == 0 }
 
 // skipCorruptSegment abandons the rest of the segment holding off: it advances
 // the read cursor past the segment, and — when the commit cursor is already
@@ -1120,6 +1276,15 @@ func (s *store) skipCorruptSegment(off int64) error {
 		s.headOff = s.writeOff
 		if s.commitOff < s.writeOff {
 			s.commitOff = s.writeOff
+		}
+		// Square the per-file counts too, not just the global one: dropCommitted
+		// subtracts df.committed from nCommitted as it reclaims, so leaving the two
+		// out of step here would drive Count() negative on the next drop.
+		for _, df := range s.files {
+			if abandoned := df.written - df.committed; abandoned > 0 {
+				s.nCommittedTotal += uint64(abandoned)
+			}
+			df.committed = df.written
 		}
 		s.nCommitted = s.nWritten
 		return nil
@@ -1153,6 +1318,7 @@ func (s *store) skipCorruptSegment(off int64) error {
 		}
 		if abandoned := df.written - df.committed; abandoned > 0 {
 			s.nCommitted += abandoned
+			s.nCommittedTotal += uint64(abandoned)
 			df.committed = df.written
 		}
 		if s.commitOff < end {
@@ -1216,7 +1382,7 @@ func (s *store) commitTo(off int64) error {
 			stop = err // can't open the file to advance the cursor; replay later
 			break
 		}
-		next, ok, err := s.recordLen(df, s.commitOff)
+		next, ok, err := s.frameEnd(df, s.commitOff)
 		// The cursor may only ever move forward, and never past the tail: a decoded
 		// length that says otherwise is corruption, not a destination.
 		if ok && (next <= s.commitOff || next > s.writeOff) {
@@ -1235,6 +1401,12 @@ func (s *store) commitTo(off int64) error {
 					stop = serr
 					break
 				}
+				// The commit path has no read to carry the report, so owe it
+				// through the backlog: the invariant is that every counted event
+				// surfaces as exactly one ErrCorrupt, and a Corruptions() that
+				// climbs with nothing in any log is what breaks an operator's trust
+				// in the number.
+				s.pendingCorrupt++
 				cur, advanced = nil, true // it persisted the header itself
 				continue
 			}
@@ -1243,6 +1415,7 @@ func (s *store) commitTo(off int64) error {
 		}
 		s.commitOff = next
 		s.nCommitted++
+		s.nCommittedTotal++
 		df.committed++
 		// header() rebuilds the checksum in memory; the bytes are written once per
 		// file (on leaving it, and the last below).
@@ -1294,7 +1467,7 @@ func (s *store) persistCommit(df *dataFile, perOp bool) error {
 	return nil
 }
 
-func (s *store) empty() bool            { return s.headOff >= s.writeOff && s.pendingCorrupt == 0 }
+func (s *store) empty() bool            { return s.drained(s.writeOff) }
 func (s *store) size() int64            { return s.writeOff - s.commitOff }
 func (s *store) count() int64           { return s.nWritten - s.nCommitted }
 func (s *store) writeOffset() int64     { return s.writeOff }
@@ -1314,7 +1487,7 @@ func (s *store) stats() Stats {
 		DiskBytes:       int64(len(s.files)) * (headerSize + s.segmentSize),
 		Added:           s.nAdded,
 		Delivered:       s.nDelivered,
-		Committed:       uint64(s.nCommitted),
+		Committed:       s.nCommittedTotal,
 		Full:            s.nFull,
 		LostBytes:       s.lostBytes,
 		LostRecords:     s.lostRecords,
@@ -1322,6 +1495,7 @@ func (s *store) stats() Stats {
 		ForeignSegments: s.foreignSegments,
 		ForeignBytes:    s.foreignBytes,
 		DiscardedBytes:  s.discardedBytes,
+		Unreclaimed:     s.unreclaimed,
 		Corruptions:     uint64(s.corruptions),
 	}
 }
@@ -1385,7 +1559,10 @@ func (s *store) close() error {
 		}
 		df.f = nil
 	}
-	s.files = nil
+	// Keep the slice. Every handle is closed and nil'd above, so nothing here is
+	// live — but Stats stays readable after Close, and a shutdown scrape that
+	// reported "0 segments, 0 bytes on disk" for a directory still holding a
+	// backlog would be the one number an operator most needs to be true.
 	s.mappedMRU, s.mappedLRU, s.mappedLen = nil, nil, 0
 	if s.dirFile != nil {
 		if err := s.dirFile.Close(); err != nil && first == nil {

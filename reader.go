@@ -216,7 +216,10 @@ func (r *Reader[T]) next(ctx context.Context, follow bool, end int64) (T, bool, 
 		if w.closed {
 			return zero, false, nil
 		}
-		if !follow && w.st.headOffset() >= end {
+		// end is a snapshot and writeOff only grows, so reaching it is the whole
+		// stopping condition — but drained() also insists the corruption backlog is
+		// paid down, or losses dropped at open would never be reported to anyone.
+		if !follow && w.st.drained(end) {
 			return zero, false, nil
 		}
 		if w.st.empty() {
@@ -228,19 +231,28 @@ func (r *Reader[T]) next(ctx context.Context, follow bool, end int64) (T, bool, 
 			}
 			continue
 		}
+		before := w.st.progress()
 		v, off, ok, err := r.read()
-		if errors.Is(err, ErrCorrupt) {
-			// The damage has already been dropped and the queue has moved past it,
-			// so keep iterating: one bad record must not silently truncate a drain
-			// of everything behind it. The first event is kept for Err, and
-			// Stats().LostBytes counts them all.
-			if r.err == nil {
-				r.err = err
+		if err != nil {
+			// Corruption the store actually stepped past is not a reason to stop:
+			// the damage is already dropped and everything behind it is still
+			// deliverable, so one bad record must not silently truncate the drain.
+			// The first event is kept for Err, and Stats().LostBytes counts them all.
+			//
+			// Corruption it did NOT step past is a reason to stop. Continuing would
+			// re-read the same bytes forever while holding this lock — which is
+			// exactly what a codec returning an error that wraps ErrCorrupt used to
+			// do, with no I/O fault involved at all.
+			if errors.Is(err, ErrCorrupt) && w.st.progress() != before {
+				if r.err == nil {
+					r.err = err
+				}
+				continue
 			}
-			continue
-		}
-		if err != nil || !ok {
 			return zero, false, err
+		}
+		if !ok {
+			return zero, false, nil
 		}
 		// Commit before yielding, under the read's lock (like Take): atomic and
 		// in cursor order, so concurrent iterations cooperate. Cost: at-most-once.
@@ -264,12 +276,22 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 		return zero, 0, false, err
 	}
 	r.scratch = append(r.scratch[:0], payload...) // copy out of the store's read buffer
+
+	// Put the head back on the record unless it is actually handed over — the same
+	// stance as a corrupt record, so a codec failure can never consume one into
+	// thin air. A defer rather than a branch because UnmarshalFunc may panic:
+	// recovering that used to leave the record consumed AND, on the Take path,
+	// committed by the caller's deferred unlock.
+	delivered := false
+	defer func() {
+		if !delivered {
+			r.w.st.rewindHead(start)
+		}
+	}()
 	v, err := r.w.unmarshal(r.scratch)
 	if err != nil {
-		// The record was never handed over, so put the head back on it rather than
-		// consuming it into thin air — the same stance as a corrupt record.
-		r.w.st.rewindHead(start)
 		return zero, 0, false, err
 	}
+	delivered = true
 	return v, off, true, nil
 }

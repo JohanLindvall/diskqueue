@@ -582,9 +582,10 @@ func TestStoreCorruptLengthNoPanic(t *testing.T) {
 			if s.commitOff < 0 || s.commitOff > s.writeOff {
 				t.Fatalf("commitOff=%d outside [0,%d]", s.commitOff, s.writeOff)
 			}
-			// Only the length prefix is ever read for a record that fails the guard,
-			// so the buffer must never have been grown to the claimed record size.
-			if cap(s.readBuf) > binary.MaxVarintLen64 {
+			// A record that fails the guard is never fetched, so the buffer must
+			// never have been grown to the claimed length — only to the read-ahead
+			// block the first pread legitimately asks for.
+			if cap(s.readBuf) > readAhead {
 				t.Fatalf("readBuf grew to %d: a corrupt length escaped the bound", cap(s.readBuf))
 			}
 		})
@@ -783,7 +784,10 @@ func assertSegmentLoss(t *testing.T, s *store, n int) {
 // order (old segments are remapped on demand).
 func TestStoreLazyMappingBounded(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 64, 0, true, 0, 2) // tiny segments, cap 2 mappings
+	// A cap below the floor is raised to it: the write, read and commit cursors
+	// can each be in a different segment, so 3 is the smallest working set.
+	const cap = 3
+	s, err := openStore(dir, 64, 0, true, 0, cap) // tiny segments, capped handles
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -796,8 +800,8 @@ func TestStoreLazyMappingBounded(t *testing.T) {
 	if got := countDataFiles(t, dir); got < 10 {
 		t.Fatalf("expected many segments, got %d", got)
 	}
-	if s.mappedLen > 2 {
-		t.Fatalf("after writes %d segments mapped, cap is 2", s.mappedLen)
+	if s.mappedLen > cap {
+		t.Fatalf("after writes %d segments mapped, cap is %d", s.mappedLen, cap)
 	}
 
 	for i := 0; i < n; i++ {
@@ -806,8 +810,8 @@ func TestStoreLazyMappingBounded(t *testing.T) {
 			t.Fatalf("read %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
 		}
 		s.commitTo(off)
-		if s.mappedLen > 2 {
-			t.Fatalf("during read %d: %d segments mapped, cap is 2", i, s.mappedLen)
+		if s.mappedLen > cap {
+			t.Fatalf("during read %d: %d segments mapped, cap is %d", i, s.mappedLen, cap)
 		}
 	}
 	if !s.empty() {

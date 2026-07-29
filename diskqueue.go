@@ -119,8 +119,12 @@ type Options struct {
 	// MaxMapped caps how many segment files are kept open at once. Segments are
 	// opened on demand and the least-recently-used handles are closed beyond the
 	// cap, bounding open descriptors for deep backlogs; the active segment is
-	// always open. 0 means unbounded (keep every touched segment open). Values are
-	// raised to a minimum of 2 (the active segment plus one reader).
+	// always open. 0 means unbounded (keep every touched segment open).
+	//
+	// Values are raised to a floor of 3, because the write, read and commit
+	// cursors can each be in a different segment; a smaller cap evicts the handle
+	// the next operation needs. Note that the open-file count is already bounded
+	// by MaxSegments, so this is only worth setting when MaxSegments is unbounded.
 	MaxMapped int
 
 	// SyncInterval, if > 0, runs a background goroutine that flushes to stable
@@ -149,6 +153,10 @@ type Stats struct {
 	Delivered uint64 // records handed to a reader, redeliveries included
 	Committed uint64 // records retired by a commit
 	Full      uint64 // Adds refused with ErrFull
+	// Unreclaimed counts failed attempts to unlink a fully-committed segment.
+	// A segment that will not unlink stays in the live set and is retried on the
+	// next drop, so this climbing means disk is not being freed.
+	Unreclaimed uint64
 
 	// Loss, all since New. LostBytes is a lower bound: for a segment that
 	// vanished from the directory, only its recorded size is left to count.
@@ -403,12 +411,17 @@ func (w *DiskQueue[T]) waitLocked(ctx context.Context) error {
 		w.notify = make(chan struct{})
 	}
 	ch := w.notify
+	// Touch the caller's context while the lock is still held. A nil ctx is a
+	// caller bug either way, but panicking after the unlock makes it an
+	// unrecoverable one: the caller's deferred Unlock then runs on a mutex nobody
+	// holds, which is a fatal runtime throw rather than a panic recover() can catch.
+	done := ctx.Done()
 	w.mu.Unlock()
 	select {
 	case <-ch:
 		w.mu.Lock()
 		return nil
-	case <-ctx.Done():
+	case <-done:
 		w.mu.Lock()
 		return ctx.Err()
 	}
