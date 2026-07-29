@@ -1,31 +1,3 @@
-// Package diskqueue implements a generic, durable, FIFO disk-backed queue (a
-// persistent work queue that doubles as a write-ahead log) backed by its own file
-// store (see store.go) using plain pread/pwrite/fsync; its only dependency is
-// cespare/xxhash/v2 (per-record checksums).
-//
-// Items are appended with Add and consumed through a Reader (Queue.NewReader): Take
-// reads + commits in one step, or Reserve reads and later Commits its offset.
-// Committing advances a persisted read cursor; data files are reclaimed once
-// fully committed.
-//
-// It is built for high throughput and minimal allocation: Add serializes into a
-// reused buffer, and a Reader copies each record into its own reused buffer — so
-// both are alloc-free once warm.
-//
-// Value lifetime: the slice passed to UnmarshalFunc (and anything in T aliasing
-// it) is owned by the Reader and valid only until that Reader's next read; copy
-// it if you need it longer.
-//
-// Concurrency: a Queue is safe for concurrent use; a single Reader is not — use one
-// per consuming goroutine. Readers share one read/commit cursor and cooperate
-// (each item delivered once). Take/TryTake and Drain/Follow commit under the lock
-// as they read, so they are safe for concurrent cooperating readers. Reserve/
-// Commit is the only deferred path: its commits must be issued in offset order
-// (single consumer) or one reader reclaims another's in-flight record. The
-// blocking methods honour their context.
-//
-// Crash semantics: at-least-once. On open the read cursor resets to the persisted
-// commit cursor, so uncommitted items replay.
 package diskqueue
 
 import (
