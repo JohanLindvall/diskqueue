@@ -64,6 +64,12 @@ func swapHandle(t *testing.T, s *store, idx, flag int) {
 	df.f = f
 }
 
+// unframeable is a length prefix no decoder can use: ten continuation bytes, so
+// the uvarint never terminates. Writing it over a record's prefix destroys the
+// frame boundaries behind it, which is the damage class that costs a whole
+// segment rather than one record.
+var unframeable = []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+
 // openFDs counts the process's open descriptors, for leak assertions.
 func openFDs(t *testing.T) int {
 	t.Helper()

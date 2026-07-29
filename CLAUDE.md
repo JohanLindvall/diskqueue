@@ -315,16 +315,16 @@ mirrors its own `written`/`committed` counts into its header.
   `append`/`commitTo` and `noSync` `writeHeader` the record/header into the page
   cache (so a reopen-via-`load` and `readFileHeader` see them) but defer the fsync;
   the per-op path fsyncs inline and clears `dirty`. `flushFile`/`flushBatch`/
-  `sync`/`close`/`evictMapped` fsync only dirty files and skip clean ones — a file
+  `sync`/`close`/`evictOpen` fsync only dirty files and skip clean ones — a file
   only read since its last flush is closed with no fsync. Under `noSync`, eviction
   just clears `dirty` and relies on kernel writeback (the page-cache bytes survive
   the handle being closed).
-- **Lazy open.** Files open on demand via `ensureMapped` (`read`, `commitTo`, and
-  `append` for the active file); `evictMapped` closes the LRU handle beyond
+- **Lazy open.** Files open on demand via `ensureOpen` (`read`, `commitTo`, and
+  `append` for the active file); `evictOpen` closes the LRU handle beyond
   `maxOpenFiles`, never the active or just-opened file, fsyncing a dirty victim first
   (a clean victim is closed without fsync). `df.f == nil` means closed —
   `flushFile`/`sync`/`flushBatch`/`close` skip such files; `df.hdr` stays resident
-  so accessors still work and a later `ensureMapped` just reopens the handle.
+  so accessors still work and a later `ensureOpen` just reopens the handle.
   `createFile` writes (and, unless `noSync`, fsyncs) the fresh header so a
   cycled-but-empty segment is a valid file on disk.
 
@@ -341,12 +341,12 @@ mirrors its own `written`/`committed` counts into its header.
   a permanently-failing codec re-reads the same record; that is intentional, and
   `Reader.Skip` is the sanctioned way past it. Do *not* route decode failures into
   `skipCorruptSegment`: a codec bug is not disk corruption, quarantining a whole
-  segment for it discards intact data, and it would make `Corruptions()` — the
+  segment for it discards intact data, and it would make `Stats().Corruptions` — the
   metric operators watch for real data loss — lie.
 - `commitTo` quarantines like the read path: a record it cannot frame moves the
   cursor past the whole segment instead of freezing it forever (which would also
   stop all reclamation, so the disk fills behind the stuck cursor).
-- `commitTo` finalizes the outgoing file's header *before* `ensureMapped` opens the
+- `commitTo` finalizes the outgoing file's header *before* `ensureOpen` opens the
   next one: with a small `maxOpenFiles`, opening the next segment can evict the one
   whose header is about to be written. `writeHeader` also self-heals a nil handle,
   so this is belt and braces — but the ordering avoids reopening a file just to
@@ -360,5 +360,5 @@ mirrors its own `written`/`committed` counts into its header.
   build-tagged file pairs; every `GOOS` in `go tool dist list` must keep compiling
   (`GOOS=windows go build ./...` etc.).
 - The fault-injection helpers in `robust_test.go` work by swapping `df.f` behind the
-  store's back, and rely on `ensureMapped` *not* reopening a file whose `f` is
+  store's back, and rely on `ensureOpen` *not* reopening a file whose `f` is
   non-nil. If that ever changes, those tests silently stop injecting anything.

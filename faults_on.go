@@ -23,5 +23,3 @@ func faultPoint(name string) error {
 	}
 	return faultHook(name)
 }
-
-const faultsEnabled = true

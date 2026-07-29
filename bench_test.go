@@ -12,15 +12,10 @@ import (
 
 var benchPayload = make([]byte, 256)
 
-func benchCodec() (MarshalFunc[[]byte], UnmarshalFunc[[]byte]) {
-	return func(dst []byte, v []byte) ([]byte, error) { return append(dst, v...), nil },
-		func(d []byte) ([]byte, error) { return d, nil }
-}
-
 // BenchmarkRead isolates the read path: one Add per iteration is amortized away
 // by pre-filling, so what is measured is takeHead + the reader's copy.
 func BenchmarkRead(b *testing.B) {
-	m, u := benchCodec()
+	m, u := bytesCodec()
 	w, err := New[[]byte](b.TempDir(), m, u, Options{NoSync: true, MaxSegments: -1})
 	if err != nil {
 		b.Fatal(err)
@@ -44,7 +39,7 @@ func BenchmarkRead(b *testing.B) {
 // BenchmarkAddTakeCommit is the full round trip a queue consumer actually runs:
 // append, read, commit — the path where a redundant pread costs most.
 func BenchmarkAddTakeCommit(b *testing.B) {
-	m, u := benchCodec()
+	m, u := bytesCodec()
 	w, err := New[[]byte](b.TempDir(), m, u, Options{NoSync: true, MaxSegments: -1})
 	if err != nil {
 		b.Fatal(err)
@@ -68,7 +63,7 @@ func BenchmarkAddTakeCommit(b *testing.B) {
 func BenchmarkAddDurable(b *testing.B) {
 	for _, every := range []int{1, 10, 100, 1000} {
 		b.Run("SyncEvery"+strconv.Itoa(every), func(b *testing.B) {
-			m, u := benchCodec()
+			m, u := bytesCodec()
 			w, err := New[[]byte](b.TempDir(), m, u, Options{SyncEvery: every, MaxSegments: -1})
 			if err != nil {
 				b.Fatal(err)
@@ -90,7 +85,7 @@ func BenchmarkAddDurable(b *testing.B) {
 func BenchmarkDeepBacklog(b *testing.B) {
 	for _, maxOpen := range []int{0, 3} {
 		b.Run("MaxOpenFiles"+strconv.Itoa(maxOpen), func(b *testing.B) {
-			m, u := benchCodec()
+			m, u := bytesCodec()
 			w, err := New[[]byte](b.TempDir(), m, u, Options{
 				NoSync: true, SegmentSize: 4096, MaxSegments: -1, MaxOpenFiles: maxOpen,
 			})

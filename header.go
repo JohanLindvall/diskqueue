@@ -16,9 +16,8 @@ import (
 // by records framed as uvarint(len) || payload || xxhash64(payload).
 
 const (
-	headerSize    = 64               // [magic][cursors+counts][version][reserved][header checksum]
-	checksumSize  = 8                // xxhash64 trailer per record
-	minRecordSize = 1 + checksumSize // smallest frame: 1-byte uvarint 0 + checksum
+	headerSize   = 64 // [magic][cursors+counts][version][reserved][header checksum]
+	checksumSize = 8  // xxhash64 trailer per record
 	// readAhead is how much of a segment a read fetches in its first pread. It is
 	// sized so that a whole record of ordinary size arrives in one syscall instead
 	// of a length probe followed by a re-read of the same bytes; the kernel serves

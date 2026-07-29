@@ -1,12 +1,11 @@
 package diskqueue
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -43,7 +42,7 @@ func (s *store) load() error {
 		}
 		nums = append(nums, num)
 	}
-	sort.Slice(nums, func(i, j int) bool { return nums[i] < nums[j] })
+	slices.Sort(nums)
 
 	if len(nums) == 0 {
 		return s.startFresh(1)
@@ -105,30 +104,52 @@ func (s *store) load() error {
 		s.nCommitted += df.committed
 	}
 
+	// A truncated segment has had its size clamped to what survived, but its header
+	// still publishes the old write cursor. Republish the clamped one now, or the
+	// next open re-detects the same short file and books the same loss again — and
+	// again on the open after that, forever.
+	//
+	// EVERY truncated segment, not just the active one: a middle segment is never
+	// re-extended and never appended to, so nothing else would ever correct it. It
+	// also has to happen before the reservation below, which would otherwise leave
+	// the active file full-size with a header pointing past its surviving records,
+	// so the zero fill reads back as a phantom backlog.
+	for _, df := range s.files {
+		if !df.truncated {
+			continue
+		}
+		if err := s.ensureOpen(df); err != nil {
+			return err
+		}
+		df.header(
+			setWriteCursor(headerSize+df.size),
+			setWrittenCount(df.written),
+		)
+		if err := s.writeHeader(df); err != nil {
+			return err
+		}
+		if !s.noSync {
+			if err := s.flushFile(df); err != nil {
+				return err
+			}
+		}
+		// Restore the geometry too, and only after the clamped cursor is durable.
+		// Segments are preallocated to a known length, so a short file is read as a
+		// different SegmentSize unless its own header proves it lost bytes — and the
+		// header no longer says that, because we just fixed it. Left short, the next
+		// open would reject the whole store with ErrSegmentSizeMismatch. Re-extended,
+		// it is an ordinary partly-filled segment whose tail is zero fill, which is
+		// what every other segment looks like.
+		if err := preallocate(df.f, headerSize+s.segmentSize); err != nil {
+			return err
+		}
+		df.truncated = false
+	}
+
 	// Open the active file so appends can write into it; the rest open on demand.
 	af := s.active()
 	if err := s.ensureOpen(af); err != nil {
 		return err
-	}
-	// A truncated active segment has had its size clamped to what survived, but its
-	// header still publishes the old write cursor. Republish the clamped one BEFORE
-	// the reservation below re-extends the file, or the next open finds a full-size
-	// file whose header points past the surviving records and reads the zero fill
-	// back as a phantom backlog — re-reporting the same loss on every open.
-	if af.truncated {
-		af.header(
-			setWriteCursor(headerSize+af.size),
-			setWrittenCount(af.written),
-		)
-		if err := s.writeHeader(af); err != nil {
-			return err
-		}
-		if !s.noSync {
-			if err := s.flushFile(af); err != nil {
-				return err
-			}
-		}
-		af.truncated = false
 	}
 	// A segment written by an older build — or while the filesystem had no
 	// fallocate — is sparse, and the active one is the one about to be appended to.
@@ -234,7 +255,7 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 		w = size // never address bytes past the real end of the file
 	}
 	df := &dataFile{num: num, hdr: h, base: base, size: w - headerSize, truncated: truncated}
-	df.written = max64(th.writtenCount(), 0)
+	df.written = max(th.writtenCount(), 0)
 	if truncated {
 		// The header counts records the file no longer holds, so Count() would
 		// promise a backlog no drain can deliver and the queue would never read
@@ -243,7 +264,7 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 		// An arithmetic bound (size / smallest possible frame) is not enough: it is
 		// only tight when the records are minimal, and for anything larger it sits
 		// above the header's count and never fires at all. Count the frames.
-		if n, err := s.surviveCount(num, df.size); err == nil {
+		if n, err := s.surviveCount(df); err == nil {
 			if gone := df.written - n; gone > 0 {
 				s.lostRecords += uint64(gone)
 			}
@@ -267,37 +288,28 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	return df, cc, nil
 }
 
-// surviveCount counts the whole record frames in the first size bytes of a
-// segment's data region.
+// surviveCount counts the whole record frames a truncated segment still holds.
 //
 // This is the one place recovery reads records, and the exception is licensed by
 // the segment's own header having proved it lost bytes: that header's count
-// describes a file which no longer exists. The walk is bounded by the segment
+// describes a file which no longer exists. The walk is bounded by the clamped
 // size and only ever runs for a segment already known to be damaged, so the
 // "recovery reads no records" cost model still holds for every healthy open.
 //
-// It never fails the open. A segment it cannot read falls back to the header's
-// count, which is no worse than not having tried.
-func (s *store) surviveCount(num uint64, size int64) (int64, error) {
-	f, err := os.Open(s.filePath(num))
-	if err != nil {
+// It steps with recordLen rather than its own decoder, so the frame layout stays
+// spelled in exactly one place — a change there that this missed would silently
+// produce a wrong count rather than an error.
+func (s *store) surviveCount(df *dataFile) (int64, error) {
+	if err := s.ensureOpen(df); err != nil {
 		return 0, err
 	}
-	defer func() { _ = f.Close() }() // read-only handle: nothing to lose on close
-	var buf [binary.MaxVarintLen64]byte
-	var n, off int64
-	for off < size {
-		avail := size - off
-		hn := min(int64(len(buf)), avail)
-		if _, err := f.ReadAt(buf[:hn], headerSize+off); err != nil {
-			return n, nil // the file ends here; everything past it is gone
+	var n int64
+	for off := df.base; off < df.base+df.size; n++ {
+		next, ok, err := s.recordLen(df, off)
+		if err != nil || !ok {
+			break // no whole frame starts here; the rest is gone
 		}
-		v, used := binary.Uvarint(buf[:hn])
-		if used <= 0 || !fitsInRecord(v, used, avail) {
-			return n, nil // no whole frame starts here
-		}
-		off += int64(used) + int64(v) + checksumSize
-		n++
+		off = next
 	}
 	return n, nil
 }
@@ -315,7 +327,7 @@ func (s *store) dropSegment(num uint64, size int64, foreign bool) error {
 		// every open, so say so rather than pretending it is gone.
 		return err
 	}
-	payload := uint64(max64(size-headerSize, 0))
+	payload := uint64(max(size-headerSize, 0))
 	if foreign {
 		s.foreignSegments++
 		s.foreignBytes += payload
@@ -354,17 +366,10 @@ func (s *store) readHeader(num uint64) ([]byte, error) {
 	defer func() { _ = f.Close() }() // read-only handle: nothing to lose on close
 	h := make([]byte, headerSize)
 	if _, err := io.ReadFull(f, h); err != nil {
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		if isShortRead(err) {
 			return nil, fmt.Errorf("%w: reading header of %s: %w", ErrCorrupt, s.filePath(num), err)
 		}
 		return nil, err
 	}
 	return h, nil
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

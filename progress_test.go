@@ -48,7 +48,7 @@ func TestTakeHeadAlwaysMakesProgress(t *testing.T) {
 	}
 	// Damage the framing so the read cannot decode a record, then make the
 	// quarantine's header write fail: the store cannot record the skip.
-	corruptData(t, s, 0, 0, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+	corruptData(t, s, 0, 0, unframeable)
 	reopenReadOnly(t, s, 0)
 
 	before := s.headOff
@@ -80,7 +80,7 @@ func TestDrainTerminatesOnUnquarantinableDamage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	corruptData(t, w.st, 0, 0, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+	corruptData(t, w.st, 0, 0, unframeable)
 	reopenReadOnly(t, w.st, 0)
 
 	withDeadline(t, 10*time.Second, "Drain over damage that cannot be quarantined", func() {
@@ -140,7 +140,7 @@ func TestFollowTerminatesOnDamage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	corruptData(t, w.st, 0, 0, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+	corruptData(t, w.st, 0, 0, unframeable)
 	reopenReadOnly(t, w.st, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -3,6 +3,7 @@ package diskqueue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 )
 
@@ -225,13 +226,14 @@ func (r *Reader[T]) next(ctx context.Context, follow bool, end int64) (T, bool, 
 		// end is a snapshot and writeOff only grows, so reaching it is the whole
 		// stopping condition — but drained() also insists the corruption backlog is
 		// paid down, or losses dropped at open would never be reported to anyone.
-		if !follow && w.st.drained(end) {
-			return zero, false, nil
-		}
-		if w.st.empty() {
-			if !follow {
+		// Two stop conditions, not three: empty() is drained(writeOff) and writeOff
+		// only ever grows past the snapshot, so empty() implies drained(end) and a
+		// bounded iteration never needs to wait.
+		if !follow {
+			if w.st.drained(end) {
 				return zero, false, nil
 			}
+		} else if w.st.empty() {
 			if err := w.waitLocked(ctx); err != nil {
 				return zero, false, nil // context done: an ordinary end of iteration
 			}
@@ -240,16 +242,19 @@ func (r *Reader[T]) next(ctx context.Context, follow bool, end int64) (T, bool, 
 		before := w.st.progress()
 		v, off, ok, err := r.read()
 		if err != nil {
-			// Corruption the store actually stepped past is not a reason to stop:
-			// the damage is already dropped and everything behind it is still
+			// ErrCodec is checked FIRST and always stops the iteration. A codec
+			// error may wrap anything the caller likes, ErrCorrupt included, so the
+			// two must be told apart by which sentinel came from the library rather
+			// than by what happens to be in the chain. It also leaves the record at
+			// the head, so continuing would re-read it forever.
+			//
+			// Corruption the store actually stepped past is the opposite case: the
+			// damage is already dropped and everything behind it is still
 			// deliverable, so one bad record must not silently truncate the drain.
 			// The first event is kept for Err, and Stats().LostBytes counts them all.
-			//
-			// Corruption it did NOT step past is a reason to stop. Continuing would
-			// re-read the same bytes forever while holding this lock — which is
-			// exactly what a codec returning an error that wraps ErrCorrupt used to
-			// do, with no I/O fault involved at all.
-			if errors.Is(err, ErrCorrupt) && w.st.progress() != before {
+			// The progress check is what makes that safe — damage the store could
+			// NOT step past reports the same error from the same offset forever.
+			if !errors.Is(err, ErrCodec) && errors.Is(err, ErrCorrupt) && w.st.progress() != before {
 				if r.err == nil {
 					r.err = err
 				}
@@ -296,7 +301,13 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 	}()
 	v, err := r.w.unmarshal(r.scratch)
 	if err != nil {
-		return zero, 0, false, err
+		// Wrap it so a codec error can never impersonate a library sentinel. A
+		// UnmarshalFunc is free to return anything, including something that wraps
+		// ErrCorrupt — and then errors.Is(err, ErrCorrupt) would tell the caller
+		// that data on disk was damaged and dropped, while Stats shows no loss at
+		// all and the record is still queued. ErrCodec keeps the two apart, and
+		// the original error stays reachable through Unwrap.
+		return zero, 0, false, fmt.Errorf("%w: %w", ErrCodec, err)
 	}
 	delivered = true
 	return v, off, true, nil

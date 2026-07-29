@@ -14,11 +14,12 @@ import (
 // followed by records (uvarint(len) || payload || xxhash64(payload) as 8 little-
 // endian bytes).
 //
-// Everything recovery needs lives in the header, so it never scans records.
-// Records never span files. A global byte offset addresses the stream: file F
-// holds offsets [F.base, F.base+F.size). Files are dropped once fully committed,
-// but only while writing — reads and commits never delete files. Each record and
-// each header carries an xxhash64, verified on read/open to catch corruption.
+// Everything recovery needs lives in the header, so it scans records only for a
+// segment whose own header proves it was truncated (see surviveCount). Records
+// never span files. A global byte offset addresses the stream: file F holds
+// offsets [F.base, F.base+F.size). Files are dropped once fully committed — on
+// the write that cycles to a new segment, and at the end of a commit. Each record
+// and each header carries an xxhash64, verified on read/open to catch corruption.
 //
 // I/O is plain pread/pwrite/fsync (no mmap): records are written with WriteAt and
 // read back with ReadAt into reused buffers, and durability is fsync. Each file's
@@ -84,7 +85,7 @@ type store struct {
 	// report them — segments dropped at open, mostly. takeHead pays it down one
 	// per call so each lost segment reaches the consumer exactly once.
 	pendingCorrupt  int
-	corruptions     int64
+	corruptions     uint64
 	lostBytes       uint64
 	lostRecords     uint64
 	lostSegments    uint64
@@ -328,9 +329,13 @@ func (s *store) createFile(num uint64, base int64) (*dataFile, error) {
 		return fail(err)
 	}
 	if !s.noSync {
+		// A full fsync, not datasync: this is the one segment write that changes
+		// metadata — the file was just created and preallocated — so the inode has
+		// to reach disk too. Do not "finish the job" by converting this one.
+		//
+		// Not latched: the file is about to be unlinked, so nothing durable depends
+		// on this fsync having happened.
 		if err := f.Sync(); err != nil {
-			// Not latched: the file is about to be unlinked, so nothing durable
-			// depends on this fsync having happened.
 			return fail(err)
 		}
 		df.dirty = false
@@ -416,10 +421,8 @@ func (s *store) append(payload []byte) error {
 		return err
 	}
 
-	if faultsEnabled {
-		if err := faultPoint("append.writeRecord"); err != nil {
-			return err
-		}
+	if err := faultPoint("append.writeRecord"); err != nil {
+		return err
 	}
 	if err := s.writeRecord(af, af.size, payload); err != nil {
 		return err // nothing advanced; the bytes are unreferenced and overwritable
@@ -430,10 +433,8 @@ func (s *store) append(payload []byte) error {
 		// the data first guarantees a crash can only ever lose the header update (a
 		// clean truncation), never leave a published record whose payload never
 		// landed.
-		if faultsEnabled {
-			if err := faultPoint("append.syncData"); err != nil {
-				return s.failIO(err)
-			}
+		if err := faultPoint("append.syncData"); err != nil {
+			return s.failIO(err)
 		}
 		if err := datasync(af.f); err != nil {
 			return s.failIO(err)
@@ -450,11 +451,9 @@ func (s *store) append(payload []byte) error {
 		setWriteCursor(headerSize+af.size),
 		setWrittenCount(af.written),
 	)
-	if faultsEnabled {
-		if err := faultPoint("append.writeHeader"); err != nil {
-			s.rollbackAppend(af, recLen)
-			return err
-		}
+	if err := faultPoint("append.writeHeader"); err != nil {
+		s.rollbackAppend(af, recLen)
+		return err
 	}
 	if err := s.writeHeader(af); err != nil {
 		// The header never reached even the page cache, so the record is invisible
@@ -470,10 +469,8 @@ func (s *store) append(payload []byte) error {
 	case s.batched():
 		return s.recordOp()
 	default:
-		if faultsEnabled {
-			if err := faultPoint("append.syncHeader"); err != nil {
-				return s.failIO(err)
-			}
+		if err := faultPoint("append.syncHeader"); err != nil {
+			return s.failIO(err)
 		}
 		if err := datasync(af.f); err != nil {
 			// The header is in the page cache, so the record is real to anything
@@ -893,6 +890,13 @@ func (s *store) commitTo(off int64) error {
 			stop = err
 			break
 		}
+		if next > off {
+			// A non-boundary target: the caller asked to acknowledge up to off and
+			// this record ends past it. Stop short rather than retiring it — the
+			// bias everywhere else is to redeliver, never to drop something nobody
+			// said was done.
+			break
+		}
 		s.commitOff = next
 		s.nCommitted++
 		s.nCommittedTotal++
@@ -960,18 +964,19 @@ func (s *store) count() int64 {
 	}
 	return 0
 }
-func (s *store) writeOffset() int64     { return s.writeOff }
-func (s *store) headOffset() int64      { return s.headOff }
-func (s *store) corruptionCount() int64 { return s.corruptions }
-func (s *store) failure() error         { return s.ioErr }
+func (s *store) writeOffset() int64      { return s.writeOff }
+func (s *store) headOffset() int64       { return s.headOff }
+func (s *store) corruptionCount() uint64 { return s.corruptions }
+func (s *store) failure() error          { return s.ioErr }
 
 // stats snapshots the counters. The caller holds the Queue lock.
 func (s *store) stats() Stats {
 	return Stats{
-		BacklogBytes: s.size(),
-		Backlog:      s.count(),
-		Segments:     len(s.files),
-		MaxSegments:  s.maxSegments,
+		BacklogBytes:  s.size(),
+		Backlog:       s.count(),
+		InFlightBytes: max(s.headOff-s.commitOff, 0),
+		Segments:      len(s.files),
+		MaxSegments:   s.maxSegments,
 		// Segments are preallocated to their full length, so what they occupy is
 		// the count times the geometry — not the bytes of records in them.
 		DiskBytes:       int64(len(s.files)) * (headerSize + s.segmentSize),
@@ -986,7 +991,7 @@ func (s *store) stats() Stats {
 		ForeignBytes:    s.foreignBytes,
 		DiscardedBytes:  s.discardedBytes,
 		Unreclaimed:     s.unreclaimed,
-		Corruptions:     uint64(s.corruptions),
+		Corruptions:     s.corruptions,
 	}
 }
 

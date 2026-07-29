@@ -32,7 +32,11 @@ The log lives in a directory of numbered files `data.00000001`, `data.00000002`,
 **preallocated** — `fallocate(2)` on Linux, `ftruncate` elsewhere — so a full
 filesystem is reported when a segment is created, while the store is still clean,
 instead of arriving as an `ENOSPC` in the middle of a record; the footprint is
-what `MaxSegments × SegmentSize` says it is. The directory itself is held open
+what `MaxSegments × SegmentSize` says it is. That guarantee needs real
+`fallocate`: on non-Linux platforms, and on Linux over NFS, 9p, some FUSE and
+overlay mounts, it falls back to `ftruncate`, which reserves nothing — there
+`ENOSPC` still arrives during an `Add` (which then leaves the queue unchanged),
+and `Stats().DiskBytes` reports apparent size over a sparse file. The directory itself is held open
 for the lifetime of the queue and carries an advisory `flock`, so a second
 `New` on the same directory fails with `ErrLocked` rather than silently
 interleaving writes into the same segments. Each file
@@ -179,7 +183,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
 | `Sync() error` | `fsync` the files to stable storage. |
 | `Stats() Stats` | Gauges and lifetime counters, including every loss path. See **Recovery**. |
-| `Rewind() (int64, error)` | Return every delivered-but-uncommitted record to the queue. The nack for `Reserve`. |
+| `Rewind() (int64, error)` | Return every delivered-but-uncommitted record to the queue. The nack for `Reserve`. Watch `Stats().InFlightBytes` to know when it is needed. |
 | `Err() error` | The latched durability failure, or nil. See **Failure handling**. |
 | `Close() error` | Flush and close (releases the directory lock). |
 
@@ -271,7 +275,7 @@ either way the record boundaries from that point on are gone. The rest of that
 segment is abandoned, so one bad byte there can cost up to `SegmentSize`.
 
 Reading is where losses are reported, so a consumer that never reads never learns
-of them; `Stats()` and `Corruptions()` are readable at any time, including after
+of them; `Stats()` is readable at any time, including after
 `Close`.
 
 ```go
@@ -366,7 +370,7 @@ diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
 	SyncEvery:      0,    // 0/1 = fsync every op; N>1 = batch the fsync over N ops
 	SyncInterval:   0,    // >0 = background flush every interval (backstop for SyncEvery)
 	SegmentSize:    0,    // 0 = 8 MiB default; floored and rounded up to 4 KiB
-	MaxOpenFiles:      0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 2
+	MaxOpenFiles:      0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 3
 })
 ```
 

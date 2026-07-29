@@ -72,6 +72,19 @@ var (
 	// looking garbage or a queue that never moves again. The error says one event
 	// happened; Stats().LostBytes and LostRecords carry the magnitude it cannot.
 	ErrCorrupt = errors.New("diskqueue: corrupt")
+	// ErrCodec wraps an error returned by the caller's UnmarshalFunc. The record
+	// is left at the head of the queue — a codec failure is not data loss, and the
+	// same record is offered again — so use Reader.Skip to step over one the codec
+	// will never accept.
+	//
+	// It exists to keep a codec error from impersonating a library sentinel: a
+	// UnmarshalFunc may return anything, and an error that happened to wrap
+	// ErrCorrupt would otherwise tell the caller that data on disk was damaged and
+	// dropped, while nothing was damaged and nothing was dropped. The codec's own
+	// error stays reachable through errors.Unwrap, which means it can still carry
+	// ErrCorrupt — so TEST ErrCodec BEFORE ErrCorrupt. Only ErrCorrupt that is not
+	// also ErrCodec means the queue lost data.
+	ErrCodec = errors.New("diskqueue: unmarshal failed")
 	// ErrSegmentSizeMismatch is returned by New when reopening a store with a
 	// different SegmentSize than it was created with (which would discard data).
 	ErrSegmentSizeMismatch = errors.New("diskqueue: segment size mismatch")
@@ -144,9 +157,15 @@ type Stats struct {
 	// Gauges.
 	BacklogBytes int64 // uncommitted bytes: the same number as Size
 	Backlog      int64 // uncommitted records: the same number as Count
-	Segments     int   // live segment files
-	MaxSegments  int   // the configured cap; 0 when unbounded
-	DiskBytes    int64 // what the segment files occupy, including preallocated slack
+	// InFlightBytes is the bytes handed to a reader but not yet committed —
+	// BacklogBytes minus what is still unread. It is the state Rewind exists to
+	// undo, and the number behind the documented oddity that Empty can be true
+	// while Count is not zero. Climbing with a flat Committed means consumers are
+	// taking work and not acknowledging it.
+	InFlightBytes int64
+	Segments      int   // live segment files
+	MaxSegments   int   // the configured cap; 0 when unbounded
+	DiskBytes     int64 // what the segment files occupy, including preallocated slack
 
 	// Counters since New.
 	Added     uint64 // records accepted by Add

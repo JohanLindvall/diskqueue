@@ -547,7 +547,7 @@ func TestStoreCorruptLengthNoPanic(t *testing.T) {
 		name   string
 		prefix []byte
 	}{
-		{"unterminated varint", []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
+		{"unterminated varint", unframeable},
 		{"wraps int when summed", uvarint(1<<63 - 1)},
 		{"negative when narrowed", uvarint(1<<64 - 1)},
 		{"larger than the segment", uvarint(1 << 40)},
@@ -766,7 +766,7 @@ func assertSegmentLoss(t *testing.T, s *store, n int) {
 	if got := s.lostSegments; got != uint64(n) {
 		t.Fatalf("lostSegments=%d, want %d", got, n)
 	}
-	if got := s.corruptionCount(); got != int64(n) {
+	if got := s.corruptionCount(); got != uint64(n) {
 		t.Fatalf("corruptions=%d, want %d", got, n)
 	}
 	for i := 0; i < n; i++ {
@@ -971,7 +971,7 @@ func TestStoreCorruptFramingCostsOneSegment(t *testing.T) {
 	}
 	segRecords := int(s.files[0].written)
 	// Overwrite the second record's length prefix with an unusable one.
-	corruptData(t, s, 0, 11, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+	corruptData(t, s, 0, 11, unframeable)
 
 	got, events := drainRecovering(t, s)
 	if events != 1 {

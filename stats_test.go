@@ -19,13 +19,7 @@ var errDecode = errors.New("decode failed")
 // paired with nWritten to compute Count() and decremented whenever a
 // fully-committed segment is reclaimed. It fell as the queue did its job.
 func TestStatsCountersAreMonotone(t *testing.T) {
-	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64,
-		Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = w.Close() }()
-	r := w.NewReader()
+	w, r, _ := openRecoveryTest(t)
 
 	const n = 1000 // enough to fill and reclaim many 4 KiB segments
 	for i := uint64(0); i < n; i++ {
@@ -128,9 +122,8 @@ func TestTruncatedSegmentCountIsHonest(t *testing.T) {
 	if got := s2.count(); got > 3 {
 		t.Fatalf("count=%d after truncation to 3 records' worth: the header was believed over the bytes", got)
 	}
-	delivered, _ := drainRecovering(t, s2)
-	if int64(len(delivered)) > s2.count()+int64(len(delivered)) {
-		t.Fatal("impossible")
+	if got, _ := drainRecovering(t, s2); len(got) != 3 {
+		t.Fatalf("delivered %v, want the 3 records that survived the cut", got)
 	}
 	if got := s2.count(); got != 0 {
 		t.Fatalf("count=%d after a full drain, want 0", got)
@@ -204,7 +197,10 @@ func TestTruncatedSegmentBacklogIsExact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const n, recLen = 10, 17 // 1 uvarint + 8 payload + 8 checksum
+	const n = 10
+	// The on-disk frame, computed rather than spelled: a change to the prefix or
+	// the checksum would otherwise cut at the wrong offset and assert the wrong count.
+	recLen := int64(uvarintLen(8) + 8 + checksumSize)
 	for i := uint64(0); i < n; i++ {
 		if err := w.Add(i); err != nil {
 			t.Fatal(err)
@@ -275,10 +271,17 @@ func TestTruncatedSegmentBacklogIsExact(t *testing.T) {
 // cursor is often already past the segment's end — every record in it was
 // delivered. Booking a lost segment for zero lost bytes tells an operator data
 // went missing when none did.
+//
+// The corruption has to land on a FRAME BOUNDARY. An earlier version of this
+// test wrote over the middle of a payload, so the commit walk framed every
+// record fine and never entered the quarantine branch at all: its assertions
+// were all "if A && B { fail }", which pass happily on a path that never ran.
 func TestCommitQuarantineDoesNotOvercount(t *testing.T) {
 	s, _ := newTestStore(t, 4096, 0)
+	// 400-byte payloads: uvarint(400) is 2 bytes, so each frame is 2+400+8 = 410.
+	const payload, frame = 400, 2 + 400 + checksumSize
 	for i := 0; s.active().num < 2; i++ {
-		mustAppend(t, s, genPayload(400, byte(i)))
+		mustAppend(t, s, genPayload(payload, byte(i)))
 	}
 	// Read past the first segment without committing.
 	for s.headOff < s.files[0].base+s.files[0].size {
@@ -286,19 +289,42 @@ func TestCommitQuarantineDoesNotOvercount(t *testing.T) {
 			t.Fatalf("read: ok=%v err=%v", ok, err)
 		}
 	}
-	// Now rot the framing behind the read cursor and commit across it.
-	corruptData(t, s, 0, 400, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
-	lostSegs, lostB := s.lostSegments, s.lostBytes
+	// Destroy the second record's length prefix, exactly on its boundary.
+	corruptData(t, s, 0, frame, unframeable)
+	lostSegs, lostB, corrupt := s.lostSegments, s.lostBytes, s.corruptionCount()
+	// Capture the boundary now: the quarantine's commit reclaims this segment, so
+	// files[0] afterwards is a different file.
+	segEnd := s.files[0].base + s.files[0].size
 
 	if err := s.commitTo(s.headOff); err != nil {
 		t.Fatalf("commitTo: %v", err)
 	}
-	if s.lostBytes == lostB && s.lostSegments != lostSegs {
-		t.Fatalf("lostSegments went %d->%d with no bytes lost: every record there was delivered",
+	// The branch really ran.
+	if s.corruptionCount() != corrupt+1 {
+		t.Fatalf("corruptions %d -> %d: the quarantine branch was not reached",
+			corrupt, s.corruptionCount())
+	}
+	// Every record in that segment had been delivered, so nothing was lost.
+	if s.lostBytes != lostB {
+		t.Errorf("lostBytes %d -> %d: nothing in that segment was undelivered", lostB, s.lostBytes)
+	}
+	if s.lostSegments != lostSegs {
+		t.Errorf("lostSegments %d -> %d: a whole segment reported lost against zero lost bytes",
 			lostSegs, s.lostSegments)
 	}
-	if s.pendingCorrupt == 0 && s.corruptions > 0 {
-		t.Fatal("a counted event with no read to report it")
+	// The commit cursor moved past the damage rather than freezing on it, which is
+	// what keeps reclamation running.
+	if s.commitOff < segEnd {
+		t.Errorf("commitOff=%d still inside the quarantined segment (ends at %d)",
+			s.commitOff, segEnd)
+	}
+	// And the event is owed to a reader.
+	if s.pendingCorrupt != 1 {
+		t.Fatalf("pendingCorrupt=%d, want 1: a counted event with no read to report it",
+			s.pendingCorrupt)
+	}
+	if _, _, ok, err := s.takeHead(); ok || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("the owed report: ok=%v err=%v, want ErrCorrupt", ok, err)
 	}
 }
 

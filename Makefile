@@ -16,10 +16,11 @@ check: lint test faults
 test:
 	go test -race -cover ./...
 
-# The durability invariants that need an injection seam the default build does
-# not carry: append's fsync ordering and each of its failure arms.
+# The whole suite under the fault-injection build. Not filtered by test name: the
+# tag only adds nil-hook branches, so everything still passes, and a -run regex
+# would silently skip the next fault test whose name did not match it.
 faults:
-	go test -tags diskqueue_faults -run 'Fault|Sync|Append|Crash|Header|WriteRecord' ./...
+	go test -race -tags diskqueue_faults ./...
 
 lint: $(GOBIN)/golangci-lint
 	golangci-lint run ./...

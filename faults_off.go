@@ -2,12 +2,9 @@
 
 package diskqueue
 
-// faultsEnabled is an untyped constant false in the default build, so every
-// `if faultsEnabled { ... }` block below is eliminated at compile time. The
-// production binary is byte-identical to one with no seam at all — which is why
-// the injection points can sit on the hot path without a benchmark to defend
-// them.
-const faultsEnabled = false
-
-// faultPoint is never called in the default build.
+// faultPoint is the no-op the default build compiles. It inlines to a nil
+// constant, so every `if err := faultPoint(...); err != nil` in the hot path
+// folds away entirely — the shipped binary is byte-identical to one with no seam
+// at all, which is why the injection points can sit in append without a
+// benchmark to defend them.
 func faultPoint(string) error { return nil }
