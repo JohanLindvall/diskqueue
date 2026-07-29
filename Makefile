@@ -10,9 +10,11 @@ all: fix check
 # Lint + the full test suite.
 check: lint test
 
-# Unit tests with coverage. The module is dependency-light (only x/sys).
+# Unit tests, raced and with coverage. The race detector is not optional here:
+# the queue hands a reused buffer to user code under a mutex, and the iterators
+# release that mutex across yields.
 test:
-	go test -cover ./...
+	go test -race -cover ./...
 
 lint: $(GOBIN)/golangci-lint
 	golangci-lint run ./...
