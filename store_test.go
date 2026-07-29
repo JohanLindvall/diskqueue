@@ -996,3 +996,75 @@ func TestStoreCorruptFramingCostsOneSegment(t *testing.T) {
 		t.Fatalf("lostSegments=%d, want 1", s.lostSegments)
 	}
 }
+
+// TestForceCommitAllQuarantineSurvivesReopen drives skipCorruptSegment's
+// "cursor addresses no live segment" arm and reopens the store.
+//
+// That arm squares every counter so Count() and Empty() agree — but the squaring
+// is only true if it reaches the headers. When it was applied in memory alone the
+// next open recovered the untouched commit cursors and replayed every record,
+// while nCommittedTotal had already counted them, so Stats().Committed counted
+// them a second time as they were re-consumed. The in-process assertions below
+// all passed in that state; only the reopen catches it.
+func TestForceCommitAllQuarantineSurvivesReopen(t *testing.T) {
+	const (
+		segSize = 4096
+		n       = 12
+	)
+	dir := t.TempDir()
+	s, err := openStore(dir, segSize, 0, false, 0, 0)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	payload := make([]byte, 512) // 8 records per segment, so n spans several files
+	for i := 0; i < n; i++ {
+		mustAppend(t, s, payload)
+	}
+	if got := s.count(); got != n {
+		t.Fatalf("count before = %d, want %d", got, n)
+	}
+	if len(s.files) < 2 {
+		t.Fatalf("want a multi-segment store, got %d files", len(s.files))
+	}
+
+	// writeOff is the end of the active file's data, and files hold [base, base+size),
+	// so no live segment contains it — which is the arm under test.
+	if df := s.fileForOffset(s.writeOff); df != nil {
+		t.Fatalf("writeOff %d still lands in a segment; the df == nil arm was not reached", s.writeOff)
+	}
+	if err := s.skipCorruptSegment(s.writeOff); err != nil {
+		t.Fatalf("skipCorruptSegment: %v", err)
+	}
+	if got := s.count(); got != 0 {
+		t.Fatalf("count after quarantine = %d, want 0", got)
+	}
+	if !s.empty() {
+		t.Fatal("queue not empty after quarantining everything")
+	}
+	committed := s.stats().Committed
+	if committed != n {
+		t.Fatalf("Committed after quarantine = %d, want %d", committed, n)
+	}
+	if err := s.close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s2, err := openStore(dir, segSize, 0, false, 0, 0)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer func() { _ = s2.close() }()
+
+	if got := s2.count(); got != 0 {
+		t.Fatalf("reopen replayed %d records the quarantine said were retired; "+
+			"the force-commit never reached the headers", got)
+	}
+	if !s2.empty() {
+		t.Fatal("reopened store is not empty")
+	}
+	// And the records must not be deliverable either — a cursor that says "empty"
+	// while takeHead still hands records out is the same bug wearing a disguise.
+	if _, _, ok, err := s2.takeHead(); ok || err != nil {
+		t.Fatalf("takeHead after reopen = ok %v, err %v; want no record", ok, err)
+	}
+}

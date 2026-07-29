@@ -725,6 +725,54 @@ func (s *store) progress() progress { return progress{head: s.headOff, pending: 
 // watched the cursor alone would never collect those reports.
 func (s *store) drained(end int64) bool { return s.headOff >= end && s.pendingCorrupt == 0 }
 
+// forceCommitAll marks every live segment fully committed, publishing each
+// file's header before the in-memory counts follow it — the same ordering the
+// per-segment quarantine uses, and for the same reason: an advance the headers do
+// not carry is replayed by the next open.
+//
+// The per-file counts move with the global one rather than after it, because
+// dropCommitted subtracts df.committed from nCommitted as it reclaims; leaving
+// the two out of step drives Count() negative on the next drop. A file whose
+// header cannot be published stops the loop with the error, leaving the segments
+// already squared durably squared — partial progress here is consistent progress,
+// not a torn state.
+func (s *store) forceCommitAll() error {
+	for _, df := range s.files {
+		if df.committed >= df.written && df.commitCursor() >= headerSize+df.size {
+			continue // already fully committed: nothing to publish, nothing to count
+		}
+		switch err := s.ensureOpen(df); {
+		case err == nil:
+			prevCursor, prevCount := df.commitCursor(), df.committedCount()
+			df.header(
+				setCommitCursor(headerSize+df.size),
+				setCommittedCount(df.written),
+			)
+			if err := s.writeHeader(df); err != nil {
+				df.header(setCommitCursor(prevCursor), setCommittedCount(prevCount))
+				return err
+			}
+			if !s.noSync {
+				if err := s.flushFile(df); err != nil { // recovery wants this durable now
+					return err
+				}
+			}
+		case errors.Is(err, os.ErrNotExist):
+			// Gone from the directory: no header left to record the quarantine in, and
+			// nothing left to replay out of it either, so the in-memory squaring below
+			// is all there is to do.
+		default:
+			return err
+		}
+		if abandoned := df.written - df.committed; abandoned > 0 {
+			s.nCommitted += abandoned
+			s.nCommittedTotal += uint64(abandoned)
+		}
+		df.committed = df.written
+	}
+	return nil
+}
+
 // skipCorruptSegment abandons the rest of the segment holding off: it advances
 // the read cursor past the segment, and — when the commit cursor is already
 // within that segment (the auto-committing read path) — force-commits the
@@ -746,6 +794,15 @@ func (s *store) skipCorruptSegment(off int64) error {
 		// the read cursor along, but if it ever happens, abandon to the tail *and*
 		// square the counters, so Count() and Empty() agree instead of leaving a
 		// blocking consumer waiting on a backlog that is not there.
+		//
+		// forceCommitAll persists that squaring before it is applied, for the same
+		// reason the per-segment path below does: an in-memory advance the headers do
+		// not carry is replayed wholesale by the next open, while nCommittedTotal — a
+		// lifetime counter no reopen undoes — has already counted those records, so
+		// Stats().Committed would count them again as they are re-consumed.
+		if err := s.forceCommitAll(); err != nil {
+			return err
+		}
 		s.corruptions++
 		s.lostSegments++
 		if lost := s.writeOff - s.headOff; lost > 0 {
@@ -755,16 +812,6 @@ func (s *store) skipCorruptSegment(off int64) error {
 		if s.commitOff < s.writeOff {
 			s.commitOff = s.writeOff
 		}
-		// Square the per-file counts too, not just the global one: dropCommitted
-		// subtracts df.committed from nCommitted as it reclaims, so leaving the two
-		// out of step here would drive Count() negative on the next drop.
-		for _, df := range s.files {
-			if abandoned := df.written - df.committed; abandoned > 0 {
-				s.nCommittedTotal += uint64(abandoned)
-			}
-			df.committed = df.written
-		}
-		s.nCommitted = s.nWritten
 		return nil
 	}
 	end := df.base + df.size
