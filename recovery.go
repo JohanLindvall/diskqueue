@@ -1,6 +1,7 @@
 package diskqueue
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -235,12 +236,18 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	df := &dataFile{num: num, hdr: h, base: base, size: w - headerSize, truncated: truncated}
 	df.written = max64(th.writtenCount(), 0)
 	if truncated {
-		// The header counts records the file no longer holds. Count() would then
-		// promise a backlog a full drain can never deliver, so believe the bytes
-		// that survived rather than the header: at most one record per the smallest
-		// frame that fits in what is left.
-		if fit := df.size / int64(minRecordSize); df.written > fit {
-			df.written = fit
+		// The header counts records the file no longer holds, so Count() would
+		// promise a backlog no drain can deliver and the queue would never read
+		// empty again. Believe the bytes that survived instead of the header.
+		//
+		// An arithmetic bound (size / smallest possible frame) is not enough: it is
+		// only tight when the records are minimal, and for anything larger it sits
+		// above the header's count and never fires at all. Count the frames.
+		if n, err := s.surviveCount(num, df.size); err == nil {
+			if gone := df.written - n; gone > 0 {
+				s.lostRecords += uint64(gone)
+			}
+			df.written = n
 		}
 	}
 	df.committed = th.committedCount()
@@ -258,6 +265,41 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 		cc = headerSize + df.size
 	}
 	return df, cc, nil
+}
+
+// surviveCount counts the whole record frames in the first size bytes of a
+// segment's data region.
+//
+// This is the one place recovery reads records, and the exception is licensed by
+// the segment's own header having proved it lost bytes: that header's count
+// describes a file which no longer exists. The walk is bounded by the segment
+// size and only ever runs for a segment already known to be damaged, so the
+// "recovery reads no records" cost model still holds for every healthy open.
+//
+// It never fails the open. A segment it cannot read falls back to the header's
+// count, which is no worse than not having tried.
+func (s *store) surviveCount(num uint64, size int64) (int64, error) {
+	f, err := os.Open(s.filePath(num))
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }() // read-only handle: nothing to lose on close
+	var buf [binary.MaxVarintLen64]byte
+	var n, off int64
+	for off < size {
+		avail := size - off
+		hn := min(int64(len(buf)), avail)
+		if _, err := f.ReadAt(buf[:hn], headerSize+off); err != nil {
+			return n, nil // the file ends here; everything past it is gone
+		}
+		v, used := binary.Uvarint(buf[:hn])
+		if used <= 0 || !fitsInRecord(v, used, avail) {
+			return n, nil // no whole frame starts here
+		}
+		off += int64(used) + int64(v) + checksumSize
+		n++
+	}
+	return n, nil
 }
 
 // dropSegment unlinks a segment that cannot be read and books the loss: as

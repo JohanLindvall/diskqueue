@@ -190,3 +190,143 @@ func TestTruncatedSegmentSurvivesReopen(t *testing.T) {
 		t.Fatalf("second open delivered %v after the first drained %v", got2, got1)
 	}
 }
+
+// TestTruncatedSegmentBacklogIsExact: the count of records a truncated segment
+// still holds has to come from the bytes, not from arithmetic. A bound of
+// "size / smallest possible frame" is only tight when the records are minimal;
+// for anything larger it sits above the header's own count and never fires, so
+// Count() kept promising a backlog no drain could deliver and the queue never
+// read empty again.
+func TestTruncatedSegmentBacklogIsExact(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New[uint64](dir, marshalU64, unmarshalU64,
+		Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n, recLen = 10, 17 // 1 uvarint + 8 payload + 8 checksum
+	for i := uint64(0); i < n; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	const kept = 6
+	if err := os.Truncate(filepath.Join(dir, "data.00000001"), headerSize+recLen*kept); err != nil {
+		t.Fatal(err)
+	}
+
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64,
+		Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := w2.NewReader()
+	var got []uint64
+	for i := 0; i < 4*n; i++ {
+		v, ok, err := r.TryTake()
+		if errors.Is(err, ErrCorrupt) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		got = append(got, v)
+	}
+	if len(got) != kept {
+		t.Fatalf("delivered %v, want the %d records that survived the cut", got, kept)
+	}
+	if c := w2.Count(); c != 0 {
+		t.Fatalf("Count=%d after a full drain, want 0: phantom backlog", c)
+	}
+	if !w2.Empty() {
+		t.Fatal("the queue should read empty")
+	}
+	st := w2.Stats()
+	if st.LostRecords != n-kept {
+		t.Fatalf("LostRecords=%d, want %d", st.LostRecords, n-kept)
+	}
+	if st.DiscardedBytes == 0 {
+		t.Fatal("the cut tail was not counted")
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// And a third open is quiet: the clamped cursor was republished, so nothing
+	// re-reports the same loss and the zero fill is not read back as records.
+	w3, err := New[uint64](dir, marshalU64, unmarshalU64,
+		Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w3.Close() }()
+	if st := w3.Stats(); st.Corruptions != 0 || st.Backlog != 0 {
+		t.Fatalf("third open: Corruptions=%d Backlog=%d, want 0 and 0", st.Corruptions, st.Backlog)
+	}
+}
+
+// TestCommitQuarantineDoesNotOvercount: reached from the commit path, the read
+// cursor is often already past the segment's end — every record in it was
+// delivered. Booking a lost segment for zero lost bytes tells an operator data
+// went missing when none did.
+func TestCommitQuarantineDoesNotOvercount(t *testing.T) {
+	s, _ := newTestStore(t, 4096, 0)
+	for i := 0; s.active().num < 2; i++ {
+		mustAppend(t, s, genPayload(400, byte(i)))
+	}
+	// Read past the first segment without committing.
+	for s.headOff < s.files[0].base+s.files[0].size {
+		if _, _, ok, err := s.takeHead(); !ok || err != nil {
+			t.Fatalf("read: ok=%v err=%v", ok, err)
+		}
+	}
+	// Now rot the framing behind the read cursor and commit across it.
+	corruptData(t, s, 0, 400, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+	lostSegs, lostB := s.lostSegments, s.lostBytes
+
+	if err := s.commitTo(s.headOff); err != nil {
+		t.Fatalf("commitTo: %v", err)
+	}
+	if s.lostBytes == lostB && s.lostSegments != lostSegs {
+		t.Fatalf("lostSegments went %d->%d with no bytes lost: every record there was delivered",
+			lostSegs, s.lostSegments)
+	}
+	if s.pendingCorrupt == 0 && s.corruptions > 0 {
+		t.Fatal("a counted event with no read to report it")
+	}
+}
+
+// TestOversizedAddReleasesScratch: the marshal buffer is the one buffer not
+// bounded by the segment geometry — it retains whatever MarshalFunc produced,
+// before anyone asks whether the record was storable at all. One rejected
+// oversized Add would otherwise pin that capacity for the life of the queue.
+func TestOversizedAddReleasesScratch(t *testing.T) {
+	seg := int64(4096)
+	m := func(dst []byte, v int) ([]byte, error) { return append(dst, make([]byte, v)...), nil }
+	u := func(d []byte) (int, error) { return len(d), nil }
+	w, err := New[int](t.TempDir(), m, u, Options{NoSync: true, SegmentSize: seg, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := w.Add(8 << 20); !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("oversized Add: %v, want ErrRecordTooLarge", err)
+	}
+	if got := int64(cap(w.scratch)); got > seg {
+		t.Fatalf("scratch pinned at %d bytes on a queue whose records cap at %d", got, seg)
+	}
+	// The queue still works, and the buffer regrows to a sane size.
+	if err := w.Add(64); err != nil {
+		t.Fatal(err)
+	}
+	if got := int64(cap(w.scratch)); got > seg {
+		t.Fatalf("scratch=%d after a normal Add", got)
+	}
+}

@@ -804,10 +804,14 @@ func (s *store) skipCorruptSegment(off int64) error {
 	// Everything between the read cursor and the end of the segment is destroyed.
 	// For a segment whose file has vanished, its recorded size is the only figure
 	// left to count, which is why LostBytes is documented as a lower bound.
+	// A segment counts as lost only if something in it actually was. Reached from
+	// the commit path, the read cursor is often already past the end — every record
+	// here was delivered — and booking a lost segment for zero lost bytes tells an
+	// operator data went missing when none did.
 	if lost := end - s.headOff; lost > 0 {
 		s.lostBytes += uint64(lost)
+		s.lostSegments++
 	}
-	s.lostSegments++
 	if s.headOff < end {
 		s.headOff = end
 	}
@@ -943,9 +947,19 @@ func (s *store) persistCommit(df *dataFile, perOp bool) error {
 	return nil
 }
 
-func (s *store) empty() bool            { return s.drained(s.writeOff) }
-func (s *store) size() int64            { return s.writeOff - s.commitOff }
-func (s *store) count() int64           { return s.nWritten - s.nCommitted }
+func (s *store) empty() bool { return s.drained(s.writeOff) }
+func (s *store) size() int64 { return s.writeOff - s.commitOff }
+
+// count is a gauge, so it must never be negative. nWritten and nCommitted are
+// exact by construction, but they are reconciled from per-segment headers at
+// open: a forged or self-inconsistent header has to produce a wrong number, not
+// an impossible one.
+func (s *store) count() int64 {
+	if c := s.nWritten - s.nCommitted; c > 0 {
+		return c
+	}
+	return 0
+}
 func (s *store) writeOffset() int64     { return s.writeOff }
 func (s *store) headOffset() int64      { return s.headOff }
 func (s *store) corruptionCount() int64 { return s.corruptions }

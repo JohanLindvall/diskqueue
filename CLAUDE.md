@@ -184,7 +184,7 @@ mirrors its own `written`/`committed` counts into its header.
   is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.
 - **Records never span files.** `append` cycles when `size+recLen > segmentSize`.
   A record bigger than `segmentSize` is `ErrRecordTooLarge`.
-- **Recovery (`load`) reads no records.** Reopen preads each file's 64-byte header
+- **Recovery (`load`) reads no records — with exactly one licensed exception.** Reopen preads each file's 64-byte header
   (no mapping) in `loadFile`, validates it, and takes the data end from the write
   cursor and the `written` count from the header, with `commitOff` from the first
   file whose commit cursor is short of its end; `headOff = commitOff`. Only the
@@ -193,6 +193,15 @@ mirrors its own `written`/`committed` counts into its header.
   subtracts the dropped file's counts (it's fully committed, so
   `written == committed`, keeping `Count` exact). Fully-committed leading files are
   *not* dropped on open.
+
+  The exception is `surviveCount`, and it is licensed by the segment's own header
+  having proved the file lost bytes: that header's record count then describes a
+  file which no longer exists, so believing it makes `Count()` promise a backlog no
+  drain can deliver and the queue never reads empty again. An arithmetic bound
+  (`size / minRecordSize`) is not enough — it is only tight for minimal records and
+  otherwise sits above the header's count and never fires. So a *truncated* segment,
+  and only a truncated one, gets a bounded frame walk over the bytes that survived.
+  Every healthy open still costs one 64-byte pread per segment.
 - **Committed counts come from the recovered cursor, not from each header.** The
   counts are per-segment while the cursor is global, and writeback across segments
   is not ordered — a header can claim "fully committed" for records the (rewound)
@@ -235,6 +244,12 @@ mirrors its own `written`/`committed` counts into its header.
   `shortReadIsCorrupt` and the `os.ErrNotExist` wrap in `read` are what route the
   second class in; without them a truncated or vanished segment arrives as a bare
   `io.EOF`/`ENOENT` that no recovery path recognises, and the reader wedges.
+- **A segment counts as lost only if something in it was.** `skipCorruptSegment`
+  books `lostSegments` inside the `lost := end - s.headOff; lost > 0` guard, not
+  beside it. Reached from the commit path the read cursor is often already past the
+  segment's end — every record in it was delivered — and a lost segment reported
+  against zero lost bytes tells an operator data went missing when none did. The
+  `corruptions` bump stays unconditional: the event did happen.
 - **`pendingCorrupt` is the backlog of losses with no read of their own.** A
   segment dropped at open loses records that no `takeHead` will ever fail on, so
   the count is paid down one per `takeHead` call — otherwise the records are

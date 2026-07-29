@@ -280,16 +280,36 @@ func (w *Queue[T]) Add(data T) error {
 		w.scratch = b // retain grown capacity for reuse, even from a failed marshal
 	}
 	if err != nil {
+		w.dropOversizedScratch()
 		return err
 	}
 	before := w.st.writeOffset()
 	err = w.st.append(b)
+	if err != nil {
+		w.dropOversizedScratch()
+	}
 	// Wake waiters whenever the record landed, so a durability error doesn't also
 	// strand a blocked consumer on a record that is in the log.
 	if w.st.writeOffset() != before {
 		w.signal()
 	}
 	return err
+}
+
+// dropOversizedScratch releases the marshal buffer once it has grown past
+// anything this queue could ever store — a record has to fit one segment.
+//
+// The store's own buffers are bounded by that geometry, because every path into
+// them is gated on the record being storable. This one is not: it retains
+// whatever MarshalFunc produced, before anyone asks whether the record was
+// admissible, so a single rejected oversized Add would pin that capacity for the
+// life of a queue whose whole documented footprint is MaxSegments × SegmentSize.
+//
+// Error paths only, so the zero-allocation hot path never reaches it.
+func (w *Queue[T]) dropOversizedScratch() {
+	if int64(cap(w.scratch)) > w.st.segmentSize {
+		w.scratch = nil
+	}
 }
 
 // Empty reports whether there are no items available to read.
