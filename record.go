@@ -28,6 +28,17 @@ func growBuf(b []byte, n int) []byte {
 	return b[:n]
 }
 
+// growKeeping is growBuf that preserves the first keep bytes across a
+// reallocation, so a buffer can be extended without re-reading what it holds.
+func growKeeping(b []byte, n, keep int) []byte {
+	if cap(b) >= n {
+		return b[:n]
+	}
+	grown := make([]byte, n)
+	copy(grown, b[:keep])
+	return grown
+}
+
 // writeRecord frames payload (uvarint length, payload, checksum) into the reused
 // writeBuf and writes it at data offset off with a single WriteAt.
 func (s *store) writeRecord(df *dataFile, off int64, payload []byte) error {
@@ -62,10 +73,109 @@ func isShortRead(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
-// recordAt preads the record at global offset off (which must lie in df) into the
-// reused readBuf, returning its payload (a slice of readBuf, valid until the next
-// read), the stored payload checksum, the offset past the record, and whether it
-// decoded. A pread failure is returned as an error.
+// The read block. readBuf holds a run of one segment's data region — not just
+// the record a read asked for — and blockFile/blockOff/blockLen say which run.
+//
+// Records are immutable once published: append only ever writes past the write
+// cursor, and the header that publishes those bytes is written afterwards. So a
+// block, which never extends past the published size it was read at, stays valid
+// for as long as its segment does. That is what makes serving later records out
+// of it sound, and it is why the only invalidation needed is "this segment's
+// published extent could have shrunk, or its file could be gone" — dropCommitted
+// and the quarantine.
+
+// blockHas reports whether the cached block holds n bytes at df's dataOff.
+func (s *store) blockHas(df *dataFile, dataOff int64, n int) bool {
+	return s.blockFile == df && dataOff >= s.blockOff &&
+		dataOff+int64(n) <= s.blockOff+int64(s.blockLen)
+}
+
+// blockAt returns the cached bytes at dataOff. The caller must have checked
+// blockHas first.
+func (s *store) blockAt(dataOff int64, n int) []byte {
+	i := int(dataOff - s.blockOff)
+	return s.readBuf[i : i+n]
+}
+
+// dropBlock forgets the cached block. Called wherever a segment's published
+// extent can shrink or its file can go away.
+func (s *store) dropBlock() { s.blockFile, s.blockOff, s.blockLen = nil, 0, 0 }
+
+// fillBlock makes the cached block cover at least need bytes of df starting at
+// dataOff, reading a whole readAhead run when it can.
+//
+// The preferred run may overshoot the end of a segment whose file is shorter
+// than its header claims. That is not necessarily fatal: a record wholly inside
+// the surviving bytes still reads, and only what the cut ran into is corruption.
+// So a short read retries at exactly what this record needs, and only a failure
+// there is reported.
+func (s *store) fillBlock(df *dataFile, dataOff, avail int64, need int) error {
+	want := min(max(int64(readAhead), int64(need)), avail)
+	if err := s.readBlock(df, dataOff, want); err != nil {
+		if !isShortRead(err) {
+			s.dropBlock()
+			return err
+		}
+		if err := s.readBlock(df, dataOff, min(int64(need), avail)); err != nil {
+			s.dropBlock()
+			return shortReadIsCorrupt(err)
+		}
+	}
+	return nil
+}
+
+// readBlock fills readBuf with n bytes of df's data region at dataOff.
+//
+// A block that already starts at dataOff is EXTENDED in place: only the tail is
+// read, and the bytes already held are kept across the grow. That is the
+// oversized-record path — a frame larger than readAhead — where re-reading from
+// the start would fetch a whole block the kernel just handed us.
+func (s *store) readBlock(df *dataFile, dataOff, n int64) error {
+	have := 0
+	if s.blockFile == df && s.blockOff == dataOff {
+		if s.blockLen >= int(n) {
+			return nil // already covered
+		}
+		have = s.blockLen
+	}
+	if have > 0 {
+		s.readBuf = growKeeping(s.readBuf, int(n), have)
+	} else {
+		s.dropBlock() // readBuf is about to be overwritten, and may be reallocated
+		s.readBuf = growBuf(s.readBuf, int(n))
+	}
+	if _, err := df.f.ReadAt(s.readBuf[have:n], headerSize+dataOff+int64(have)); err != nil {
+		return err // the caller decides; the block still describes what is valid
+	}
+	s.blockFile, s.blockOff, s.blockLen = df, dataOff, int(n)
+	return nil
+}
+
+// frameHeader returns the decoded length prefix of the record at dataOff: the
+// prefix width, the payload length, and the total frame size. ok is false when
+// the bytes there cannot be trusted to frame a record inside the segment.
+func (s *store) frameHeader(df *dataFile, dataOff, avail int64) (n, total int, ok bool, err error) {
+	probe := int(min(int64(binary.MaxVarintLen64), avail))
+	if !s.blockHas(df, dataOff, probe) {
+		if err := s.fillBlock(df, dataOff, avail, probe); err != nil {
+			return 0, 0, false, err
+		}
+		probe = min(probe, s.blockLen)
+	}
+	v, n := binary.Uvarint(s.blockAt(dataOff, probe))
+	if n <= 0 || !fitsInRecord(v, n, avail) {
+		return 0, 0, false, nil
+	}
+	return n, n + int(v) + checksumSize, true, nil
+}
+
+// recordAt reads the record at global offset off (which must lie in df),
+// returning its payload (a slice of readBuf, valid until the next read), the
+// stored payload checksum, the offset past the record, and whether it decoded.
+//
+// The common case costs no syscall at all: records are consumed in order, and a
+// readAhead block holds many of them, so only the read that crosses out of the
+// block goes to the kernel.
 func (s *store) recordAt(df *dataFile, off int64) ([]byte, uint64, int64, bool, error) {
 	dataOff := off - df.base
 	if dataOff < 0 || dataOff >= df.size {
@@ -73,46 +183,24 @@ func (s *store) recordAt(df *dataFile, off int64) ([]byte, uint64, int64, bool, 
 	}
 	avail := df.size - dataOff
 
-	// Read a block up front rather than probing for the length and then re-reading
-	// the same bytes: a whole record under readAhead arrives in one pread, which is
-	// the common case by a wide margin, and the length prefix is decoded out of
-	// bytes already in hand. Only a record too big for the block costs the second
-	// syscall — and then the first read was not wasted either, since the kernel has
-	// the page.
-	hn := int64(readAhead)
-	if hn > avail {
-		hn = avail
+	n, total, ok, err := s.frameHeader(df, dataOff, avail)
+	if err != nil || !ok {
+		return nil, 0, 0, false, err
 	}
-	s.readBuf = growBuf(s.readBuf, int(hn))
-	if _, err := df.f.ReadAt(s.readBuf[:hn], headerSize+dataOff); err != nil {
-		// Short of the block is fine as long as the record itself is whole: the
-		// segment's data region simply ends there. Re-read exactly the prefix and
-		// let the framing checks below decide.
-		if !isShortRead(err) {
+	if !s.blockHas(df, dataOff, total) {
+		// The frame runs past the block. Re-read from its start, asking for the
+		// whole thing: a record larger than readAhead becomes its own block.
+		if err := s.fillBlock(df, dataOff, avail, total); err != nil {
 			return nil, 0, 0, false, err
 		}
-		hn = min(int64(binary.MaxVarintLen64), avail)
-		if _, err := df.f.ReadAt(s.readBuf[:hn], headerSize+dataOff); err != nil {
-			return nil, 0, 0, false, shortReadIsCorrupt(err)
+		if !s.blockHas(df, dataOff, total) {
+			return nil, 0, 0, false, shortReadIsCorrupt(io.ErrUnexpectedEOF)
 		}
 	}
-	v, n := binary.Uvarint(s.readBuf[:hn])
-	if n <= 0 {
-		return nil, 0, 0, false, nil
-	}
-	if !fitsInRecord(v, n, avail) {
-		return nil, 0, 0, false, nil
-	}
-	L := int(v)
-	total := n + L + checksumSize
-	if int64(total) > hn { // the record ran past the block: fetch the whole frame
-		s.readBuf = growBuf(s.readBuf, total)
-		if _, err := df.f.ReadAt(s.readBuf[:total], headerSize+dataOff); err != nil {
-			return nil, 0, 0, false, shortReadIsCorrupt(err)
-		}
-	}
-	sum := binary.LittleEndian.Uint64(s.readBuf[n+L : total])
-	return s.readBuf[n : n+L], sum, off + int64(total), true, nil
+	frame := s.blockAt(dataOff, total)
+	L := total - n - checksumSize
+	sum := binary.LittleEndian.Uint64(frame[n+L:])
+	return frame[n : n+L], sum, off + int64(total), true, nil
 }
 
 // frameEnd returns the offset just past the record at off, using the boundary
@@ -129,31 +217,21 @@ func (s *store) frameEnd(df *dataFile, off int64) (int64, bool, error) {
 	return s.recordLen(df, off)
 }
 
-// recordLen preads only the length prefix of the record at off, returning the
-// offset past the record. Used by commitTo, which needs the record boundary but
-// not the payload.
+// recordLen returns the offset past the record at off without fetching its
+// payload. Used by commitTo, which needs the boundary but not the bytes — and
+// which walks record by record, so it reads through the same block cache rather
+// than issuing a pread per record while holding the queue lock.
 func (s *store) recordLen(df *dataFile, off int64) (int64, bool, error) {
 	dataOff := off - df.base
 	if dataOff < 0 || dataOff >= df.size {
 		return 0, false, nil
 	}
 	avail := df.size - dataOff
-	hn := int64(binary.MaxVarintLen64)
-	if hn > avail {
-		hn = avail
+	_, total, ok, err := s.frameHeader(df, dataOff, avail)
+	if err != nil || !ok {
+		return 0, false, err
 	}
-	s.readBuf = growBuf(s.readBuf, int(hn))
-	if _, err := df.f.ReadAt(s.readBuf[:hn], headerSize+dataOff); err != nil {
-		return 0, false, shortReadIsCorrupt(err)
-	}
-	v, n := binary.Uvarint(s.readBuf[:hn])
-	if n <= 0 {
-		return 0, false, nil
-	}
-	if !fitsInRecord(v, n, avail) {
-		return 0, false, nil
-	}
-	return off + int64(n) + int64(v) + checksumSize, true, nil
+	return off + int64(total), true, nil
 }
 
 // fitsInRecord reports whether a decoded length prefix v (n bytes of varint)

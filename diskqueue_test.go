@@ -31,7 +31,12 @@ func openTest(t *testing.T, maxSegments int) (*Queue[uint64], *Reader[uint64]) {
 	if maxSegments == 0 {
 		maxSegments = -1 // these tests pass 0 for "unbounded" (now a negative value)
 	}
-	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{MaxSegments: maxSegments})
+	// NoSync: none of the tests on this helper assert anything about durability —
+	// none reopens the directory (openTest does not even return the path) and none
+	// calls Sync. Paying two fdatasyncs per Add and one per commit for that cost
+	// 15 s of the suite's 28.
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64,
+		Options{NoSync: true, MaxSegments: maxSegments})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -352,7 +357,9 @@ func countDataFiles(t *testing.T, dir string) int {
 // inside a later segment (earlier ones fully consumed) and several files exist.
 func TestReopenMultiFile(t *testing.T) {
 	dir := t.TempDir()
-	w, err := New[uint64](dir, marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	// NoSync is safe for what this asserts: it Closes before reopening, and Close
+	// always flushes.
+	w, err := New[uint64](dir, marshalU64, unmarshalU64, Options{NoSync: true, SegmentSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +383,7 @@ func TestReopenMultiFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w2, err := New[uint64](dir, marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64, Options{NoSync: true, SegmentSize: 4096})
 	if err != nil {
 		t.Fatal(err)
 	}

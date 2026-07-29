@@ -254,7 +254,7 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	if truncated && w > size {
 		w = size // never address bytes past the real end of the file
 	}
-	df := &dataFile{num: num, hdr: h, base: base, size: w - headerSize, truncated: truncated}
+	df := &dataFile{num: num, path: path, hdr: h, base: base, size: w - headerSize, truncated: truncated}
 	df.written = max(th.writtenCount(), 0)
 	if truncated {
 		// The header counts records the file no longer holds, so Count() would

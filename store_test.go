@@ -36,11 +36,18 @@ func recIdx(p []byte) int { return int(p[0]) | int(p[1])<<8 }
 
 // corruptData overwrites len(b) bytes of segment fileIdx's data region starting at
 // dataOff, writing through the store's open handle so the store's reads see it.
+//
+// It drops the store's read block as well. These injectors model damage that was
+// already on disk — bit-rot, a torn write, a truncation — not a rewrite that
+// happens between a read and its commit. Without this the store would keep
+// serving the bytes it had read before the test scribbled on the file, which is
+// correct behaviour (published records are immutable) but the wrong scenario.
 func corruptData(t *testing.T, s *store, fileIdx, dataOff int, b []byte) {
 	t.Helper()
 	if _, err := s.files[fileIdx].f.WriteAt(b, int64(headerSize+dataOff)); err != nil {
 		t.Fatal(err)
 	}
+	s.dropBlock()
 }
 
 // flipData XORs mask into the data-region byte at dataOff of segment fileIdx.
@@ -51,7 +58,7 @@ func flipData(t *testing.T, s *store, fileIdx, dataOff int, mask byte) {
 		t.Fatal(err)
 	}
 	one[0] ^= mask
-	corruptData(t, s, fileIdx, dataOff, one)
+	corruptData(t, s, fileIdx, dataOff, one) // drops the read block for us
 }
 
 // readFileHeader reads the four header words straight off disk. The store writes

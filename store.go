@@ -62,10 +62,13 @@ type store struct {
 	lastFrameEnd int64
 
 	// Reused I/O buffers: writeBuf frames a record before a single WriteAt; readBuf
-	// receives a record (or just its length prefix) on ReadAt. Reusing them keeps
-	// append/read alloc-free once warm.
-	writeBuf []byte
-	readBuf  []byte
+	// holds a block of one segment's data region. Reusing them keeps append/read
+	// alloc-free once warm; see record.go for what the block cache guarantees.
+	writeBuf  []byte
+	readBuf   []byte
+	blockFile *dataFile // segment readBuf currently holds bytes from, or nil
+	blockOff  int64     // data-region offset of readBuf[0]
+	blockLen  int       // valid bytes in readBuf
 
 	writeOff  int64 // global offset of the next record to write (tail)
 	headOff   int64 // global offset of the next record to read (in memory only)
@@ -170,7 +173,7 @@ func (s *store) ensureOpen(df *dataFile) error {
 		s.touchOpen(df)
 		return nil
 	}
-	f, err := os.OpenFile(s.filePath(df.num), os.O_RDWR, 0o644)
+	f, err := os.OpenFile(df.path, os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
@@ -303,13 +306,14 @@ func (s *store) filePath(num uint64) string {
 // to trip over, and returns cleanly: nothing was published, so the store is
 // exactly where it was.
 func (s *store) createFile(num uint64, base int64) (*dataFile, error) {
-	f, err := os.OpenFile(s.filePath(num), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	path := s.filePath(num)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	fail := func(err error) (*dataFile, error) {
 		_ = f.Close()
-		_ = os.Remove(s.filePath(num))
+		_ = os.Remove(path)
 		return nil, err
 	}
 	// Reserve the blocks now rather than discovering a full filesystem in the
@@ -317,7 +321,7 @@ func (s *store) createFile(num uint64, base int64) (*dataFile, error) {
 	if err := preallocate(f, headerSize+s.segmentSize); err != nil {
 		return fail(err)
 	}
-	df := &dataFile{num: num, f: f, hdr: make([]byte, headerSize), base: base}
+	df := &dataFile{num: num, path: path, f: f, hdr: make([]byte, headerSize), base: base}
 	df.header(
 		(*dataFile).initHeader,
 		setCommitCursor(headerSize),
@@ -541,9 +545,10 @@ func (s *store) dropCommitted(keep *dataFile) {
 	if len(s.files) == 0 || s.files[0] == keep || s.files[0].base+s.files[0].size > s.commitOff {
 		return
 	}
-	// A reclaim invalidates the cached frame boundary: offsets it named may belong
-	// to a segment that is about to stop existing.
+	// A reclaim invalidates both caches: the frame boundary and the block may name
+	// a segment that is about to stop existing.
 	s.lastFrameAt, s.lastFrameEnd = 0, 0
+	s.dropBlock()
 	survive := s.files[:0]
 	for _, df := range s.files {
 		if df != keep && df.base+df.size <= s.commitOff {
@@ -552,7 +557,7 @@ func (s *store) dropCommitted(keep *dataFile) {
 				df.f = nil
 				s.untrackOpen(df)
 			}
-			if err := os.Remove(s.filePath(df.num)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := os.Remove(df.path); err != nil && !errors.Is(err, os.ErrNotExist) {
 				s.unreclaimed++
 				survive = append(survive, df)
 				continue

@@ -109,3 +109,42 @@ func BenchmarkDeepBacklog(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkBatchCommit is the Reserve/Commit deferred-ack path: reserve N
+// records, then retire them with one Commit. That commit walks every record's
+// frame to find each boundary, with the queue mutex held the whole time — so its
+// cost is what every producer and every other reader waits behind.
+func BenchmarkBatchCommit(b *testing.B) {
+	const batch = 1000
+	m, u := bytesCodec()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		w, err := New[[]byte](b.TempDir(), m, u, Options{NoSync: true, MaxSegments: -1})
+		if err != nil {
+			b.Fatal(err)
+		}
+		r := w.NewReader()
+		for j := 0; j < batch; j++ {
+			if err := w.Add(benchPayload); err != nil {
+				b.Fatal(err)
+			}
+		}
+		var last int64
+		for j := 0; j < batch; j++ {
+			_, ok, off, err := r.TryReserve()
+			if !ok || err != nil {
+				b.Fatalf("reserve: ok=%v err=%v", ok, err)
+			}
+			last = off
+		}
+		b.StartTimer()
+
+		if err := r.Commit(last); err != nil {
+			b.Fatal(err)
+		}
+
+		b.StopTimer()
+		_ = w.Close()
+		b.StartTimer()
+	}
+}
