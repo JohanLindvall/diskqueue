@@ -31,17 +31,25 @@ package diskqueue
 import (
 	"context"
 	"errors"
-	"os"
 	"sync"
 	"time"
 )
 
 // MarshalFunc serializes v by appending to dst and returning the extended slice
 // (like the builtin append). Appending rather than allocating keeps Add alloc-free.
+//
+// It is called with the DiskQueue's internal lock held, so it must not call back
+// into the DiskQueue or any of its Readers — the mutex is not reentrant and doing
+// so deadlocks.
 type MarshalFunc[T any] func(dst []byte, v T) ([]byte, error)
 
 // UnmarshalFunc decodes a value from data, a Reader-owned buffer valid only until
 // that Reader's next read; copy out of it if you need it longer.
+//
+// Like MarshalFunc it runs under the DiskQueue's lock and must not call back into
+// the queue. Returning an error leaves the record at the head of the queue rather
+// than consuming it, so the same record is offered again; use Reader.Skip to step
+// over one the codec will never accept.
 type UnmarshalFunc[T any] func(data []byte) (T, error)
 
 // Errors returned by the package.
@@ -54,17 +62,29 @@ var (
 	ErrInvalidOffset = errors.New("diskqueue: invalid offset")
 	// ErrRecordTooLarge is returned by Add when a record cannot fit one segment.
 	ErrRecordTooLarge = errors.New("diskqueue: record too large")
-	// ErrCorrupt is returned when a stored xxhash64 does not match its data,
-	// indicating on-disk corruption — either a record's payload (the read cursor
-	// does not advance, so the bad record is reported on every subsequent read) or
-	// a file header (open fails).
-	ErrCorrupt = errors.New("diskqueue: checksum mismatch")
-	// ErrBadFormat is returned by New when a file in the directory is not a DiskQueue
-	// segment of a supported version (wrong magic or version).
-	ErrBadFormat = errors.New("diskqueue: unrecognized file format")
+	// ErrCorrupt is returned by a read whose data failed its integrity check: a
+	// record whose stored xxhash64 does not match, a length that overruns its
+	// segment, or a segment dropped at open for a damaged header.
+	//
+	// The damaged data is dropped and the queue advances past it — the record
+	// alone when its framing is still trustworthy, otherwise the rest of that
+	// segment — so corruption degrades to reported loss rather than to plausible
+	// looking garbage or a queue that never moves again. The error says one event
+	// happened; Stats().LostBytes and LostRecords carry the magnitude it cannot.
+	ErrCorrupt = errors.New("diskqueue: corrupt")
 	// ErrSegmentSizeMismatch is returned by New when reopening a store with a
 	// different SegmentSize than it was created with (which would discard data).
 	ErrSegmentSizeMismatch = errors.New("diskqueue: segment size mismatch")
+	// ErrLocked is returned by New when another DiskQueue — in this process or
+	// another — already holds the directory's advisory lock.
+	ErrLocked = errors.New("diskqueue: directory already in use")
+	// ErrIO wraps a durability failure that the queue cannot recover from in
+	// place: an fsync that failed. The kernel reports such an error once and then
+	// drops the dirty pages, so a later fsync may well succeed with the data
+	// already gone — rather than report a durability it does not have, the queue
+	// latches the failure and every subsequent Add, commit and Sync returns it
+	// (wrapping the original errno). Close it and reopen to continue.
+	ErrIO = errors.New("diskqueue: durability failure")
 )
 
 // Options tunes the behaviour of a DiskQueue. The zero value is valid and selects
@@ -108,15 +128,37 @@ type Options struct {
 	// idle queue's last writes become durable within the interval instead of
 	// waiting for SyncEvery more operations. Ignored when NoSync is set.
 	SyncInterval time.Duration
+}
 
-	// RecoverCorrupt enables best-effort recovery instead of failing on
-	// corruption. On open, a torn trailing segment (a crash mid-cycle) is dropped
-	// rather than returning ErrCorrupt/ErrBadFormat. On read, a corrupt record
-	// quarantines the remainder of its segment and continues with the next valid
-	// record instead of returning ErrCorrupt. Recovery is lossy — the dropped data
-	// is gone — so each event is counted (see DiskQueue.Corruptions). Default false
-	// (strict: corruption is surfaced as an error).
-	RecoverCorrupt bool
+// Stats is a snapshot of a DiskQueue's gauges and lifetime counters, for
+// monitoring. It is a plain struct on purpose: no registry model is imposed on
+// callers, and no callback of theirs runs under the queue's lock.
+//
+// The loss counters are what make corruption observable. ErrCorrupt says an
+// event happened; LostBytes and LostRecords say how much it cost.
+type Stats struct {
+	// Gauges.
+	BacklogBytes int64 // uncommitted bytes: the same number as Size
+	Backlog      int64 // uncommitted records: the same number as Count
+	Segments     int   // live segment files
+	MaxSegments  int   // the configured cap; 0 when unbounded
+	DiskBytes    int64 // what the segment files occupy, including preallocated slack
+
+	// Counters since New.
+	Added     uint64 // records accepted by Add
+	Delivered uint64 // records handed to a reader, redeliveries included
+	Committed uint64 // records retired by a commit
+	Full      uint64 // Adds refused with ErrFull
+
+	// Loss, all since New. LostBytes is a lower bound: for a segment that
+	// vanished from the directory, only its recorded size is left to count.
+	LostBytes       uint64 // destroyed by corruption
+	LostRecords     uint64 // individually dropped damaged records
+	LostSegments    uint64 // segments abandoned or dropped whole
+	ForeignSegments uint64 // dropped for a format version this build cannot read
+	ForeignBytes    uint64
+	DiscardedBytes  uint64 // trailing bytes a segment lost to truncation
+	Corruptions     uint64 // corruption events, each surfaced as one ErrCorrupt
 }
 
 // DiskQueue is a generic persistent FIFO queue of T.
@@ -145,11 +187,16 @@ type DiskQueue[T any] struct {
 // count, durability, and recovery behaviour are tuned via Options (see
 // Options.MaxSegments for the file-count cap, which defaults to 32).
 func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*DiskQueue[T], error) {
+	if marshal == nil || unmarshal == nil {
+		// Caught here rather than as a nil call on the first Add: construction is
+		// the last point where the caller can still do something about it.
+		return nil, errors.New("diskqueue: marshal and unmarshal must be non-nil")
+	}
 	var opt Options
 	if len(opts) > 0 {
 		opt = opts[0]
 	}
-	st, err := openStore(path, segmentCapacity(opt.SegmentSize), resolveMaxSegments(opt.MaxSegments), opt.NoSync, opt.SyncEvery, opt.MaxMapped, opt.RecoverCorrupt)
+	st, err := openStore(path, segmentCapacity(opt.SegmentSize), resolveMaxSegments(opt.MaxSegments), opt.NoSync, opt.SyncEvery, opt.MaxMapped)
 	if err != nil {
 		return nil, err
 	}
@@ -180,21 +227,35 @@ func resolveMaxSegments(v int) int {
 	}
 }
 
+// segmentAlign is what SegmentSize rounds up to. It is a fixed constant, not the
+// host's page size: nothing is mapped any more, and rounding by the running
+// host's page size would bake that host into the on-disk segment length — a store
+// created on a 4 KiB-page machine would then fail to reopen on a 64 KiB-page one
+// with ErrSegmentSizeMismatch.
+const segmentAlign = 4096
+
 func segmentCapacity(size int64) int64 {
 	c := size
 	if c <= 0 {
 		c = 8 << 20 // 8 MiB default
 	}
-	if c < 4096 {
-		c = 4096
+	if c < segmentAlign {
+		c = segmentAlign
 	}
-	if ps := int64(os.Getpagesize()); c%ps != 0 {
-		c = (c/ps + 1) * ps
+	if c%segmentAlign != 0 {
+		c = (c/segmentAlign + 1) * segmentAlign
 	}
 	return c
 }
 
 // Add appends data to the back of the log.
+//
+// A write that cannot be placed at all (ErrFull, ErrRecordTooLarge, a failed
+// pwrite) leaves the queue untouched: the error means the item is not in it. The
+// exception is a durability failure — if the error wraps ErrIO the record's bytes
+// and the header publishing them did reach the page cache, so the item is in the
+// log and readable, and only its power-loss durability is in doubt; the queue is
+// then poisoned and every later operation repeats the error.
 func (w *DiskQueue[T]) Add(data T) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -202,15 +263,16 @@ func (w *DiskQueue[T]) Add(data T) error {
 		return ErrClosed
 	}
 	b, err := w.marshal(w.scratch[:0], data)
+	if b != nil {
+		w.scratch = b // retain grown capacity for reuse, even from a failed marshal
+	}
 	if err != nil {
 		return err
 	}
-	w.scratch = b // retain grown capacity for reuse
 	before := w.st.writeOffset()
 	err = w.st.append(b)
-	// The record can land even when a per-op fsync then fails (append advances the
-	// write offset before flushing). Wake waiters whenever it did, so a durability
-	// error doesn't also strand a blocked consumer on a record that is in the log.
+	// Wake waiters whenever the record landed, so a durability error doesn't also
+	// strand a blocked consumer on a record that is in the log.
 	if w.st.writeOffset() != before {
 		w.signal()
 	}
@@ -239,13 +301,40 @@ func (w *DiskQueue[T]) Size() int64 {
 }
 
 // Corruptions returns how many corruption events have been recovered from since
-// open (torn trailing segments dropped on open plus segments quarantined on
-// read). Always 0 unless RecoverCorrupt is set. A non-zero value means data was
-// dropped.
+// New: segments dropped at open, records dropped for a bad checksum, and
+// segments abandoned for unusable framing. Each one was, or will be, surfaced as
+// one ErrCorrupt from a read. A non-zero value means data was dropped; Stats
+// says how much.
+//
+// It remains readable after Close and reports the final observed state.
 func (w *DiskQueue[T]) Corruptions() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.st.corruptionCount()
+}
+
+// Stats returns a snapshot of the queue's gauges and lifetime counters. It
+// remains readable after Close and reports the final observed state.
+func (w *DiskQueue[T]) Stats() Stats {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.st.stats()
+}
+
+// Err returns the latched durability failure, if any: nil while the queue is
+// healthy, and an error wrapping ErrIO once an fsync has failed. A poisoned queue
+// keeps serving reads but refuses every write, commit and sync, because the
+// kernel reports a writeback error once and then discards the pages — a second
+// fsync would report success over data that is already gone. Close it and reopen
+// to continue; whatever was durable is still there, and uncommitted records
+// replay.
+func (w *DiskQueue[T]) Err() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.st == nil {
+		return nil
+	}
+	return w.st.failure()
 }
 
 // Sync flushes buffered writes to stable storage.
@@ -298,6 +387,8 @@ func (w *DiskQueue[T]) syncLoop(d time.Duration) {
 		case <-t.C:
 			w.mu.Lock()
 			if !w.closed {
+				// Nowhere to return it to, but a failed fsync latches inside the
+				// store, so the next Add/Sync/Close — or Err — reports it.
 				_ = w.st.sync()
 			}
 			w.mu.Unlock()

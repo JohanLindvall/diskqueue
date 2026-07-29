@@ -2,7 +2,6 @@ package diskqueue
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -51,7 +50,7 @@ var idxRecLen = int64(uvarintLen(2) + 2 + checksumSize)
 // surfaced as ErrCorrupt rather than returned as a bogus record.
 func TestStoreHeaderOverpromiseCaughtByChecksum(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	s, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +68,7 @@ func TestStoreHeaderOverpromiseCaughtByChecksum(t *testing.T) {
 		binary.LittleEndian.PutUint64(h[24:32], uint64(written+1))   // claim one extra record
 	})
 
-	s2, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	s2, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen (header is valid, so open must succeed): %v", err)
 	}
@@ -77,59 +76,21 @@ func TestStoreHeaderOverpromiseCaughtByChecksum(t *testing.T) {
 	if got := s2.count(); got != n+1 {
 		t.Fatalf("count=%d, want %d (header over-promises by one)", got, n+1)
 	}
-	for i := 0; i < n; i++ {
-		p, off, ok, err := s2.takeHead()
-		if err != nil || !ok || recIdx(p) != i {
-			t.Fatalf("real record %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
-		}
-		s2.commitTo(off)
+	// The real records come out; the phantom is reported as corruption and
+	// dropped, never handed over as a record, and the queue then reads clean.
+	got, events := drainRecovering(t, s2)
+	if len(got) != n {
+		t.Fatalf("delivered %v, want the %d real records", got, n)
 	}
-	if _, _, _, err := s2.takeHead(); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("phantom record: err=%v, want ErrCorrupt", err)
+	assertAscending(t, got)
+	if events == 0 {
+		t.Fatal("the phantom was neither delivered nor reported")
 	}
-}
-
-// TestStoreHeaderOverpromiseRecovered is the recoverCorrupt counterpart: instead
-// of surfacing ErrCorrupt forever, the phantom segment tail is quarantined, the
-// queue drains, and the event is counted.
-func TestStoreHeaderOverpromiseRecovered(t *testing.T) {
-	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, false, 0, 0, false)
-	if err != nil {
-		t.Fatal(err)
+	if s2.corruptionCount() == 0 {
+		t.Fatal("the phantom was not counted")
 	}
-	const n = 3
-	for i := 0; i < n; i++ {
-		mustAppend(t, s, idxRec(i))
-	}
-	_, w, written, _ := readFileHeader(t, dir, 1)
-	if err := s.close(); err != nil {
-		t.Fatal(err)
-	}
-
-	forgeHeader(t, dir, 1, func(h []byte) {
-		binary.LittleEndian.PutUint64(h[16:24], uint64(w+idxRecLen))
-		binary.LittleEndian.PutUint64(h[24:32], uint64(written+1))
-	})
-
-	s2, err := openStore(dir, 4096, 0, false, 0, 0, true) // recoverCorrupt
-	if err != nil {
-		t.Fatalf("reopen: %v", err)
-	}
-	defer s2.close()
-	for i := 0; i < n; i++ {
-		p, off, ok, err := s2.takeHead()
-		if err != nil || !ok || recIdx(p) != i {
-			t.Fatalf("real record %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
-		}
-		s2.commitTo(off)
-	}
-	// The phantom is skipped, not returned; the store then reads empty.
-	if _, _, ok, err := s2.takeHead(); ok || err != nil {
-		t.Fatalf("after phantom: ok=%v err=%v, want empty/no-error", ok, err)
-	}
-	if got := s2.corruptionCount(); got != 1 {
-		t.Fatalf("corruptionCount=%d, want 1", got)
+	if s2.lostBytes == 0 {
+		t.Fatal("lostBytes did not account for the phantom")
 	}
 }
 
@@ -139,7 +100,7 @@ func TestStoreHeaderOverpromiseRecovered(t *testing.T) {
 // flush. The orphaned bytes must be invisible (clean truncation), with no error.
 func TestStoreDataBeyondHeaderInvisible(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	s, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +119,7 @@ func TestStoreDataBeyondHeaderInvisible(t *testing.T) {
 		binary.LittleEndian.PutUint64(h[24:32], uint64(written-1))
 	})
 
-	s2, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	s2, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -187,7 +148,7 @@ func TestStoreDataBeyondHeaderInvisible(t *testing.T) {
 // recovery the prefix survives and the torn tail is dropped.
 func TestStoreTornRecordTailBatched(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, false, 8, 0, false) // syncEvery=8 (batched)
+	s, err := openStore(dir, 4096, 0, false, 8, 0) // syncEvery=8 (batched)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,41 +174,23 @@ func TestStoreTornRecordTailBatched(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Strict: the prefix reads, then the torn record is ErrCorrupt. Read without
-	// committing so the on-disk state is untouched for the recovery reopen below
-	// (a flushed commit cursor would otherwise skip the prefix on the next open).
-	strict, err := openStore(dir, 4096, 0, false, 8, 0, false)
+	// The prefix survives intact and the torn record — structurally whole, so its
+	// framing is still trustworthy — costs exactly itself.
+	rec, err := openStore(dir, 4096, 0, false, 8, 0)
 	if err != nil {
-		t.Fatalf("strict reopen: %v", err)
-	}
-	for i := 0; i < n-1; i++ {
-		p, _, ok, err := strict.takeHead()
-		if err != nil || !ok || recIdx(p) != i {
-			t.Fatalf("strict record %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
-		}
-	}
-	if _, _, _, err := strict.takeHead(); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("strict torn tail: err=%v, want ErrCorrupt", err)
-	}
-	_ = strict.close()
-
-	// Recovery: prefix survives, torn record dropped, one event counted.
-	rec, err := openStore(dir, 4096, 0, false, 8, 0, true)
-	if err != nil {
-		t.Fatalf("recover reopen: %v", err)
+		t.Fatalf("reopen: %v", err)
 	}
 	defer rec.close()
-	for i := 0; i < n-1; i++ {
-		p, off, ok, err := rec.takeHead()
-		if err != nil || !ok || recIdx(p) != i {
-			t.Fatalf("recover record %d: idx=%d ok=%v err=%v", i, recIdx(p), ok, err)
-		}
-		rec.commitTo(off)
+	got, events := drainRecovering(t, rec)
+	if len(got) != n-1 {
+		t.Fatalf("delivered %v, want the %d records before the tear", got, n-1)
 	}
-	if _, _, ok, err := rec.takeHead(); ok || err != nil {
-		t.Fatalf("recover after tear: ok=%v err=%v, want clean empty", ok, err)
+	assertAscending(t, got)
+	if events != 1 {
+		t.Fatalf("%d corruption events, want 1", events)
 	}
-	if got := rec.corruptionCount(); got != 1 {
-		t.Fatalf("corruptionCount=%d, want 1", got)
+	if rec.lostRecords != 1 || rec.lostSegments != 0 {
+		t.Fatalf("lostRecords=%d lostSegments=%d, want 1 and 0: a torn payload is one record",
+			rec.lostRecords, rec.lostSegments)
 	}
 }

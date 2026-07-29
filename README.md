@@ -22,22 +22,28 @@ allocation:
   value never aliases the store's reused read buffer.
 
 ```
-BenchmarkAddTake-22    36 ns/op    0 B/op    0 allocs/op   (NoSync)
+BenchmarkAddTake-16    4.3 µs/op    0 B/op    0 allocs/op   (NoSync; add + take + commit)
 ```
 
 ## Storage layout
 
 The log lives in a directory of numbered files `data.00000001`, `data.00000002`,
-… each `SegmentSize` bytes, at most `MaxSegments` of them at once. Each file
+… each `SegmentSize` bytes, at most `MaxSegments` of them at once. Segments are
+**preallocated** — `fallocate(2)` on Linux, `ftruncate` elsewhere — so a full
+filesystem is reported when a segment is created, while the store is still clean,
+instead of arriving as an `ENOSPC` in the middle of a record; the footprint is
+what `MaxSegments × SegmentSize` says it is. The directory itself is held open
+for the lifetime of the queue and carries an advisory `flock`, so a second
+`New` on the same directory fails with `ErrLocked` rather than silently
+interleaving writes into the same segments. Each file
 begins with a 64-byte header — a magic number, a format version, the commit
 cursor (persisted read position), write cursor (data end), written and committed
 record counts, and an `xxhash64` over the header itself — followed by records,
 each `uvarint(len) || payload || xxhash64(payload)` (an 8-byte little-endian
 checksum trailer). Because the cursors and counts all live in the header,
 reopening reads no records at all; the header checksum is verified on open (a
-mismatch is `ErrCorrupt`, a wrong magic/version is `ErrBadFormat`), and each
-record's checksum is verified on read (a mismatch returns `ErrCorrupt` without
-advancing the cursor). Records are written with `pwrite` and read back with
+segment that fails it is dropped and counted — see **Recovery**), and each
+record's checksum is verified on read. Records are written with `pwrite` and read back with
 `pread` into reused buffers; each file's handle is opened on demand and the
 least-recently-used handles are closed once `MaxMapped` are open, so a deep
 backlog does not hold an open descriptor per retained file. A file is dropped once
@@ -171,7 +177,10 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Count() int` | Number of items added but not yet committed. |
 | `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
 | `Sync() error` | `fsync` the files to stable storage. |
-| `Close() error` | Flush and close. |
+| `Stats() Stats` | Gauges and lifetime counters, including every loss path. See **Recovery**. |
+| `Corruptions() int64` | Corruption events since `New`; each was surfaced as one `ErrCorrupt`. |
+| `Err() error` | The latched durability failure, or nil. See **Failure handling**. |
+| `Close() error` | Flush and close (releases the directory lock). |
 
 `Reader[T]` — consume items (created via `NewReader`):
 
@@ -182,8 +191,10 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Reserve(ctx) (T, bool, int64, error)` | Block until an item is available, then read it. |
 | `Take(ctx) (T, bool, error)` | Block until an item is available, then read + commit. |
 | `Commit(offset int64) error` | Mark the entry at `offset` and all before it consumed; reclaim space. |
+| `Skip() (bool, error)` | Consume and commit the head record without decoding it. |
 | `Drain(ctx) iter.Seq[T]` | Drain items present at call time (commits each). |
 | `Follow(ctx) iter.Seq[T]` | Drain existing then future items until `ctx` is cancelled (commits each). |
+| `Err() error` | Why the last `Drain`/`Follow` stopped; nil if it simply ran out. |
 
 ## Semantics
 
@@ -201,22 +212,130 @@ processing (at-least-once), use `Reserve`/`Commit`.
   `Reserve`/`Commit` for explicit acknowledgement.
 - **Durability.** Writes go into the page cache via `pwrite` and survive a
   process crash. By default each write and commit is `fsync`'d for
-  power-loss durability; set `NoSync` to skip that entirely, or `SyncEvery: N` to
-  batch one fsync over N operations (optionally with a `SyncInterval` wall-clock
-  backstop). `Sync` flushes on demand.
+  power-loss durability; set `NoSync` to skip the per-operation fsync, or
+  `SyncEvery: N` to batch one fsync over N operations (optionally with a
+  `SyncInterval` wall-clock backstop). `Sync` flushes on demand and `Close`
+  always flushes — including under `NoSync`, which means "no fsync per
+  operation", not "never". Segment creation and removal are additionally made
+  durable with a directory `fsync`; that is a POSIX notion, so it is skipped on
+  Windows, plan9 and js/wasm, and on Unix filesystems that do not implement it —
+  a power loss there can lose a freshly cycled segment's directory entry.
 - **Integrity.** Every record and every file header stores an `xxhash64`, verified
-  on read and on open. A record mismatch (bit-rot or a torn write) returns
-  `ErrCorrupt` and leaves the read cursor in place, so the bad record surfaces
-  rather than being delivered as valid data; a bad header fails the open with
-  `ErrCorrupt`, and a foreign/garbage file fails with `ErrBadFormat`.
-- **Recovery.** With `RecoverCorrupt` set, corruption is recovered instead of
-  surfaced: a torn trailing segment (a crash mid-cycle) is dropped on open, and a
-  corrupt record quarantines the rest of its segment and the reader continues with
-  the next valid record. Recovery is lossy — dropped data is gone — so each event
-  is counted by `DiskQueue.Corruptions()`. Without the flag the default is strict.
+  on read and on open. A segment that has *lost* bytes is corruption too, not a
+  geometry mismatch: since segments are preallocated to a known length, a file of
+  the wrong size is read as `ErrSegmentSizeMismatch` only when its own header
+  agrees it is complete. See **Recovery** for what a failed check costs.
 - **Reclamation.** Disk is freed a whole file at a time, once every record in a
   file is committed, and only while writing. A read-only consumer never deletes
-  files; reclamation happens on the next `Add` that cycles to a new file.
+  files; reclamation happens on the next `Add` that cycles to a new file. A file
+  that will not unlink stays counted, so `MaxSegments` keeps describing what is
+  really on disk, and the next reclamation retries it.
+
+## Recovery
+
+Recovery is not an option to switch on — it is the behaviour. Two rules run
+through all of it:
+
+**Corruption degrades to reported loss, never to corrupt output and never to a
+wedged queue.** Damaged data is dropped and counted, not handed onward as
+plausible-looking records, and there is no failure mode where the consumer waits
+forever on bytes that will never parse. A queue that answers `ErrCorrupt` to
+every read until someone edits the directory by hand is not more careful than one
+that drops the record — it is just unavailable as well as damaged.
+
+**Every loss path is observable.** Each event surfaces as exactly one
+`ErrCorrupt` from a read, and `Stats()` carries the magnitude the error cannot:
+`LostRecords`, `LostSegments`, `LostBytes` (a lower bound), `DiscardedBytes` and
+`ForeignSegments`. `increase(LostBytes) > 0` means corruption destroyed data.
+
+| Damage | Cost |
+| --- | --- |
+| Crash mid-`Add` (torn record at the tail) | nothing: the header never published it, and the `Add` never returned |
+| Crash between `Add` and the header fsync | the record is invisible on reopen — a clean truncation, not an error |
+| One flipped byte in a record **payload** | **one record**: its length still framed it, so exactly that record is dropped |
+| One flipped byte in a record **length** | **up to one segment**: the frame boundaries behind it are gone with it |
+| Damaged segment header | that segment is dropped at open — wherever it sits — and counted; the rest stay readable |
+| Segment truncated by the filesystem | the records still present survive; the cut tail is counted in `DiscardedBytes` |
+| Segment file deleted underneath a running queue | the segment is abandoned, one `ErrCorrupt`, the queue keeps making progress |
+| Zero-length segment (a create interrupted before its header) | removed silently — it never held a record, so it is not a loss event |
+| Unknown format version | segment dropped silently, counted in `ForeignSegments` — a format change is not data loss |
+| Segment that cannot be *read* (`EACCES`, `EMFILE`, `EIO`) | **not** damage: the open fails and nothing is deleted, because "I could not look" is not evidence |
+
+"One bad byte costs one record" is true of payloads, not of length prefixes. A
+damaged length is always *detected* — the checksum it points at no longer
+matches — but it cannot be *repaired*: damaged upward it overruns the segment,
+damaged downward it desynchronizes the walk into the middle of a payload, and
+either way the record boundaries from that point on are gone. The rest of that
+segment is abandoned, so one bad byte there can cost up to `SegmentSize`.
+
+Reading is where losses are reported, so a consumer that never reads never learns
+of them; `Stats()` and `Corruptions()` are readable at any time, including after
+`Close`.
+
+```go
+for {
+    v, ok, err := r.TryTake()
+    switch {
+    case errors.Is(err, ErrCorrupt):
+        // Damage was dropped and the queue advanced. Count it and go round again.
+        log.Warn("diskqueue read", "err", err, "lost", w.Stats().LostBytes)
+    case err != nil:
+        return err
+    case !ok:
+        return nil
+    default:
+        process(v)
+    }
+}
+```
+
+`Drain` and `Follow` cannot carry an error per item, so they do not stop on
+corruption — the damage is already dropped and the queue has moved on, and
+stopping would strand every record behind it. They keep iterating and record the
+first event in `Reader.Err()`.
+
+## Failure handling
+
+An I/O error never panics and never wedges the queue — it comes back as an error,
+and the queue is left in a state you can reason about.
+
+- **A write that fails did not happen.** `Add` returning `ErrFull`,
+  `ErrRecordTooLarge` or a failed `pwrite` leaves the queue byte-for-byte as it
+  was: the item is not in it, and retrying is well defined. A segment that cannot
+  be created is unlinked again, so a failed `Add` leaves no stub behind.
+- **A failed `fsync` poisons the queue.** Linux reports a writeback error *once*
+  and then discards the dirty pages, so a second `fsync` can return success over
+  data that is already gone. Rather than claim a durability it cannot deliver, the
+  queue latches the first such failure: `Add`, `Commit` and `Sync` all return an
+  error wrapping `ErrIO` from then on (the original errno is wrapped too, so
+  `errors.Is(err, syscall.ENOSPC)` still works), and `DiskQueue.Err()` reports it
+  without performing an operation. **Reads keep working**, so a consumer can drain
+  what is there; to write again, `Close` and reopen — whatever was durable is
+  still on disk and uncommitted records replay.
+- **Commits report failure.** `Take`/`TryTake` return the item *and* a non-nil
+  error when the read succeeded but its commit did not reach disk: the item is
+  yours to process, and it will be delivered again after a reopen. `Commit`
+  returns the same error directly.
+- **Iterators report through `Err()`.** An `iter.Seq` cannot carry an error, so
+  `Drain`/`Follow` stop and record it: check `r.Err()` after the loop. Nil means
+  the iteration ended because the queue was drained, the context was cancelled, or
+  the queue was closed.
+- **A record that could not be delivered stays put.** If `UnmarshalFunc` returns
+  an error the read cursor is rewound, exactly as for a corrupt record, so a
+  transient decode failure cannot silently consume an item. A record the codec
+  will *never* accept is therefore offered again on every read — call `Skip` to
+  step over it deliberately.
+- **`Commit` is bounded by the read cursor.** An offset past what has been read
+  returns `ErrInvalidOffset` instead of reclaiming (and deleting) records nobody
+  has seen.
+- **Recovery never destroys what it could not read.** A segment is dropped only
+  when it is *readable and damaged*. One that merely could not be opened —
+  `EACCES`, `EMFILE`, a device error — fails the open instead, so a transient
+  permission blip cannot unlink good data. A segment that has *disappeared* is
+  corruption, and is abandoned like any other.
+- **One writer per directory.** `New` takes an advisory `flock` on the queue
+  directory (Unix; a no-op where the standard library has no `flock`). A second
+  open of the same directory fails with `ErrLocked`.
 - **Value lifetime.** A `Reader` copies each record into its own reusable scratch
   buffer before calling `UnmarshalFunc`, so the value (and anything in `T` that
   aliases it) never aliases the store's reused read buffer. It is valid until
@@ -244,9 +363,8 @@ diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
 	NoSync:         true, // skip fsync per write/commit (faster, no power-loss durability)
 	SyncEvery:      0,    // 0/1 = fsync every op; N>1 = batch the fsync over N ops
 	SyncInterval:   0,    // >0 = background flush every interval (backstop for SyncEvery)
-	SegmentSize:    0,    // 0 = 8 MiB default; floored at 4 KiB, rounded up to a page
+	SegmentSize:    0,    // 0 = 8 MiB default; floored and rounded up to 4 KiB
 	MaxMapped:      0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 2
-	RecoverCorrupt: false, // true = drop corrupt data and continue instead of erroring
 })
 ```
 
@@ -257,9 +375,12 @@ torn tail is caught by the per-record checksum). `Close` and `Sync` always flush
 The speed-up is large — on a laptop NVMe, durable `Add` goes from ~1.6 ms/op at
 `SyncEvery: 1` to ~9 µs at `SyncEvery: 100` and ~1.1 µs at `SyncEvery: 1000`.
 
-`SegmentSize` is fixed when the store is created. Reopening an existing store with
-a different (post-rounding) `SegmentSize` is rejected with `ErrSegmentSizeMismatch`
-rather than truncating the files and discarding committed records.
+`SegmentSize` is fixed when the store is created, floored at 4 KiB and rounded up
+to a multiple of 4 KiB (a fixed constant, not the host's page size — otherwise a
+store created on a 4 KiB-page machine would not reopen on a 64 KiB-page one).
+Reopening an existing store with a different (post-rounding) `SegmentSize` is
+rejected with `ErrSegmentSizeMismatch` rather than truncating the files and
+discarding committed records.
 
 ## License
 

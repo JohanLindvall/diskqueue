@@ -15,7 +15,7 @@ import (
 func newTestStore(t *testing.T, segmentSize int64, maxSegments int) (*store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := openStore(dir, segmentSize, maxSegments, true, 0, 0, false)
+	s, err := openStore(dir, segmentSize, maxSegments, true, 0, 0)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestStoreRecordTooLarge(t *testing.T) {
 
 func TestStoreHeaderOnDisk(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, true, 0, 0, false)
+	s, err := openStore(dir, 4096, 0, true, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestStoreHeaderOnDisk(t *testing.T) {
 
 func TestStoreRecovery(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 64, 0, true, 0, 0, false)
+	s, err := openStore(dir, 64, 0, true, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +302,7 @@ func TestStoreRecovery(t *testing.T) {
 
 	// Reopen: counts come from the header (no record scan), the read cursor is
 	// reset to the commit cursor, and the remaining records replay in order.
-	s2, err := openStore(dir, 64, 0, true, 0, 0, false)
+	s2, err := openStore(dir, 64, 0, true, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +324,7 @@ func TestStoreRecovery(t *testing.T) {
 
 func TestStoreReopenFullyDrained(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, true, 0, 0, false)
+	s, err := openStore(dir, 4096, 0, true, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +337,7 @@ func TestStoreReopenFullyDrained(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s2, err := openStore(dir, 4096, 0, true, 0, 0, false)
+	s2, err := openStore(dir, 4096, 0, true, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +376,7 @@ func checkPayload(t *testing.T, got []byte, length int, fill byte) {
 func runStoreProgram(t *testing.T, segSize int64, maxSeg int, prog []byte) {
 	t.Helper()
 	dir := t.TempDir()
-	s, err := openStore(dir, segSize, maxSeg, true, 0, 0, false)
+	s, err := openStore(dir, segSize, maxSeg, true, 0, 0)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -462,7 +462,7 @@ func runStoreProgram(t *testing.T, segSize int64, maxSeg int, prog []byte) {
 			if err := s.close(); err != nil {
 				t.Fatalf("close: %v", err)
 			}
-			ns, nerr := openStore(dir, segSize, maxSeg, true, 0, 0, false)
+			ns, nerr := openStore(dir, segSize, maxSeg, true, 0, 0)
 			if nerr != nil {
 				t.Fatalf("reopen: %v", nerr)
 			}
@@ -532,19 +532,63 @@ func TestStressStoreRandom(t *testing.T) {
 
 // TestStoreCorruptLengthNoPanic verifies that a record with a corrupt length
 // prefix decodes as "not ok" rather than panicking past the mapping.
+// TestStoreCorruptLengthNoPanic walks the length-prefix bounds guard with the
+// values that break it in different ways. The 1<<63-1 case is the one that used
+// to kill the process: int(v) is a large *positive* int, so the old `L < 0` guard
+// let it through, and n+L+checksumSize then wrapped negative — reslicing readBuf
+// to a negative length inside growBuf. The commit path shared the same guard and
+// drove the commit cursor to ≈ -9.2e18.
 func TestStoreCorruptLengthNoPanic(t *testing.T) {
-	s, _ := newTestStore(t, 4096, 0)
-	mustAppend(t, s, idxRec(1))
-
-	// Overwrite the first record's uvarint length with a huge value (0xFF…),
-	// which would read far past the data region without the bounds guard.
-	corruptData(t, s, 0, 0, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
-
-	if _, _, _, ok, _ := s.read(0); ok {
-		t.Fatal("corrupt record should not decode ok")
+	uvarint := func(v uint64) []byte {
+		b := make([]byte, binary.MaxVarintLen64)
+		return b[:binary.PutUvarint(b, v)]
 	}
-	// A commit walking the corrupt record must also stop cleanly, not panic.
-	s.commitTo(s.writeOff)
+	cases := []struct {
+		name   string
+		prefix []byte
+	}{
+		{"unterminated varint", []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}},
+		{"wraps int when summed", uvarint(1<<63 - 1)},
+		{"negative when narrowed", uvarint(1<<64 - 1)},
+		{"larger than the segment", uvarint(1 << 40)},
+		{"one byte too long", uvarint(4096)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newTestStore(t, 4096, 0)
+			mustAppend(t, s, idxRec(1))
+			corruptData(t, s, 0, 0, tc.prefix)
+
+			if _, _, _, ok, _ := s.read(0); ok {
+				t.Fatal("corrupt record should not decode ok")
+			}
+			if _, _, ok, err := s.takeHead(); ok || !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("takeHead: ok=%v err=%v, want ErrCorrupt", ok, err)
+			}
+			// The framing is unusable, so the segment goes — and the cursors move
+			// past it. Standing still here is what wedges a queue forever.
+			if s.headOff != s.writeOff {
+				t.Fatalf("headOff=%d, want %d: the queue must advance past unusable framing",
+					s.headOff, s.writeOff)
+			}
+			if _, _, ok, err := s.takeHead(); ok || err != nil {
+				t.Fatalf("after the skip: ok=%v err=%v, want a clean empty", ok, err)
+			}
+			// A commit walking the corrupt record must also make progress, not panic
+			// and not move the cursor anywhere absurd.
+			if err := s.commitTo(s.writeOff); err != nil {
+				t.Fatalf("commitTo: %v", err)
+			}
+			if s.commitOff < 0 || s.commitOff > s.writeOff {
+				t.Fatalf("commitOff=%d outside [0,%d]", s.commitOff, s.writeOff)
+			}
+			// Only the length prefix is ever read for a record that fails the guard,
+			// so the buffer must never have been grown to the claimed record size.
+			if cap(s.readBuf) > binary.MaxVarintLen64 {
+				t.Fatalf("readBuf grew to %d: a corrupt length escaped the bound", cap(s.readBuf))
+			}
+		})
+	}
 }
 
 // TestStoreBatchedCommitAcrossSegments commits many records spanning several
@@ -552,7 +596,7 @@ func TestStoreCorruptLengthNoPanic(t *testing.T) {
 // flush and directory sync), then reopens to confirm the batch is durable.
 func TestStoreBatchedCommitAcrossSegments(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 16, 0, false, 0, 0, false) // tiny segments, sync enabled
+	s, err := openStore(dir, 16, 0, false, 0, 0) // tiny segments, sync enabled
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -571,7 +615,7 @@ func TestStoreBatchedCommitAcrossSegments(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	s2, err := openStore(dir, 16, 0, false, 0, 0, false)
+	s2, err := openStore(dir, 16, 0, false, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -584,8 +628,9 @@ func TestStoreBatchedCommitAcrossSegments(t *testing.T) {
 	}
 }
 
-// TestStoreChecksumDetectsCorruption flips a payload byte in the mapping and
-// verifies the read fails with ErrCorrupt without advancing the head cursor.
+// TestStoreChecksumDetectsCorruption flips a payload byte and verifies the blast
+// radius: the record's length still framed it inside the segment, so exactly that
+// one record is dropped and the queue moves on to the next.
 func TestStoreChecksumDetectsCorruption(t *testing.T) {
 	s, _ := newTestStore(t, 4096, 0)
 	mustAppend(t, s, idxRec(0))
@@ -594,25 +639,34 @@ func TestStoreChecksumDetectsCorruption(t *testing.T) {
 	// Corrupt the first record's payload (just past its 1-byte length prefix).
 	flipData(t, s, 0, 1, 0xFF)
 
-	if _, _, _, err := s.takeHead(); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("takeHead on corrupt record: err=%v, want ErrCorrupt", err)
+	if _, _, ok, err := s.takeHead(); ok || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("takeHead on corrupt record: ok=%v err=%v, want ErrCorrupt", ok, err)
 	}
-	if s.headOff != 0 {
-		t.Fatalf("head advanced past corrupt record: headOff=%d, want 0", s.headOff)
+	if s.headOff == 0 {
+		t.Fatal("the damaged record was not dropped: the queue would never move again")
 	}
-	// Repairing the byte lets the read succeed again — proof it was the checksum.
-	flipData(t, s, 0, 1, 0xFF)
+	// The neighbouring record is untouched — one bad byte costs one record.
 	p, _, ok, err := s.takeHead()
-	if err != nil || !ok || recIdx(p) != 0 {
-		t.Fatalf("after repair: idx=%d ok=%v err=%v", recIdx(p), ok, err)
+	if err != nil || !ok || recIdx(p) != 1 {
+		t.Fatalf("record after the damaged one: idx=%d ok=%v err=%v", recIdx(p), ok, err)
+	}
+	if got := s.lostRecords; got != 1 {
+		t.Fatalf("lostRecords=%d, want 1", got)
+	}
+	if s.lostSegments != 0 {
+		t.Fatalf("lostSegments=%d: a payload flip must not cost a whole segment", s.lostSegments)
+	}
+	if s.lostBytes == 0 {
+		t.Fatal("the dropped record's bytes were not counted")
 	}
 }
 
-// TestStoreHeaderChecksumDetected corrupts a header field on disk and verifies
-// that reopening fails with ErrCorrupt rather than trusting a bad cursor.
+// TestStoreHeaderChecksumDetected corrupts a header field on disk. The segment
+// cannot be trusted, so it is dropped and counted rather than failing the open —
+// an unopenable queue helps nobody, and the intact segments must stay reachable.
 func TestStoreHeaderChecksumDetected(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	s, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,16 +683,22 @@ func TestStoreHeaderChecksumDetected(t *testing.T) {
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openStore(dir, 4096, 0, false, 0, 0, false); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("reopen with corrupt header: got %v, want ErrCorrupt", err)
+	s2, err := openStore(dir, 4096, 0, false, 0, 0)
+	if err != nil {
+		t.Fatalf("reopen with a corrupt header: %v, want the segment dropped", err)
+	}
+	defer func() { _ = s2.close() }()
+	assertSegmentLoss(t, s2, 1)
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the unreadable segment is still on disk: %v", err)
 	}
 }
 
-// TestStoreBadFormatRejected verifies that a file with the wrong magic is
-// rejected with ErrBadFormat (and that magic is checked before the checksum).
-func TestStoreBadFormatRejected(t *testing.T) {
+// TestStoreBadMagicDropped: a file carrying the right name but not our magic
+// cannot be framed, so it goes the same way as a damaged header.
+func TestStoreBadMagicDropped(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 4096, 0, false, 0, 0, false)
+	s, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,8 +715,66 @@ func TestStoreBadFormatRejected(t *testing.T) {
 	if err := os.WriteFile(path, b, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openStore(dir, 4096, 0, false, 0, 0, false); !errors.Is(err, ErrBadFormat) {
-		t.Fatalf("reopen with bad magic: got %v, want ErrBadFormat", err)
+	s2, err := openStore(dir, 4096, 0, false, 0, 0)
+	if err != nil {
+		t.Fatalf("reopen with bad magic: %v, want the segment dropped", err)
+	}
+	defer func() { _ = s2.close() }()
+	assertSegmentLoss(t, s2, 1)
+}
+
+// TestStoreForeignVersionDropped: a segment written by a build whose framing this
+// one does not know is unreadable but undamaged, so it is dropped silently and
+// counted apart from corruption — no data-loss alarm for a format change.
+func TestStoreForeignVersionDropped(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 4096, 0, false, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, s, idxRec(0))
+	if err := s.close(); err != nil {
+		t.Fatal(err)
+	}
+	// A valid header naming a version from the future.
+	forgeHeader(t, dir, 1, func(h []byte) { h[40] = formatVersion + 7 })
+
+	s2, err := openStore(dir, 4096, 0, false, 0, 0)
+	if err != nil {
+		t.Fatalf("reopen with a foreign version: %v, want the segment dropped", err)
+	}
+	defer func() { _ = s2.close() }()
+	if s2.foreignSegments != 1 {
+		t.Fatalf("foreignSegments=%d, want 1", s2.foreignSegments)
+	}
+	if s2.foreignBytes == 0 {
+		t.Fatal("foreignBytes not counted")
+	}
+	if s2.corruptionCount() != 0 {
+		t.Fatalf("corruptions=%d: an unknown version is not damage", s2.corruptionCount())
+	}
+	if _, _, ok, err := s2.takeHead(); ok || err != nil {
+		t.Fatalf("after a foreign drop: ok=%v err=%v, want a clean empty", ok, err)
+	}
+}
+
+// assertSegmentLoss checks that n segments were dropped as damaged, and that the
+// loss is reported to a reader exactly n times before the queue reads clean.
+func assertSegmentLoss(t *testing.T, s *store, n int) {
+	t.Helper()
+	if got := s.lostSegments; got != uint64(n) {
+		t.Fatalf("lostSegments=%d, want %d", got, n)
+	}
+	if got := s.corruptionCount(); got != int64(n) {
+		t.Fatalf("corruptions=%d, want %d", got, n)
+	}
+	for i := 0; i < n; i++ {
+		if _, _, ok, err := s.takeHead(); ok || !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("loss report %d: ok=%v err=%v, want ErrCorrupt", i, ok, err)
+		}
+	}
+	if _, _, ok, err := s.takeHead(); ok || err != nil {
+		t.Fatalf("after the loss reports: ok=%v err=%v, want a clean empty", ok, err)
 	}
 }
 
@@ -665,7 +783,7 @@ func TestStoreBadFormatRejected(t *testing.T) {
 // order (old segments are remapped on demand).
 func TestStoreLazyMappingBounded(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 64, 0, true, 0, 2, false) // tiny segments, cap 2 mappings
+	s, err := openStore(dir, 64, 0, true, 0, 2) // tiny segments, cap 2 mappings
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,7 +837,7 @@ func highestDataFileNum(t *testing.T, dir string) uint64 {
 // segments stay readable in order.
 func TestStoreRecoverTornTail(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 64, 0, false, 0, 0, false)
+	s, err := openStore(dir, 64, 0, false, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -745,45 +863,66 @@ func TestStoreRecoverTornTail(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Strict open fails.
-	if _, err := openStore(dir, 64, 0, false, 0, 0, false); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("strict reopen: %v, want ErrCorrupt", err)
-	}
-	// Recovering open drops the torn tail and reports it.
-	s2, err := openStore(dir, 64, 0, false, 0, 0, true)
+	// The open drops the torn tail and reports it; the earlier segments survive.
+	s2, err := openStore(dir, 64, 0, false, 0, 0)
 	if err != nil {
-		t.Fatalf("recovering reopen: %v", err)
+		t.Fatalf("reopen: %v", err)
 	}
 	t.Cleanup(func() { s2.close() })
 	if got := s2.corruptionCount(); got != 1 {
 		t.Fatalf("corruptions=%d, want 1", got)
 	}
-	prev := -1
-	for {
-		p, off, ok, err := s2.takeHead()
-		if err != nil {
-			t.Fatalf("read after recovery: %v", err)
-		}
-		if !ok {
-			break
-		}
-		if recIdx(p) <= prev {
-			t.Fatalf("out of order: %d after %d", recIdx(p), prev)
-		}
-		prev = recIdx(p)
-		s2.commitTo(off)
+	got, events := drainRecovering(t, s2)
+	if events != 1 {
+		t.Fatalf("%d corruption events reported to the reader, want 1", events)
 	}
-	if prev < 0 {
+	if len(got) == 0 {
 		t.Fatal("expected earlier segments to survive")
+	}
+	assertAscending(t, got)
+}
+
+// drainRecovering reads a store dry the way a consumer is meant to: a corruption
+// event reports one loss and the queue has already advanced, so the loop simply
+// goes round again. It returns the records delivered and the number of events.
+func drainRecovering(t *testing.T, s *store) (delivered []int, events int) {
+	t.Helper()
+	for i := 0; ; i++ {
+		if i > 100000 {
+			t.Fatal("drain made no progress: the queue is wedged")
+		}
+		p, off, ok, err := s.takeHead()
+		switch {
+		case errors.Is(err, ErrCorrupt):
+			events++
+			continue
+		case err != nil:
+			t.Fatalf("drain: %v", err)
+		case !ok:
+			return delivered, events
+		}
+		delivered = append(delivered, recIdx(p))
+		if err := s.commitTo(off); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
 	}
 }
 
-// TestStoreRecoverSkipsCorruptSegment corrupts a record in an early segment and
-// verifies that, with recovery, the reader quarantines that segment's remainder
-// and continues delivering later records in order (last record still arrives).
-func TestStoreRecoverSkipsCorruptSegment(t *testing.T) {
+func assertAscending(t *testing.T, got []int) {
+	t.Helper()
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Fatalf("out of order: %d after %d", got[i], got[i-1])
+		}
+	}
+}
+
+// TestStoreCorruptPayloadCostsOneRecord pins the blast-radius rule on a live
+// store: a damaged payload whose length still frames it inside the segment costs
+// exactly that record. Everything else, in every segment, is delivered.
+func TestStoreCorruptPayloadCostsOneRecord(t *testing.T) {
 	dir := t.TempDir()
-	s, err := openStore(dir, 128, 0, false, 0, 0, true)
+	s, err := openStore(dir, 128, 0, false, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -792,35 +931,57 @@ func TestStoreRecoverSkipsCorruptSegment(t *testing.T) {
 	for i := 0; i < n; i++ {
 		mustAppend(t, s, idxRec(i))
 	}
-	// Corrupt a record's bytes inside the first segment (records after the first).
-	flipData(t, s, 0, 20, 0xFF)
+	// Flip a byte inside the payload of the second record of the first segment
+	// (records are 11 bytes: 1 length + 2 payload + 8 checksum).
+	flipData(t, s, 0, 12, 0xFF)
 
-	delivered := 0
-	prev := -1
-	var last int
-	for {
-		p, off, ok, err := s.takeHead()
-		if err != nil {
-			t.Fatalf("read with recovery returned error: %v", err)
-		}
-		if !ok {
-			break
-		}
-		if recIdx(p) <= prev {
-			t.Fatalf("out of order: %d after %d", recIdx(p), prev)
-		}
-		prev = recIdx(p)
-		last = recIdx(p)
-		delivered++
-		s.commitTo(off)
+	got, events := drainRecovering(t, s)
+	if events != 1 {
+		t.Fatalf("%d corruption events, want 1", events)
 	}
-	if s.corruptionCount() < 1 {
-		t.Fatal("expected at least one quarantined segment")
+	if len(got) != n-1 {
+		t.Fatalf("delivered %d records, want %d: one bad byte cost more than one record", len(got), n-1)
 	}
-	if delivered >= n {
-		t.Fatalf("expected some records dropped, delivered=%d of %d", delivered, n)
+	assertAscending(t, got)
+	if got[len(got)-1] != n-1 {
+		t.Fatalf("last delivered=%d, want %d", got[len(got)-1], n-1)
 	}
-	if last != n-1 {
-		t.Fatalf("last delivered=%d, want %d (later segments must survive)", last, n-1)
+	if s.lostRecords != 1 || s.lostSegments != 0 {
+		t.Fatalf("lostRecords=%d lostSegments=%d, want 1 and 0", s.lostRecords, s.lostSegments)
+	}
+}
+
+// TestStoreCorruptFramingCostsOneSegment is the other half: damage the length
+// prefix and the record boundaries behind it are gone with it, so the rest of
+// that segment is abandoned — but no more than that segment.
+func TestStoreCorruptFramingCostsOneSegment(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, 128, 0, false, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.close() })
+	const n = 60
+	for i := 0; i < n; i++ {
+		mustAppend(t, s, idxRec(i))
+	}
+	segRecords := int(s.files[0].written)
+	// Overwrite the second record's length prefix with an unusable one.
+	corruptData(t, s, 0, 11, []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
+
+	got, events := drainRecovering(t, s)
+	if events != 1 {
+		t.Fatalf("%d corruption events, want 1", events)
+	}
+	assertAscending(t, got)
+	if len(got) != n-(segRecords-1) {
+		t.Fatalf("delivered %d records, want %d: the loss should stop at the segment boundary",
+			len(got), n-(segRecords-1))
+	}
+	if got[len(got)-1] != n-1 {
+		t.Fatalf("last delivered=%d, want %d (later segments must survive)", got[len(got)-1], n-1)
+	}
+	if s.lostSegments != 1 {
+		t.Fatalf("lostSegments=%d, want 1", s.lostSegments)
 	}
 }
