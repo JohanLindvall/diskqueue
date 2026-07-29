@@ -301,7 +301,13 @@ func (w *DiskQueue[T]) Count() int {
 	return int(w.st.count())
 }
 
-// Size returns the bytes of uncommitted records, roughly the data on disk.
+// Size returns the bytes of uncommitted records.
+//
+// This is payload accounting, not disk usage: segments are preallocated, so what
+// the queue occupies is Stats().DiskBytes, which is a multiple of the segment
+// geometry and never smaller than this.
+//
+// It remains readable after Close and reports the final observed state.
 func (w *DiskQueue[T]) Size() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()

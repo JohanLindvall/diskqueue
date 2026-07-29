@@ -10,7 +10,19 @@ and behaviour are documented in [README.md](README.md); read it first. Its only
 dependency is `cespare/xxhash/v2` (per-record checksums); it ships its own file
 store using plain `pread`/`pwrite`/`fsync` (no mmap).
 
-- [store.go](store.go) — the `store`: the `[]byte`-only file backend (ReadAt/WriteAt).
+- [header.go](header.go) — the on-disk format alone: the constants, `dataFile`, the 64-byte
+  header accessors/setters and the checksum. Pure — no I/O, no knowledge of the store.
+  Changing anything here changes what is written to disk.
+- [record.go](record.go) — the record frame both ways: `writeRecord`, `recordAt`/`recordLen`/
+  `frameEnd`, and the guards (`fitsInRecord`, `shortReadIsCorrupt`, `growBuf`, `uvarintLen`).
+- [recovery.go](recovery.go) — the open path and nothing else: `load`, `loadFile`,
+  `startFresh`, `dropSegment`, `removeFile`, `readHeader`.
+- [store.go](store.go) — the `store`: the `[]byte`-only file backend (ReadAt/WriteAt). Keeps
+  everything whose ordering is the invariant — the handle LRU, the segment lifecycle, the
+  durability policy, `append`, the read/quarantine path, `commitTo` and the gauges. These are
+  deliberately *not* split further: pulling `writeHeader`/`flushFile` away from `append` and
+  `commitTo` would separate the calls whose order is the whole point (see the
+  data-before-header invariant below).
 - [diskqueue.go](diskqueue.go) — the generic `DiskQueue[T]` writer/owner (Add, Empty/Count/Size,
   Sync/Err/Close, NewReader) on top of `store`.
 - [reader.go](reader.go) — `Reader[T]`: all consume ops (Reserve/Take/Commit/

@@ -143,6 +143,12 @@ func (r *Reader[T]) Commit(offset int64) error {
 // It is the deliberate way past a record UnmarshalFunc rejects. Because a decode
 // error leaves the record in place — so a codec bug can never silently eat data —
 // a consumer that has decided a record is unprocessable has to say so explicitly.
+//
+// Skip acts on the SHARED head, not on a record this Reader holds. With several
+// cooperating Readers it discards whatever is at the cursor when it runs, which
+// may be a record another Reader would have handled — so call it from one
+// consumer, or coordinate. It is the one consume operation that destroys a record
+// without reading it, and the loss is not counted as corruption.
 func (r *Reader[T]) Skip() (bool, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()

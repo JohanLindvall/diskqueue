@@ -47,8 +47,9 @@ record's checksum is verified on read. Records are written with `pwrite` and rea
 `pread` into reused buffers; each file's handle is opened on demand and the
 least-recently-used handles are closed once `MaxMapped` are open, so a deep
 backlog does not hold an open descriptor per retained file. A file is dropped once
-all its records are committed — but only while writing (a new write cycling to the
-next file); reads and commits never delete files.
+all its records are committed: on the next write that cycles to a new file, and
+also at the end of a commit — so a consume-only or producer-stopped workload
+frees disk without waiting for another write.
 
 ## Install
 
@@ -178,7 +179,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
 | `Sync() error` | `fsync` the files to stable storage. |
 | `Stats() Stats` | Gauges and lifetime counters, including every loss path. See **Recovery**. |
-| `Corruptions() int64` | Corruption events since `New`; each was surfaced as one `ErrCorrupt`. |
+| `Corruptions() int64` | Corruption events since `New`; each was surfaced as one `ErrCorrupt`. Same number as `Stats().Corruptions`. |
 | `Err() error` | The latched durability failure, or nil. See **Failure handling**. |
 | `Close() error` | Flush and close (releases the directory lock). |
 
@@ -225,11 +226,12 @@ processing (at-least-once), use `Reserve`/`Commit`.
   geometry mismatch: since segments are preallocated to a known length, a file of
   the wrong size is read as `ErrSegmentSizeMismatch` only when its own header
   agrees it is complete. See **Recovery** for what a failed check costs.
-- **Reclamation.** Disk is freed a whole file at a time, once every record in a
-  file is committed, and only while writing. A read-only consumer never deletes
-  files; reclamation happens on the next `Add` that cycles to a new file. A file
-  that will not unlink stays counted, so `MaxSegments` keeps describing what is
-  really on disk, and the next reclamation retries it.
+- **Reclamation.** Disk is freed a whole file at a time, once every record in it
+  is committed. It happens on the write that cycles to a new file *and* at the end
+  of a commit, so a consumer draining a backlog with the producer stopped still
+  frees disk — you do not need another `Add` to get the space back. A file that
+  will not unlink stays counted (`Stats().Unreclaimed`), so `MaxSegments` keeps
+  describing what is really on disk, and the next reclamation retries it.
 
 ## Recovery
 
