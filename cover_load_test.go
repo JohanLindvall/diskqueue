@@ -643,11 +643,15 @@ func TestLoadRepairHeaderWriteFailureFailsTheOpen(t *testing.T) {
 // in between can never leave a full-length segment whose header points past its
 // real records (the zero fill would read back as a phantom backlog).
 //
-// The price of that ordering is asserted too: a segment left short with a header
-// that matches its length is indistinguishable from a store built with a smaller
-// SegmentSize, so reopening with the configured size is refused with
-// ErrSegmentSizeMismatch. The records are still there — no byte was lost — but
-// the store cannot be opened with its own geometry until it can be re-extended.
+// There used to be a price for that ordering: with the header matching the
+// file's shortened length, the old file-size discriminator read the segment as a
+// store built with a smaller SegmentSize and refused the configured geometry —
+// the store was locked out of its own directory until someone guessed the
+// surviving length as SegmentSize. The header now states the geometry it was
+// created under, so the next open reads the short file as exactly what it is:
+// one that lost only preallocated zero fill. It finishes the re-extension the
+// failed open could not, raises no loss event (no published byte is missing),
+// and the survivor is delivered under the configured geometry.
 func TestLoadRepairPreallocFailureFailsTheOpen(t *testing.T) {
 	if !loadIsolate(t) {
 		return // the parent; the real work happened in the child
@@ -695,19 +699,16 @@ func TestLoadRepairPreallocFailureFailsTheOpen(t *testing.T) {
 			cursor, written, headerSize+idxRecLen)
 	}
 
-	// The consequence of stopping there: with the header now matching the file's
-	// length, the short segment reads as a different geometry.
-	if mism, merr := openStore(dir, 4096, 0, false, 0, 0); !errors.Is(merr, ErrSegmentSizeMismatch) {
-		if merr == nil {
-			_ = mism.close()
-		}
-		t.Fatalf("reopen with the configured segment size: %v, want ErrSegmentSizeMismatch", merr)
-	}
-	// And no record was lost by any of it: the survivor is still readable under
-	// the geometry the repaired header describes.
-	good, err := openStore(dir, idxRecLen, 0, false, 0, 0)
+	// With the cap lifted, reopening under the CONFIGURED geometry succeeds and
+	// completes the re-extension the failed open could not. The old file-size
+	// discriminator refused this open with ErrSegmentSizeMismatch — a store locked
+	// out of its own directory over lost zero fill.
+	good, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
-		t.Fatalf("reopen with the surviving geometry: %v", err)
+		t.Fatalf("reopen with the configured segment size: %v", err)
+	}
+	if got := loadFileSize(t, dir, 1); got != headerSize+4096 {
+		t.Fatalf("segment length=%d after reopen, want the re-extended %d", got, headerSize+4096)
 	}
 	defer func() { _ = good.close() }()
 	if good.corruptionCount() != 0 || good.discardedBytes != 0 {

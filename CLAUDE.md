@@ -366,8 +366,9 @@ mirrors its own `written`/`committed` counts into its header.
   the per-op path fsyncs inline and clears `dirty`. `flushFile`/`flushBatch`/
   `sync`/`close`/`evictOpen` fsync only dirty files and skip clean ones — a file
   only read since its last flush is closed with no fsync. Under `noSync`, eviction
-  just clears `dirty` and relies on kernel writeback (the page-cache bytes survive
-  the handle being closed).
+  closes the handle with `dirty` still set (no fsync of the victim), so a later
+  explicit `Sync` reopens and flushes it — which is what keeps
+  `Stats().UnsyncedBytes` honest after `Sync` returns.
 - **Lazy open.** Files open on demand via `ensureOpen` (`read`, `commitTo`, and
   `append` for the active file); `evictOpen` closes the LRU handle beyond
   `maxOpenFiles`, never the active or just-opened file, fsyncing a dirty victim first

@@ -76,9 +76,19 @@ type dataFile struct {
 
 // Header layout (little-endian): [0:8] magic, [8:16] commit cursor, [16:24] write
 // cursor, [24:32] written count, [32:40] committed count, [40] version, [41]
-// flags, [42:56] reserved, [56:64] xxhash64 of [0:56]. The checksum is rewritten
-// on every header update so torn/rotten headers are caught on open — and it covers
-// [0:56], so the flags are protected like everything else.
+// flags, [42:50] this segment's data-region capacity, [50:56] the SegmentSize the
+// store was created with (6-byte little-endian, so any size below 256 TiB
+// round-trips exactly — the store layer accepts arbitrary sizes, not just
+// page-rounded ones), [56:64] xxhash64 of [0:56]. The checksum is rewritten on every header update so
+// torn/rotten headers are caught on open — and it covers [0:56], so the flags and
+// geometry fields are protected like everything else.
+//
+// The two geometry fields exist because file length stopped being trustworthy
+// evidence once segments could be individually sized: capacity is what bounds
+// every read and tells a short file it lost bytes, and the created-with
+// SegmentSize is the witness for ErrSegmentSizeMismatch — without it, a store
+// whose every surviving segment was oversized carried no record of the geometry
+// it was built under.
 func (df *dataFile) magic() uint64 { return binary.LittleEndian.Uint64(df.hdr[0:8]) }
 
 func (df *dataFile) version() byte { return df.hdr[40] }
@@ -124,6 +134,35 @@ func setWrittenCount(v int64) func(*dataFile) {
 
 func setCommittedCount(v int64) func(*dataFile) {
 	return func(df *dataFile) { binary.LittleEndian.PutUint64(df.hdr[32:40], uint64(v)) }
+}
+
+// hdrCapacity is the data-region capacity this segment was created with: the
+// configured SegmentSize for an ordinary segment, one record's framed length for
+// an oversized one. It bounds every offset derived from this header.
+func (df *dataFile) hdrCapacity() int64 { return int64(binary.LittleEndian.Uint64(df.hdr[42:50])) }
+
+func setHdrCapacity(v int64) func(*dataFile) {
+	return func(df *dataFile) { binary.LittleEndian.PutUint64(df.hdr[42:50], uint64(v)) }
+}
+
+// hdrSegSize is the SegmentSize the creating store was configured with — the
+// same for every segment of a store, oversized ones included, which is what
+// makes it usable as the geometry witness on reopen. Six raw little-endian
+// bytes: the store layer does not require page-rounded sizes, so the field must
+// round-trip any value, and 2^48 is far past what fallocate can reserve anyway.
+func (df *dataFile) hdrSegSize() int64 {
+	b := df.hdr[50:56]
+	return int64(uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 |
+		uint64(b[3])<<24 | uint64(b[4])<<32 | uint64(b[5])<<40)
+}
+
+func setHdrSegSize(v int64) func(*dataFile) {
+	return func(df *dataFile) {
+		u := uint64(v)
+		b := df.hdr[50:56]
+		b[0], b[1], b[2], b[3], b[4], b[5] =
+			byte(u), byte(u>>8), byte(u>>16), byte(u>>24), byte(u>>32), byte(u>>40)
+	}
 }
 
 // initHeader stamps the magic and version into a fresh header.

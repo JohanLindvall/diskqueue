@@ -336,6 +336,13 @@ func (s *store) createFile(num uint64, base, capacity int64) (*dataFile, error) 
 		(*dataFile).initHeader,
 		setCommitCursor(headerSize),
 		setWriteCursor(headerSize),
+		// Geometry, stated by the segment itself: its own capacity, and the
+		// SegmentSize the store is configured with. File length is not evidence —
+		// a short file has lost bytes and an oversized file is legitimately long —
+		// so recovery decides truncation from the capacity field and geometry
+		// mismatch from the config field, never from os.Stat.
+		setHdrCapacity(capacity),
+		setHdrSegSize(s.segmentSize),
 	}
 	if capacity > s.segmentSize {
 		mods = append(mods, setOversized())
@@ -452,8 +459,17 @@ func (s *store) append(payload []byte) error {
 	if err := faultPoint("append.writeRecord"); err != nil {
 		return err
 	}
-	if err := s.writeRecord(af, af.size, payload); err != nil {
-		return err // nothing advanced; the bytes are unreferenced and overwritable
+	werr := s.writeRecord(af, af.size, payload)
+	if int64(cap(s.writeBuf)) > s.segmentSize {
+		// An oversized record grew the frame buffer past anything an ordinary
+		// record can need. Keep it and the largest record ever seen stays resident
+		// for the queue's lifetime; drop it and the next oversized append pays one
+		// allocation. Ordinary appends never reach this — the comparison is the
+		// whole cost, so the hot path stays zero-alloc.
+		s.writeBuf = nil
+	}
+	if werr != nil {
+		return werr // nothing advanced; the bytes are unreferenced and overwritable
 	}
 	perOp := !s.noSync && !s.batched()
 	if perOp {
@@ -933,8 +949,15 @@ func (s *store) commitTo(off int64) error {
 	var cur *dataFile // file with header changes not yet written out
 	var stop error
 	advanced := false
+	var df *dataFile // carried across iterations; the walk is sequential
 	for s.commitOff < off {
-		df := s.fileForOffset(s.commitOff)
+		// Re-resolve only when the cursor leaves the carried file: re-scanning the
+		// slice per record made the walk O(records × segments) with the queue
+		// mutex held. A quarantine can jump the cursor a whole segment at a time,
+		// which the bounds check catches like any other crossing.
+		if df == nil || s.commitOff < df.base || s.commitOff >= df.base+df.size {
+			df = s.fileForOffset(s.commitOff)
+		}
 		if df == nil {
 			stop = ErrCorrupt // the cursor points at no file: nothing can advance it
 			break

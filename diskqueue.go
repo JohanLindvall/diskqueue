@@ -32,7 +32,11 @@ var (
 	ErrFull = errors.New("diskqueue: full")
 	// ErrInvalidOffset is returned by Commit for an offset beyond the last record.
 	ErrInvalidOffset = errors.New("diskqueue: invalid offset")
-	// ErrRecordTooLarge is returned by Add when a record cannot fit one segment.
+	// ErrRecordTooLarge is returned by Add for a record that can NEVER be
+	// admitted: one whose framed length exceeds Options.MaxBytes, which no amount
+	// of draining changes. It is the permanent refusal, where ErrFull is the
+	// transient one. A record merely larger than SegmentSize is not an error —
+	// it is stored in a segment sized to itself.
 	ErrRecordTooLarge = errors.New("diskqueue: record too large")
 	// ErrCorrupt is returned by a read whose data failed its integrity check: a
 	// record whose stored xxhash64 does not match, a length that overruns its
@@ -90,15 +94,17 @@ type Options struct {
 	SyncEvery int
 
 	// SegmentSize sets each segment file's capacity. Default 8 MiB, floored at
-	// 4 KiB and rounded up to a page. A record too big for one segment is
-	// rejected with ErrRecordTooLarge. Fixed at creation: reopening with a
-	// different (post-rounding) value is rejected with ErrSegmentSizeMismatch.
+	// 4 KiB and rounded up to a page. It is not a ceiling on record size: a
+	// record too big for the geometry gets a segment sized to exactly itself.
+	// Fixed at creation: reopening with a different (post-rounding) value is
+	// rejected with ErrSegmentSizeMismatch.
 	SegmentSize int64
 
 	// MaxSegments caps how many segment files are kept at once; once reached, Add
 	// returns ErrFull until a segment is committed and reclaimed. The footprint is
-	// about MaxSegments × SegmentSize bytes. 0 selects the default of 32; a
-	// negative value means unbounded.
+	// about MaxSegments × SegmentSize bytes — oversized records excepted, since
+	// their segments are as long as the record; Stats().DiskBytes reports the real
+	// number. 0 selects the default of 32; a negative value means unbounded.
 	MaxSegments int
 
 	// MaxBytes caps the uncommitted backlog in BYTES — the same number Size and
@@ -279,6 +285,13 @@ func segmentCapacity(size int64) int64 {
 	if c < segmentAlign {
 		c = segmentAlign
 	}
+	// Every header states the SegmentSize it was created under, in a 6-byte
+	// field — a 256 TiB ceiling. Clamp rather than let a preposterous
+	// configuration silently truncate the field into a spurious
+	// ErrSegmentSizeMismatch on reopen.
+	if maxSeg := int64(1)<<48 - segmentAlign; c > maxSeg {
+		return maxSeg
+	}
 	if c%segmentAlign != 0 {
 		c = (c/segmentAlign + 1) * segmentAlign
 	}
@@ -323,16 +336,16 @@ func (w *Queue[T]) Add(data T) error {
 	return err
 }
 
-// dropOversizedScratch releases the marshal buffer once it has grown past
-// anything this queue could ever store — a record has to fit one segment.
+// dropOversizedScratch releases the marshal buffer once it has grown past the
+// segment geometry — the size of the largest ORDINARY record, and therefore of
+// anything the steady state ever needs.
 //
-// The store's own buffers are bounded by that geometry, because every path into
-// them is gated on the record being storable. This one is not: it retains
-// whatever MarshalFunc produced, before anyone asks whether the record was
-// admissible, so a single rejected oversized Add would pin that capacity for the
-// life of a queue whose whole documented footprint is MaxSegments × SegmentSize.
-//
-// Error paths only, so the zero-allocation hot path never reaches it.
+// Oversized records are admitted (into segments of their own), so this runs on
+// success as well as failure: keeping the buffer would pin the largest record
+// ever marshalled for the life of the queue. The store's frame and block buffers
+// and the Reader's copy follow the same rule at their own sites (append,
+// dropBlock, trimScratch). On the hot path this is one integer compare, so the
+// zero-allocation property stands.
 func (w *Queue[T]) dropOversizedScratch() {
 	if int64(cap(w.scratch)) > w.st.segmentSize {
 		w.scratch = nil

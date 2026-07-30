@@ -32,14 +32,17 @@ The log lives in a directory of numbered files `data.00000001`, `data.00000002`,
 **preallocated** — `fallocate(2)` on Linux, `ftruncate` elsewhere — so a full
 filesystem is reported when a segment is created, while the store is still clean,
 instead of arriving as an `ENOSPC` in the middle of a record; the footprint is
-what `MaxSegments × SegmentSize` says it is. That guarantee needs real
+what `MaxSegments × SegmentSize` says it is, plus any oversized records' segments
+(`Stats().DiskBytes` reports the real number). That guarantee needs real
 `fallocate`: on non-Linux platforms, and on Linux over NFS, 9p, some FUSE and
 overlay mounts, it falls back to `ftruncate`, which reserves nothing — there
 `ENOSPC` still arrives during an `Add` (which then leaves the queue unchanged),
 and `Stats().DiskBytes` reports apparent size over a sparse file. The directory itself is held open
 for the lifetime of the queue and carries an advisory `flock`, so a second
 `New` on the same directory fails with `ErrLocked` rather than silently
-interleaving writes into the same segments. Each file
+interleaving writes into the same segments — on platforms whose standard library
+has flock; on Windows, Solaris, AIX, plan9 and js the lock is a no-op and
+nothing prevents two processes from opening the same directory. Each file
 begins with a 64-byte header — a magic number, a format version, the commit
 cursor (persisted read position), write cursor (data end), written and committed
 record counts, and an `xxhash64` over the header itself — followed by records,
@@ -210,9 +213,10 @@ processing (at-least-once), use `Reserve`/`Commit`.
 - **`Options.MaxSegments` bounds the number of segment files** kept on disk at
   once, so the footprint is about `MaxSegments × SegmentSize`. When the active
   segment fills and that many segments are already live, `Add` returns `ErrFull`
-  until a whole segment is committed and reclaimed. A record (length prefix plus
-  payload) too large to fit one segment is rejected with `ErrRecordTooLarge`. The
-  default (a zero value) is 32; a negative value means unbounded.
+  until a whole segment is committed and reclaimed. A record too large for the
+  geometry is not refused — it gets a segment sized to itself; `ErrRecordTooLarge`
+  is reserved for a record that exceeds `Options.MaxBytes`, which no draining can
+  ever admit. The default (a zero value) is 32; a negative value means unbounded.
 - **At-least-once.** The read cursor is reset to the persisted commit cursor on
   open, so after a restart any items added but not committed are replayed. Use
   `Reserve`/`Commit` for explicit acknowledgement.

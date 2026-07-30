@@ -210,7 +210,9 @@ consuming a backlog costs roughly one pread per block instead of two per record.
 
 Each segment is a 64-byte little-endian header followed by records. The header
 holds a magic number, the commit cursor, the write cursor, written and committed
-counts, a format version, and an xxhash64 over its own first 56 bytes. Each
+counts, a format version, the segment's own capacity and the SegmentSize its
+store was created with (the geometry is decided by these fields, never by file
+length), and an xxhash64 over its own first 56 bytes. Each
 record is a uvarint length, the payload, and an 8-byte xxhash64 of the payload,
 verified on every read.
 

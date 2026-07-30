@@ -310,7 +310,19 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 		return zero, 0, false, fmt.Errorf("%w: %w", ErrCodec, err)
 	}
 	delivered = true
+	r.trimScratch()
 	return v, off, true, nil
+}
+
+// trimScratch releases a scratch buffer an oversized record grew past the
+// ordinary geometry, so one exceptional record does not stay resident for the
+// Reader's lifetime. Called after the value is handed over; anything in T that
+// aliases the old array keeps it alive on its own, so the release only ever
+// costs the next read one allocation.
+func (r *Reader[T]) trimScratch() {
+	if int64(cap(r.scratch)) > r.w.st.segmentSize {
+		r.scratch = nil
+	}
 }
 
 // Requeue moves the record at the head of the queue to the BACK, without
@@ -356,5 +368,7 @@ func (r *Reader[T]) Requeue() (bool, error) {
 		return false, err
 	}
 	r.w.signal() // a waiter blocked on an empty queue can have this one
-	return true, r.w.st.commitTo(off)
+	cerr := r.w.st.commitTo(off)
+	r.trimScratch() // the copy served its purpose; don't pin an oversized one
+	return true, cerr
 }

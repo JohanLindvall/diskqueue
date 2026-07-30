@@ -225,29 +225,30 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 		return nil, 0, s.dropSegment(num, size, true)
 	}
 
-	// Segments are preallocated to their full length, so a file of any other size
-	// is either a store built with a different SegmentSize — reopening with the
-	// wrong one would discard records, so reject it — or a file that lost bytes.
-	// The header tells them apart: a write cursor past the end of the file means
-	// the bytes it published are gone.
-	// An oversized segment says so in its own header, and its length is one
-	// record's rather than the configured geometry — so it is exempt from the
-	// size check, and only from it. Without the flag "bigger than the geometry"
-	// would be indistinguishable from a store created with a LARGER SegmentSize
-	// and reopened with a smaller one, which must still be refused.
-	capacity := s.segmentSize
-	if th.oversized() {
-		capacity = max(size-headerSize, 0)
+	// The header, not the file length, is the evidence about geometry. Every
+	// segment states the SegmentSize its store was created under — the witness for
+	// the mismatch check, and the reason a store whose every surviving segment is
+	// oversized still refuses the wrong configuration — and its own capacity,
+	// which is what a file of any length is measured against. Deriving either
+	// from os.Stat, as this used to, could not tell an oversized segment from a
+	// store built at a different SegmentSize, and could not see that an oversized
+	// segment had been truncated at all.
+	if cfg := th.hdrSegSize(); cfg != s.segmentSize {
+		return nil, 0, fmt.Errorf("%w: store created with segment size %d, opened with %d",
+			ErrSegmentSizeMismatch, cfg, s.segmentSize)
 	}
-	truncated := false
-	if size != headerSize+capacity {
-		if th.writeCursor() <= size {
-			return nil, 0, fmt.Errorf("%w: store created with segment size %d, opened with %d",
-				ErrSegmentSizeMismatch, size-headerSize, s.segmentSize)
-		}
-		// Keep the records that are still there and account for the cut tail; the
-		// per-record checksum drops whatever the truncation ran into.
-		truncated = true
+	capacity := max(th.hdrCapacity(), 0)
+
+	// A file shorter than its stated capacity lost bytes; whether it lost DATA is
+	// the write cursor's call. Bytes past the cursor are preallocated zero fill,
+	// so a cut that stayed within them costs nothing — the repair in load
+	// re-extends the file and no loss event is raised. A cut that reached
+	// published bytes is corruption: count the tail, owe the reader one report.
+	// (A file LONGER than its capacity is ignored rather than diagnosed: nothing
+	// past capacity is ever addressed, so the surplus is inert.)
+	truncated := size < headerSize+capacity
+	lostTail := truncated && th.writeCursor() > size
+	if lostTail {
 		s.discardedBytes += uint64(th.writeCursor() - size)
 		s.corruptions++
 		s.pendingCorrupt++
@@ -260,13 +261,13 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	if w > headerSize+capacity {
 		w = headerSize + capacity
 	}
-	if truncated && w > size {
+	if w > size {
 		w = size // never address bytes past the real end of the file
 	}
 	df := &dataFile{num: num, path: path, hdr: h, base: base, size: w - headerSize,
 		capacity: capacity, truncated: truncated}
 	df.written = max(th.writtenCount(), 0)
-	if truncated {
+	if lostTail {
 		// The header counts records the file no longer holds, so Count() would
 		// promise a backlog no drain can deliver and the queue would never read
 		// empty again. Believe the bytes that survived instead of the header.
@@ -274,11 +275,32 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 		// An arithmetic bound (size / smallest possible frame) is not enough: it is
 		// only tight when the records are minimal, and for anything larger it sits
 		// above the header's count and never fires at all. Count the frames.
-		if n, err := s.surviveCount(df); err == nil {
+		if n, end, err := s.surviveCount(df); err == nil {
 			if gone := df.written - n; gone > 0 {
 				s.lostRecords += uint64(gone)
 			}
 			df.written = n
+			// Cut the published extent back to the last WHOLE frame, not to where
+			// the file happens to end. The bytes between the two are a partial
+			// frame, and leaving them inside the extent is what once destroyed
+			// records accepted after a clean recovery: the repair republished the
+			// write cursor beyond them, the next append landed there, and the read
+			// walk then tripped over the stale partial frame and mis-framed
+			// everything behind it — fresh, fsynced, acknowledged records included.
+			// Clamped, the repair republishes the cursor at the clean boundary and
+			// the next append overwrites the garbage.
+			if cut := df.base + df.size - end; cut > 0 {
+				s.discardedBytes += uint64(cut)
+				df.size = end - df.base
+				// The walk itself just read this segment through the block cache,
+				// which may now hold bytes past the clamped extent. The cache's
+				// soundness rests on published records being immutable — and the
+				// repair breaks exactly that premise here, republishing the write
+				// cursor at the clean boundary so a later append legitimately
+				// overwrites the partial bytes. Served stale, that cached prefix
+				// mis-frames the fresh record and destroys it; drop the block.
+				s.dropBlock()
+			}
 		}
 	}
 	df.committed = th.committedCount()
@@ -309,19 +331,24 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 // It steps with recordLen rather than its own decoder, so the frame layout stays
 // spelled in exactly one place — a change there that this missed would silently
 // produce a wrong count rather than an error.
-func (s *store) surviveCount(df *dataFile) (int64, error) {
+// It returns the count and the offset just past the last whole frame — the
+// clean boundary. The caller clamps the published extent to it, because bytes
+// past it are a partial frame that would poison every later append.
+func (s *store) surviveCount(df *dataFile) (int64, int64, error) {
 	if err := s.ensureOpen(df); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var n int64
-	for off := df.base; off < df.base+df.size; n++ {
+	off := df.base
+	for off < df.base+df.size {
 		next, ok, err := s.recordLen(df, off)
 		if err != nil || !ok {
 			break // no whole frame starts here; the rest is gone
 		}
 		off = next
+		n++
 	}
-	return n, nil
+	return n, off, nil
 }
 
 // dropSegment unlinks a segment that cannot be read and books the loss: as

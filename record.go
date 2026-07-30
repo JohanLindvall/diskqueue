@@ -99,7 +99,18 @@ func (s *store) blockAt(dataOff int64, n int) []byte {
 
 // dropBlock forgets the cached block. Called wherever a segment's published
 // extent can shrink or its file can go away.
-func (s *store) dropBlock() { s.blockFile, s.blockOff, s.blockLen = nil, 0, 0 }
+//
+// It is also where a buffer grown by an oversized record is released: readBuf
+// sized for the largest record ever read would otherwise stay resident for the
+// store's lifetime. Safe here because every consumer copies out of readBuf under
+// the same lock hold that read it, so by the time a reclamation or quarantine
+// drops the block, nothing aliases the bytes.
+func (s *store) dropBlock() {
+	s.blockFile, s.blockOff, s.blockLen = nil, 0, 0
+	if int64(cap(s.readBuf)) > s.segmentSize {
+		s.readBuf = nil
+	}
+}
 
 // fillBlock makes the cached block cover at least need bytes of df starting at
 // dataOff, reading a whole readAhead run when it can.
