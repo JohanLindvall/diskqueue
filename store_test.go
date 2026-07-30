@@ -243,13 +243,26 @@ func TestStoreMaxSegments(t *testing.T) {
 	}
 }
 
-func TestStoreRecordTooLarge(t *testing.T) {
+func TestStoreOversizedRecordGetsOwnSegment(t *testing.T) {
 	s, _ := newTestStore(t, 64, 0)
-	if err := s.append(make([]byte, 64)); !errors.Is(err, ErrRecordTooLarge) {
-		t.Fatalf("expected ErrRecordTooLarge, got %v", err)
+	// Too large for the 64-byte geometry: it gets a segment sized to itself, whose
+	// capacity is the record's framed length and nothing more, so the segment can
+	// never take a second record.
+	if err := s.append(make([]byte, 64)); err != nil {
+		t.Fatalf("oversized append: %v", err)
+	}
+	big := s.active()
+	if !big.oversized() {
+		t.Fatal("the segment holding an oversized record is not flagged oversized")
+	}
+	if big.capacity != big.size {
+		t.Fatalf("oversized segment: capacity=%d size=%d, want them equal", big.capacity, big.size)
 	}
 	if err := s.append(make([]byte, 50)); err != nil { // 1 + 50 + 8 checksum = 59 <= 64
 		t.Fatalf("50-byte record should fit: %v", err)
+	}
+	if s.active() == big {
+		t.Fatal("a second record landed in the oversized segment")
 	}
 }
 

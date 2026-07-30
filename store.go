@@ -29,10 +29,14 @@ import (
 // store is the raw, []byte-oriented file backend. Not safe for concurrent use;
 // the Queue serializes access with its own mutex.
 type store struct {
-	dir          string
-	dirFile      *os.File // held open for the whole session: directory fsync + advisory lock
-	segmentSize  int64    // capacity of each file's data region (excludes header)
-	maxSegments  int      // max number of data files retained at once; 0 == unbounded
+	dir         string
+	dirFile     *os.File // held open for the whole session: directory fsync + advisory lock
+	segmentSize int64    // capacity of each file's data region (excludes header)
+	maxSegments int      // max number of data files retained at once; 0 == unbounded
+	// maxBytes caps the uncommitted backlog in bytes; 0 == unbounded. It is an
+	// admission policy rather than a geometry, so unlike segmentSize it is not
+	// baked into anything on disk and can change between opens.
+	maxBytes     int64
 	noSync       bool
 	syncEvery    int // fsync every N writes/commits; <=1 means every one
 	maxOpenFiles int // cap on simultaneously open segment files; 0 == unbounded
@@ -77,8 +81,14 @@ type store struct {
 	nWritten   int64 // total records appended
 	nCommitted int64 // total records committed
 
-	unsynced    int    // writes/commits accumulated since the last batched flush
-	unreclaimed uint64 // failed attempts to unlink a fully-committed segment
+	unsynced int // writes/commits accumulated since the last batched flush
+	// unsyncedBytes is record bytes appended but not yet fsync'd — what a power
+	// loss would cost right now. Only the deferred policies accumulate it: the
+	// per-op path fsyncs before append returns, so it stays zero there. It is
+	// cleared only by a flush that covered every file, so a partial failure keeps
+	// over-reporting rather than under-reporting the exposure.
+	unsyncedBytes int64
+	unreclaimed   uint64 // failed attempts to unlink a fully-committed segment
 
 	// Loss accounting. Corruption is never allowed to wedge the queue, so the
 	// only way a consumer learns what a bad byte cost is through these: each
@@ -293,7 +303,7 @@ func (s *store) flushBatch() error {
 	if errs != nil {
 		return errs
 	}
-	s.unsynced = 0
+	s.unsynced, s.unsyncedBytes = 0, 0
 	return nil
 }
 
@@ -305,7 +315,7 @@ func (s *store) filePath(num uint64) string {
 // partial file again, so a failed create leaves nothing behind for the next open
 // to trip over, and returns cleanly: nothing was published, so the store is
 // exactly where it was.
-func (s *store) createFile(num uint64, base int64) (*dataFile, error) {
+func (s *store) createFile(num uint64, base, capacity int64) (*dataFile, error) {
 	path := s.filePath(num)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
@@ -318,15 +328,19 @@ func (s *store) createFile(num uint64, base int64) (*dataFile, error) {
 	}
 	// Reserve the blocks now rather than discovering a full filesystem in the
 	// middle of an append: here the segment is still empty and unreferenced.
-	if err := preallocate(f, headerSize+s.segmentSize); err != nil {
+	if err := preallocate(f, headerSize+capacity); err != nil {
 		return fail(err)
 	}
-	df := &dataFile{num: num, path: path, f: f, hdr: make([]byte, headerSize), base: base}
-	df.header(
+	df := &dataFile{num: num, path: path, f: f, hdr: make([]byte, headerSize), base: base, capacity: capacity}
+	mods := []func(*dataFile){
 		(*dataFile).initHeader,
 		setCommitCursor(headerSize),
 		setWriteCursor(headerSize),
-	)
+	}
+	if capacity > s.segmentSize {
+		mods = append(mods, setOversized())
+	}
+	df.header(mods...)
 	// Persist the header so a freshly cycled segment is a valid file on disk
 	// (magic/checksum) even before its first record is written.
 	if err := s.writeHeader(df); err != nil {
@@ -405,13 +419,23 @@ func (s *store) append(payload []byte) error {
 	}
 	L := len(payload)
 	recLen := int64(uvarintLen(uint64(L)) + L + checksumSize)
-	if recLen > s.segmentSize {
-		return ErrRecordTooLarge
+	if s.maxBytes > 0 {
+		// Two different answers, because they call for different handling. A record
+		// that cannot fit the cap on an EMPTY queue will never fit, so retrying is
+		// futile and the caller must drop or split it. One that merely does not fit
+		// right now is backpressure, and clears as the consumer drains.
+		if recLen > s.maxBytes {
+			return ErrRecordTooLarge
+		}
+		if s.size()+recLen > s.maxBytes {
+			s.nFull++
+			return ErrFull
+		}
 	}
 
 	af := s.active()
-	if af == nil || af.size+recLen > s.segmentSize {
-		if err := s.cycle(); err != nil {
+	if af == nil || af.size+recLen > af.capacity {
+		if err := s.cycle(recLen); err != nil {
 			if errors.Is(err, ErrFull) {
 				s.nFull++
 			}
@@ -469,8 +493,10 @@ func (s *store) append(payload []byte) error {
 	case s.noSync:
 		// No fsync; the record and header sit in the page cache and an explicit
 		// Sync/Close flushes them.
+		s.unsyncedBytes += recLen
 		return nil
 	case s.batched():
+		s.unsyncedBytes += recLen
 		return s.recordOp()
 	default:
 		if err := faultPoint("append.syncHeader"); err != nil {
@@ -505,12 +531,15 @@ func (s *store) rollbackAppend(af *dataFile, recLen int64) {
 
 // cycle drops any now fully-committed files and starts a fresh active file. It
 // fails with ErrFull if creating the new file would exceed maxSegments.
-func (s *store) cycle() error {
+// cycle starts a new active segment with room for at least need record bytes. A
+// record too large for the standard geometry gets a segment sized to itself, so
+// "records never span files" holds without capping record size at SegmentSize.
+func (s *store) cycle(need int64) error {
 	s.dropCommitted(nil) // the soon-to-be-old active file may go; a new one follows
 	if s.maxSegments > 0 && len(s.files) >= s.maxSegments {
 		return ErrFull
 	}
-	df, err := s.createFile(s.nextNum, s.writeOff)
+	df, err := s.createFile(s.nextNum, s.writeOff, max(s.segmentSize, need))
 	if err != nil {
 		return err
 	}
@@ -1039,11 +1068,14 @@ func (s *store) stats() Stats {
 		BacklogBytes:  s.size(),
 		Backlog:       s.count(),
 		InFlightBytes: max(s.headOff-s.commitOff, 0),
+		UnsyncedBytes: s.unsyncedBytes,
 		Segments:      len(s.files),
 		MaxSegments:   s.maxSegments,
-		// Segments are preallocated to their full length, so what they occupy is
-		// the count times the geometry — not the bytes of records in them.
-		DiskBytes:       int64(len(s.files)) * (headerSize + s.segmentSize),
+		MaxBytes:      s.maxBytes,
+		// Segments are preallocated to their full length, so what they occupy is the
+		// sum of their reserved capacities — not count × segmentSize, once an
+		// oversized record has a segment sized to itself.
+		DiskBytes:       s.diskBytes(),
 		Added:           s.nAdded,
 		Delivered:       s.nDelivered,
 		Committed:       s.nCommittedTotal,
@@ -1073,7 +1105,7 @@ func (s *store) sync() error {
 	if errs != nil {
 		return errs
 	}
-	s.unsynced = 0 // a full flush makes any batched-but-unsynced ops durable
+	s.unsynced, s.unsyncedBytes = 0, 0 // a full flush makes the batched ops durable
 	return nil
 }
 
@@ -1130,4 +1162,15 @@ func (s *store) close() error {
 		s.dirFile = nil
 	}
 	return first
+}
+
+// diskBytes is what the live segments occupy, preallocated slack included. It
+// sums each segment's own capacity rather than multiplying by segmentSize,
+// because an oversized record's segment is sized to that record.
+func (s *store) diskBytes() int64 {
+	var n int64
+	for _, df := range s.files {
+		n += headerSize + df.capacity
+	}
+	return n
 }

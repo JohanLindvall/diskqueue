@@ -43,13 +43,18 @@ type dataFile struct {
 	// path is this segment's file name, built once. ensureOpen and dropCommitted
 	// would otherwise rebuild it with fmt.Sprintf on every eviction cycle, which
 	// profiling put at 45% of the allocations under a capped open-file count.
-	path      string
-	f         *os.File // open handle, or nil when not currently open
-	hdr       []byte   // resident copy of the 64-byte header (page 0)
-	base      int64    // global offset of this file's first data byte
-	size      int64    // bytes of records written into the data region (excludes header)
-	written   int64    // number of records written (mirrors the header)
-	committed int64    // number of records committed (mirrors the header)
+	path string
+	f    *os.File // open handle, or nil when not currently open
+	hdr  []byte   // resident copy of the 64-byte header (page 0)
+	base int64    // global offset of this file's first data byte
+	size int64    // bytes of records written into the data region (excludes header)
+	// capacity is how many record bytes this segment's data region can hold. It is
+	// the store's segmentSize for an ordinary segment, and exactly one record's
+	// framed length for an oversized one — which is what keeps "records never span
+	// files" true for a record bigger than a segment.
+	capacity  int64
+	written   int64 // number of records written (mirrors the header)
+	committed int64 // number of records committed (mirrors the header)
 
 	// Intrusive LRU links, valid only while open (f != nil). The store threads
 	// open files from mru (most-recently-used) toward lru via prev.
@@ -70,12 +75,29 @@ type dataFile struct {
 }
 
 // Header layout (little-endian): [0:8] magic, [8:16] commit cursor, [16:24] write
-// cursor, [24:32] written count, [32:40] committed count, [40] version, [41:56]
-// reserved, [56:64] xxhash64 of [0:56]. The checksum is rewritten on every header
-// update so torn/rotten headers are caught on open.
+// cursor, [24:32] written count, [32:40] committed count, [40] version, [41]
+// flags, [42:56] reserved, [56:64] xxhash64 of [0:56]. The checksum is rewritten
+// on every header update so torn/rotten headers are caught on open — and it covers
+// [0:56], so the flags are protected like everything else.
 func (df *dataFile) magic() uint64 { return binary.LittleEndian.Uint64(df.hdr[0:8]) }
 
 func (df *dataFile) version() byte { return df.hdr[40] }
+
+// flagOversized marks a segment sized to hold ONE record too large for the
+// configured SegmentSize, rather than to the standard geometry.
+//
+// It has to be on disk rather than inferred, because without it "this file is
+// bigger than headerSize+segmentSize" is ambiguous: it equally describes a store
+// created with a LARGER SegmentSize and reopened with a smaller one, which must
+// still be rejected with ErrSegmentSizeMismatch instead of being silently
+// accepted and half-read.
+const flagOversized = 1 << 0
+
+func (df *dataFile) oversized() bool { return df.hdr[41]&flagOversized != 0 }
+
+func setOversized() func(*dataFile) {
+	return func(df *dataFile) { df.hdr[41] |= flagOversized }
+}
 
 func (df *dataFile) commitCursor() int64 { return int64(binary.LittleEndian.Uint64(df.hdr[8:16])) }
 

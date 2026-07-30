@@ -90,7 +90,7 @@ handle `syncDir` fsyncs and the thing the advisory `flock` hangs on, so closing 
 store releases the lock. 64-byte LE header:
 `[0:8]` magic, `[8:16]` commit cursor (next uncommitted record), `[16:24]` write
 cursor (data end), `[24:32]` written count, `[32:40]` committed count, `[40]`
-version, `[56:64]` xxhash64 of `[0:56]`; then records, each
+version, `[41]` flags (`flagOversized`), `[56:64]` xxhash64 of `[0:56]`; then records, each
 `uvarint(len) || payload || xxhash64(payload)` (8-byte LE checksum trailer,
 verified on read — mismatch → `ErrCorrupt`, and the record is dropped). Records
 are written with one `WriteAt` (framed in the reused `s.writeBuf`) and read with
@@ -196,11 +196,29 @@ mirrors its own `written`/`committed` counts into its header.
   (closing its handle and removing it) — but the scratch copy already happened
   (read precedes commit), so the held value stays valid. A concurrent `Add`'s
   `dropCommitted` can do the same. All store ops hold the Queue mutex.
-- **`maxSegments` bounds the file count.** `cycle` drops committed files, then
-  returns `ErrFull` if `len(files) >= maxSegments` (0 = unbounded). So the bound
-  is on *segments*, not bytes; footprint ≈ `maxSegments × segmentSize`.
-- **Records never span files.** `append` cycles when `size+recLen > segmentSize`.
-  A record bigger than `segmentSize` is `ErrRecordTooLarge`.
+- **Two independent caps, and they mean different things.** `maxSegments` bounds
+  the *file count* (`cycle` drops committed files, then returns `ErrFull` if
+  `len(files) >= maxSegments`; 0 = unbounded). `maxBytes` bounds the *uncommitted
+  backlog in bytes*, checked in `append` before anything is written. Whichever
+  binds first wins. `maxBytes` is an admission policy, not a geometry — it is
+  deliberately **not** an `openStore` parameter and is set on the store after the
+  open, so recovery never consults it and a store written under one cap reopens
+  cleanly under another. A record longer than `maxBytes` returns
+  `ErrRecordTooLarge` (permanent — no amount of draining admits it) rather than
+  `ErrFull` (transient).
+- **Records never span files — but `SegmentSize` is not a ceiling on record size.**
+  `append` cycles when `size+recLen > df.capacity`, which is per-file: ordinary
+  segments get `segmentSize`, and a record too large for that gets a segment sized
+  to exactly its framed length. `cycle(need)` reserves `max(segmentSize, need)`.
+  Such a segment sets `flagOversized` in header byte `[41]` (inside the checksummed
+  `[0:56]`), and `loadFile` exempts it from the geometry check *by that flag only*.
+  The flag cannot be inferred: "longer than `headerSize+segmentSize`" equally
+  describes a store created with a **larger** `SegmentSize` and reopened with a
+  smaller one, which must still be `ErrSegmentSizeMismatch` rather than silently
+  half-read. Because its capacity equals its size, an oversized segment can never
+  take a second record. `Stats().DiskBytes` sums per-file capacity (`diskBytes()`),
+  not `len(files) × segmentSize`. `Add` drops an outsized `w.scratch` on **success**
+  as well as failure, or one huge record pins its buffer for the queue's lifetime.
 - **Recovery (`load`) reads no records — with exactly one licensed exception.** Reopen preads each file's 64-byte header
   (no mapping) in `loadFile`, validates it, and takes the data end from the write
   cursor and the `written` count from the header, with `commitOff` from the first
@@ -363,6 +381,17 @@ mirrors its own `written`/`committed` counts into its header.
 
 - `Take`/`Drain`/`Follow` advance `headOff` and commit; `Reserve` advances
   `headOff` without committing (so `Empty()` can be true while `Count() > 0`).
+- `Reader.Requeue` moves the head record to the tail: it appends *first* and
+  commits the head *second*, because the reverse loses the record outright if the
+  append fails. The consequence is that a failed commit after a successful append
+  leaves the record twice, which at-least-once already permits; a failed append
+  moves nothing (`rewindHead`). It breaks FIFO for that record by design, and like
+  `Skip` it acts on the **shared** head, not on a record the calling Reader holds.
+- `Stats().UnsyncedBytes` counts record bytes appended on the *deferred* paths
+  only (`noSync`, `batched`) — the per-op path fsyncs before `append` returns, so
+  it stays 0 there. It is incremented after `writeHeader` succeeds, so a rolled-back
+  append never contributes, and cleared only by a flush that covered every file
+  (`flushBatch`, `sync`), so a partial failure over-reports rather than under-reports.
 - `Take`/`TryTake` can return **a value and a non-nil error**: the read succeeded
   and the commit did not. Callers that check `err` first simply let the item replay,
   which is safe; don't "fix" it into dropping the value.

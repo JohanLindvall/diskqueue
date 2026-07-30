@@ -57,9 +57,12 @@ cancelled or the queue is closed. Both are [iter.Seq], so an error cannot travel
 with the values — check [Reader.Err] after the loop, or an I/O failure is
 indistinguishable from an empty queue.
 
-[Reader.Skip] discards the record at the head without decoding it. It is the
-sanctioned way past a record the codec will never accept, because a decode
-failure deliberately leaves the record in place (see [ErrCodec]).
+A record the consumer cannot process would otherwise block the head forever, so
+there are two ways past it. [Reader.Skip] discards it without decoding — the
+sanctioned route past a record the codec will never accept, since a decode failure
+deliberately leaves the record in place (see [ErrCodec]). [Reader.Requeue] moves it
+to the back instead, so a single poison record costs a reordering rather than
+either data loss or a stalled queue.
 
 # Durability
 
@@ -125,8 +128,12 @@ to the queue — a bulk nack for a consumer that is shutting down or has failed.
 
 [Queue.Stats] returns a plain struct — no metrics registry is imposed on the
 caller, and no callback of theirs runs under the queue's lock. It carries gauges
-(backlog, in-flight bytes, segment count, disk footprint), lifetime counters
-(added, delivered, committed), and the loss counters.
+(backlog, in-flight bytes, unsynced bytes, segment count, disk footprint),
+lifetime counters (added, delivered, committed), and the loss counters.
+
+[Stats].UnsyncedBytes is what a power loss would cost right now. It is always zero
+under the default per-op policy and climbs under NoSync or SyncEvery > 1 until a
+flush; if it keeps climbing, the [Options].SyncInterval backstop is not keeping up.
 
 [Stats].Corruptions is the field to alert on: it counts events, each of which was
 or will be surfaced as one [ErrCorrupt]. [Stats].LostBytes, LostRecords and
@@ -140,10 +147,18 @@ carries its magnitude.
 
 Storage is a directory of numbered, preallocated segment files.
 [Options].SegmentSize sets each one (8 MiB by default) and [Options].MaxSegments
-caps how many exist at once (32 by default), so the footprint is bounded at about
-their product. Records never span segments, so a record larger than one segment
-is rejected with [ErrRecordTooLarge]. When the cap is reached, [Queue.Add]
-returns [ErrFull] until a segment is fully committed and reclaimed.
+caps how many exist at once (32 by default). [Options].MaxBytes additionally caps
+the backlog in bytes, which is the budget operators actually reason about; the two
+compose, and whichever binds first returns [ErrFull]. Watch
+[Stats].BacklogBytes against [Stats].MaxBytes — "70% and climbing" is a signal, a
+bare byte count is not.
+
+Records never span segments, but that does not make [Options].SegmentSize a
+ceiling on record size: a record too large for the geometry gets a segment sized
+to itself, flagged as such in its header so a reopen can tell it apart from a
+store built at a different SegmentSize. [ErrRecordTooLarge] is now reserved for a
+record larger than [Options].MaxBytes, which no amount of draining can ever admit —
+as opposed to [ErrFull], which clears as the consumer catches up.
 
 Segments are preallocated with fallocate where available, so a full filesystem is
 discovered at segment creation rather than mid-record. [Options].MaxOpenFiles

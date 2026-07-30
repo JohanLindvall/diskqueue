@@ -312,3 +312,49 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 	delivered = true
 	return v, off, true, nil
 }
+
+// Requeue moves the record at the head of the queue to the BACK, without
+// decoding it; ok is false when the queue is empty.
+//
+// It is the answer to a poison record — one the consumer cannot process and that
+// would otherwise block the head forever. Skip is the other answer and it
+// destroys the record; Requeue keeps it and lets everything behind it drain, so a
+// single unprocessable item costs a reordering rather than either data loss or a
+// stalled queue. Watch for it with Stats(): Delivered climbing while Committed
+// stays flat on a non-empty backlog is a head record nobody can retire.
+//
+// The record is re-appended and only then committed at the head, in that order,
+// because the reverse would lose it outright if the append failed. That ordering
+// has a consequence: if the append succeeds and the commit does not, the record
+// exists twice — once at the tail and once still at the head — which is what
+// at-least-once already permits. A failed append moves nothing and leaves the
+// record where it was, so ErrFull is safe to retry once the consumer has drained.
+//
+// Two caveats. It BREAKS FIFO order for the record it moves, which is the point;
+// a queue whose ordering is load-bearing should not use it. And like Skip it acts
+// on the SHARED head rather than on a record this Reader is holding, so with
+// several cooperating Readers it moves whatever is at the cursor when it runs —
+// call it from one consumer, or coordinate.
+func (r *Reader[T]) Requeue() (bool, error) {
+	r.w.mu.Lock()
+	defer r.w.mu.Unlock()
+	if r.w.closed {
+		return false, ErrClosed
+	}
+	start := r.w.st.headOffset()
+	payload, off, ok, err := r.w.st.takeHead()
+	if err != nil || !ok {
+		return false, err
+	}
+	// Copy out of the store's shared read buffer before appending: the append path
+	// owns writeBuf, not readBuf, but every other consume op copies under the lock
+	// for exactly this reason and a single-caller exception is how that stops being
+	// true. The Reader's scratch is already the buffer for it.
+	r.scratch = append(r.scratch[:0], payload...)
+	if err := r.w.st.append(r.scratch); err != nil {
+		r.w.st.rewindHead(start) // nothing was published; leave it at the head
+		return false, err
+	}
+	r.w.signal() // a waiter blocked on an empty queue can have this one
+	return true, r.w.st.commitTo(off)
+}

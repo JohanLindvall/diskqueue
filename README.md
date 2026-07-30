@@ -176,13 +176,13 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | Method | Description |
 | --- | --- |
 | `New[T](path, marshal, unmarshal, ...Options)` | Open/create a Queue at `path` (segment cap via `Options.MaxSegments`, default 32). |
-| `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments`, `ErrRecordTooLarge` if it can't fit a segment. |
+| `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments` or `MaxBytes` (transient), `ErrRecordTooLarge` if it can never fit under `MaxBytes` (permanent). A record too big for one segment gets a segment of its own. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
 | `Empty() bool` | Whether anything is available to read. |
 | `Count() int` | Number of items added but not yet committed. |
 | `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
 | `Sync() error` | `fsync` the files to stable storage. |
-| `Stats() Stats` | Gauges and lifetime counters, including every loss path. See **Recovery**. |
+| `Stats() Stats` | Gauges and lifetime counters, including every loss path. `UnsyncedBytes` is what a power loss would cost right now; `BacklogBytes`/`MaxBytes` is the utilisation to alert on. See **Recovery**. |
 | `Rewind() (int64, error)` | Return every delivered-but-uncommitted record to the queue. The nack for `Reserve`. Watch `Stats().InFlightBytes` to know when it is needed. |
 | `Err() error` | The latched durability failure, or nil. See **Failure handling**. |
 | `Close() error` | Flush and close (releases the directory lock). |
@@ -196,7 +196,8 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Reserve(ctx) (T, bool, int64, error)` | Block until an item is available, then read it. |
 | `Take(ctx) (T, bool, error)` | Block until an item is available, then read + commit. |
 | `Commit(offset int64) error` | Mark the entry at `offset` and all before it consumed; reclaim space. |
-| `Skip() (bool, error)` | Consume and commit the head record without decoding it. |
+| `Skip() (bool, error)` | Consume and commit the head record without decoding it — discards it. |
+| `Requeue() (bool, error)` | Move the head record to the **back** without decoding it. The non-destructive way past a poison record: it costs a reordering instead of data loss or a stalled head. |
 | `Drain(ctx) iter.Seq[T]` | Drain items present at call time (commits each). |
 | `Follow(ctx) iter.Seq[T]` | Drain existing then future items until `ctx` is cancelled (commits each). |
 | `Err() error` | Why the last `Drain`/`Follow` stopped; nil if it simply ran out. |
@@ -365,19 +366,36 @@ and the queue is left in a state you can reason about.
 
 ```go
 diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
-	MaxSegments:    0,    // 0 = 32 default; N>0 = cap live files (ErrFull); <0 = unbounded
-	NoSync:         true, // skip fsync per write/commit (faster, no power-loss durability)
-	SyncEvery:      0,    // 0/1 = fsync every op; N>1 = batch the fsync over N ops
-	SyncInterval:   0,    // >0 = background flush every interval (backstop for SyncEvery)
-	SegmentSize:    0,    // 0 = 8 MiB default; floored and rounded up to 4 KiB
-	MaxOpenFiles:      0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 3
+	MaxSegments:  0,    // 0 = 32 default; N>0 = cap live files (ErrFull); <0 = unbounded
+	MaxBytes:     0,    // 0 = no byte cap; N>0 = cap the uncommitted backlog in bytes (ErrFull)
+	NoSync:       true, // skip fsync per write/commit (faster, no power-loss durability)
+	SyncEvery:    0,    // 0/1 = fsync every op; N>1 = batch the fsync over N ops
+	SyncInterval: 0,    // >0 = background flush every interval (backstop for SyncEvery)
+	SegmentSize:  0,    // 0 = 8 MiB default; floored and rounded up to 4 KiB
+	MaxOpenFiles: 0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 3
 })
 ```
+
+The two caps compose and answer different questions. `MaxSegments` bounds the
+**file count**, so the footprint that follows from it is `MaxSegments ×
+SegmentSize` — a ceiling on disk rather than a budget on the backlog, and a queue
+holding one record per segment can be nowhere near its byte cap while at its
+segment cap. `MaxBytes` bounds the **uncommitted backlog in bytes**, which is what
+an outage budget is actually sized in; `Stats().BacklogBytes / Stats().MaxBytes` is
+the utilisation ratio to alert on. Whichever binds first returns `ErrFull`, and the
+queue is left untouched, so the caller chooses: block, drop, or shed load upstream.
+
+A record larger than `MaxBytes` can never be accepted on an empty queue either, so
+it is refused with `ErrRecordTooLarge` — permanent, where `ErrFull` is transient
+and clears as the consumer drains.
 
 `SyncEvery` trades a bounded power-loss window for throughput: with `SyncEvery: N`
 the fsync cost is amortized over N writes/commits, so up to the last N unsynced
 operations can be lost on power loss (they still survive a process crash, and a
 torn tail is caught by the per-record checksum). `Close` and `Sync` always flush.
+`Stats().UnsyncedBytes` reports that window as a number — zero under the default
+per-op policy, climbing under `NoSync` or `SyncEvery > 1` until a flush. If it
+keeps climbing, the `SyncInterval` backstop is not keeping up.
 The speed-up is large — on a laptop NVMe, durable `Add` goes from ~1.6 ms/op at
 `SyncEvery: 1` to ~9 µs at `SyncEvery: 100` and ~1.1 µs at `SyncEvery: 1000`.
 
@@ -387,6 +405,13 @@ store created on a 4 KiB-page machine would not reopen on a 64 KiB-page one).
 Reopening an existing store with a different (post-rounding) `SegmentSize` is
 rejected with `ErrSegmentSizeMismatch` rather than truncating the files and
 discarding committed records.
+
+It is not, however, a ceiling on record size. Records never span segments — that is
+the invariant — but a record too large for the configured geometry gets a segment
+sized to exactly itself, marked as such in that segment's header so a reopen can
+tell it apart from a store built at a different `SegmentSize`. Such a segment holds
+that one record and nothing else, and `Stats().DiskBytes` reports the real
+footprint rather than `segments × SegmentSize`.
 
 ## License
 

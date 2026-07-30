@@ -140,7 +140,7 @@ func (s *store) load() error {
 		// open would reject the whole store with ErrSegmentSizeMismatch. Re-extended,
 		// it is an ordinary partly-filled segment whose tail is zero fill, which is
 		// what every other segment looks like.
-		if err := preallocate(df.f, headerSize+s.segmentSize); err != nil {
+		if err := preallocate(df.f, headerSize+df.capacity); err != nil {
 			return err
 		}
 		df.truncated = false
@@ -156,14 +156,14 @@ func (s *store) load() error {
 	// Reserving it again is a no-op if it is already allocated. Deliberately
 	// best-effort: making this fatal would stop a queue on a full disk from being
 	// opened to drain it, which is exactly when opening it matters most.
-	_ = preallocate(af.f, headerSize+s.segmentSize)
+	_ = preallocate(af.f, headerSize+af.capacity)
 	return nil
 }
 
 // startFresh creates segment num as the sole (active) file, for an empty
 // directory or one whose every segment turned out to be a dropped torn tail.
 func (s *store) startFresh(num uint64) error {
-	df, err := s.createFile(num, s.writeOff)
+	df, err := s.createFile(num, s.writeOff, s.segmentSize)
 	if err != nil {
 		return err
 	}
@@ -230,8 +230,17 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	// wrong one would discard records, so reject it — or a file that lost bytes.
 	// The header tells them apart: a write cursor past the end of the file means
 	// the bytes it published are gone.
+	// An oversized segment says so in its own header, and its length is one
+	// record's rather than the configured geometry — so it is exempt from the
+	// size check, and only from it. Without the flag "bigger than the geometry"
+	// would be indistinguishable from a store created with a LARGER SegmentSize
+	// and reopened with a smaller one, which must still be refused.
+	capacity := s.segmentSize
+	if th.oversized() {
+		capacity = max(size-headerSize, 0)
+	}
 	truncated := false
-	if size != headerSize+s.segmentSize {
+	if size != headerSize+capacity {
 		if th.writeCursor() <= size {
 			return nil, 0, fmt.Errorf("%w: store created with segment size %d, opened with %d",
 				ErrSegmentSizeMismatch, size-headerSize, s.segmentSize)
@@ -248,13 +257,14 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	if w < headerSize {
 		w = headerSize
 	}
-	if w > headerSize+s.segmentSize {
-		w = headerSize + s.segmentSize
+	if w > headerSize+capacity {
+		w = headerSize + capacity
 	}
 	if truncated && w > size {
 		w = size // never address bytes past the real end of the file
 	}
-	df := &dataFile{num: num, path: path, hdr: h, base: base, size: w - headerSize, truncated: truncated}
+	df := &dataFile{num: num, path: path, hdr: h, base: base, size: w - headerSize,
+		capacity: capacity, truncated: truncated}
 	df.written = max(th.writtenCount(), 0)
 	if truncated {
 		// The header counts records the file no longer holds, so Count() would

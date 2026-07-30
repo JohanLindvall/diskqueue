@@ -101,6 +101,24 @@ type Options struct {
 	// negative value means unbounded.
 	MaxSegments int
 
+	// MaxBytes caps the uncommitted backlog in BYTES — the same number Size and
+	// Stats().BacklogBytes report. Past it, Add returns ErrFull and the queue is
+	// left untouched, so the caller chooses: block, drop, or shed load upstream.
+	// 0 (the default) applies no byte cap, leaving MaxSegments as the only bound.
+	//
+	// It is worth setting because MaxSegments bounds the FILE COUNT, and the
+	// footprint that follows from it (MaxSegments × SegmentSize) is a ceiling on
+	// disk rather than a budget on the backlog: a queue holding one record per
+	// segment is nowhere near its byte cap but may be at its segment cap. Sizing an
+	// outage budget in bytes is the thing operators actually want to do, and
+	// BacklogBytes/MaxBytes is the utilisation ratio to alert on — "70% and
+	// climbing" is a signal, a bare byte count is not.
+	//
+	// The two caps compose: whichever binds first returns ErrFull. A record larger
+	// than the cap itself can never be accepted and is refused with
+	// ErrRecordTooLarge, which is permanent, rather than ErrFull, which is not.
+	MaxBytes int64
+
 	// MaxOpenFiles caps how many segment files are kept open at once. Segments are
 	// opened on demand and the least-recently-used handles are closed beyond the
 	// cap, bounding open descriptors for deep backlogs; the active segment is
@@ -129,6 +147,16 @@ type Stats struct {
 	// Gauges.
 	BacklogBytes int64 // uncommitted bytes: the same number as Size
 	Backlog      int64 // uncommitted records: the same number as Count
+	// UnsyncedBytes is record bytes that are written but not yet fsync'd: what a
+	// power loss would cost right now, and how far a deferred sync policy has run
+	// ahead of the last flush. It is always zero under the default per-op policy,
+	// which fsyncs before Add returns, and climbs under NoSync or SyncEvery > 1
+	// until a Sync, a batch flush or Close brings it back to zero.
+	//
+	// A process crash does not lose these bytes — the kernel owns the pages — so
+	// this measures exposure to power loss and kernel panic specifically. Watch it
+	// against SyncInterval: if it keeps climbing, the backstop is not keeping up.
+	UnsyncedBytes int64
 	// InFlightBytes is the bytes handed to a reader but not yet committed —
 	// BacklogBytes minus what is still unread. It is the state Rewind exists to
 	// undo, and the number behind the documented oddity that Empty can be true
@@ -136,7 +164,8 @@ type Stats struct {
 	// taking work and not acknowledging it.
 	InFlightBytes int64
 	Segments      int   // live segment files
-	MaxSegments   int   // the configured cap; 0 when unbounded
+	MaxSegments   int   // the configured segment-count cap; 0 when unbounded
+	MaxBytes      int64 // the configured backlog byte cap; 0 when unbounded
 	DiskBytes     int64 // what the segment files occupy, including preallocated slack
 
 	// Counters since New.
@@ -204,6 +233,10 @@ func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T],
 	if err != nil {
 		return nil, err
 	}
+	// Set after the open rather than passed through it: the byte cap governs what
+	// Add will accept, not how the store is laid out, so recovery never consults it
+	// and a store written under one cap reopens cleanly under another.
+	st.maxBytes = max(opt.MaxBytes, 0)
 	w := &Queue[T]{marshal: marshal, unmarshal: unmarshal, st: st}
 	if opt.SyncInterval > 0 && !opt.NoSync {
 		w.syncStop = make(chan struct{})
@@ -276,9 +309,12 @@ func (w *Queue[T]) Add(data T) error {
 	}
 	before := w.st.writeOffset()
 	err = w.st.append(b)
-	if err != nil {
-		w.dropOversizedScratch()
-	}
+	// Release a scratch buffer an outsized record grew past the segment geometry —
+	// on SUCCESS as well as failure, now that a record larger than a segment is
+	// accepted rather than refused. Such records are by definition exceptional, and
+	// pinning the largest one ever seen for the lifetime of the queue is a memory
+	// leak in all but name. The next Add pays one allocation for it.
+	w.dropOversizedScratch()
 	// Wake waiters whenever the record landed, so a durability error doesn't also
 	// strand a blocked consumer on a record that is in the log.
 	if w.st.writeOffset() != before {

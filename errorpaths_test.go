@@ -177,7 +177,7 @@ func TestCreateFileLeavesNoResidue(t *testing.T) {
 	}
 	defer func() { _ = os.Chmod(dir, 0o755) }()
 
-	if _, err := s.createFile(s.nextNum, s.writeOff); err == nil {
+	if _, err := s.createFile(s.nextNum, s.writeOff, s.segmentSize); err == nil {
 		t.Fatal("createFile into an unwritable directory should fail")
 	}
 	if err := os.Chmod(dir, 0o755); err != nil {

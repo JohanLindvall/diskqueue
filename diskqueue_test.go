@@ -1,6 +1,7 @@
 package diskqueue
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -403,7 +404,7 @@ func TestReopenMultiFile(t *testing.T) {
 	}
 }
 
-func TestRecordTooLarge(t *testing.T) {
+func TestOversizedRecordGetsItsOwnSegment(t *testing.T) {
 	w, err := New[[]byte](t.TempDir(),
 		func(dst []byte, v []byte) ([]byte, error) { return append(dst, v...), nil },
 		func(data []byte) ([]byte, error) { return data, nil },
@@ -412,12 +413,29 @@ func TestRecordTooLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	if err := w.Add(make([]byte, 5000)); !errors.Is(err, ErrRecordTooLarge) {
-		t.Fatalf("expected ErrRecordTooLarge, got %v", err)
+	// A record too large for the configured geometry is accepted into a segment
+	// sized to itself, rather than refused. "Records never span files" is what the
+	// invariant actually requires, and an oversized segment keeps that true without
+	// making SegmentSize a ceiling on what the queue can carry.
+	big := make([]byte, 5000)
+	for i := range big {
+		big[i] = byte(i)
 	}
-	// A record that fits is still accepted.
+	if err := w.Add(big); err != nil {
+		t.Fatalf("oversized add: %v", err)
+	}
+	// A record that fits is still accepted, into a segment of its own.
 	if err := w.Add(make([]byte, 100)); err != nil {
 		t.Fatalf("small add: %v", err)
+	}
+	// And the big one comes back byte-for-byte.
+	r := w.NewReader()
+	got, ok, err := r.TryTake()
+	if !ok || err != nil {
+		t.Fatalf("take: ok=%v err=%v", ok, err)
+	}
+	if !bytes.Equal(got, big) {
+		t.Fatalf("oversized record round-tripped as %d bytes, want %d", len(got), len(big))
 	}
 }
 

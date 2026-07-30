@@ -342,8 +342,11 @@ func TestOversizedAddReleasesScratch(t *testing.T) {
 	}
 	defer func() { _ = w.Close() }()
 
-	if err := w.Add(8 << 20); !errors.Is(err, ErrRecordTooLarge) {
-		t.Fatalf("oversized Add: %v, want ErrRecordTooLarge", err)
+	// The oversized record is ACCEPTED now, which is exactly why the scratch must
+	// still be released: a queue that took one 8 MiB record and then a million
+	// small ones would otherwise pin 8 MiB for its whole life.
+	if err := w.Add(8 << 20); err != nil {
+		t.Fatalf("oversized Add: %v", err)
 	}
 	if got := int64(cap(w.scratch)); got > seg {
 		t.Fatalf("scratch pinned at %d bytes on a queue whose records cap at %d", got, seg)
