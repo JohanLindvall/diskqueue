@@ -340,7 +340,16 @@ func (r *Reader[T]) trimScratch() {
 // has a consequence: if the append succeeds and the commit does not, the record
 // exists twice — once at the tail and once still at the head — which is what
 // at-least-once already permits. A failed append moves nothing and leaves the
-// record where it was, so ErrFull is safe to retry once the consumer has drained.
+// record where it was.
+//
+// The re-append is EXEMPT from MaxBytes and MaxSegments. The rotation is
+// backlog-neutral — the tail copy is followed immediately by the commit that
+// retires the head original, so the net backlog is unchanged and the overshoot
+// is transiently one record (at worst one segment). Enforcing the caps here
+// inverted the method's purpose: commits are a cursor, so nothing behind an
+// unprocessable head can retire first, and a poison head at a FULL queue —
+// exactly when rotation matters most — could then never be moved, wedging the
+// queue and pinning its disk across restarts.
 //
 // Two caveats. It BREAKS FIFO order for the record it moves, which is the point;
 // a queue whose ordering is load-bearing should not use it. And like Skip it acts
@@ -363,7 +372,7 @@ func (r *Reader[T]) Requeue() (bool, error) {
 	// for exactly this reason and a single-caller exception is how that stops being
 	// true. The Reader's scratch is already the buffer for it.
 	r.scratch = append(r.scratch[:0], payload...)
-	if err := r.w.st.append(r.scratch); err != nil {
+	if err := r.w.st.appendRecord(r.scratch, true); err != nil {
 		r.w.st.rewindHead(start) // nothing was published; leave it at the head
 		return false, err
 	}

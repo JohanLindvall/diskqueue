@@ -223,12 +223,17 @@ func TestRequeueMovesPoisonRecordToTheBack(t *testing.T) {
 	}
 }
 
-// TestRequeueFailedAppendLeavesRecordAtHead: the append comes first precisely so
-// a failure loses nothing. If it could commit the head and then fail to re-append,
-// Requeue would be a data-loss path wearing the name of a recovery one.
-func TestRequeueFailedAppendLeavesRecordAtHead(t *testing.T) {
+// TestRequeueRotatesAtFullQueue pins the cap exemption: Requeue is the answer
+// to a poison head, and a poison head at a FULL queue is exactly when the
+// answer is needed — commits are a cursor, so nothing behind the head can
+// retire first, and a cap-bound Requeue could never move it (the old contract
+// returned ErrFull here, which was circular: "retry once the consumer has
+// drained" describes a consumer that cannot drain past the very record it is
+// trying to rotate). The rotation is backlog-neutral: the tail copy is
+// committed against the head original, so Count and Size end unchanged.
+func TestRequeueRotatesAtFullQueue(t *testing.T) {
 	m, u := impCodec()
-	// One segment, already full: the re-append has nowhere to go.
+	// One segment, already full: the old contract had nowhere to go.
 	q, err := New[[]byte](t.TempDir(), m, u,
 		Options{NoSync: true, SegmentSize: 4096, MaxSegments: 1})
 	if err != nil {
@@ -236,6 +241,7 @@ func TestRequeueFailedAppendLeavesRecordAtHead(t *testing.T) {
 	}
 	defer func() { _ = q.Close() }()
 	rec := make([]byte, 900)
+	var payloads int
 	for {
 		if err := q.Add(rec); err != nil {
 			if errors.Is(err, ErrFull) {
@@ -243,23 +249,48 @@ func TestRequeueFailedAppendLeavesRecordAtHead(t *testing.T) {
 			}
 			t.Fatal(err)
 		}
+		payloads++
 	}
 	before, beforeBytes := q.Count(), q.Size()
 
 	r := q.NewReader()
 	ok, err := r.Requeue()
-	if ok || !errors.Is(err, ErrFull) {
-		t.Fatalf("Requeue with no room: ok=%v err=%v, want false and ErrFull", ok, err)
+	if !ok || err != nil {
+		t.Fatalf("Requeue at a full queue: ok=%v err=%v, want a successful rotation", ok, err)
 	}
+	// Backlog-neutral: nothing gained, nothing lost.
 	if got := q.Count(); got != before {
-		t.Fatalf("Count=%d after a failed Requeue, want %d", got, before)
+		t.Fatalf("Count=%d after Requeue, want %d", got, before)
 	}
 	if got := q.Size(); got != beforeBytes {
-		t.Fatalf("Size=%d after a failed Requeue, want %d", got, beforeBytes)
+		t.Fatalf("Size=%d after Requeue, want %d", got, beforeBytes)
 	}
-	// And the record is still at the head, deliverable.
-	if _, ok, err := r.TryTake(); !ok || err != nil {
-		t.Fatalf("the record was not left at the head: ok=%v err=%v", ok, err)
+	// The exemption is the rotation's, not the producer's: the forced cycle
+	// opened at most one segment of transient headroom, and once it fills the
+	// cap binds again.
+	for {
+		if err := q.Add(rec); err != nil {
+			if !errors.Is(err, ErrFull) {
+				t.Fatal(err)
+			}
+			break
+		}
+		payloads++
+	}
+	// Every record still drains, the rotated one last.
+	var drained int
+	for {
+		_, ok, err := r.TryTake()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			break
+		}
+		drained++
+	}
+	if drained != payloads {
+		t.Fatalf("drained %d records, want %d", drained, payloads)
 	}
 }
 

@@ -421,12 +421,24 @@ func (s *store) flushFile(df *dataFile) error {
 // nothing can still make the record invisible, so a failure before that point
 // leaves the store exactly as it was: the caller's error means "not appended".
 func (s *store) append(payload []byte) error {
+	return s.appendRecord(payload, false)
+}
+
+// appendRecord is append with an escape hatch: force bypasses BOTH capacity
+// caps. Only Requeue uses it. The rotation it implements is backlog-neutral —
+// the re-appended copy is followed immediately by the commit that retires the
+// head original — so refusing it at the cap inverts its purpose: commits are a
+// cursor, records behind the head can never retire first, and a poison head at
+// a full queue then wedges the queue precisely when the rotation matters most
+// (nothing drains, disk stays pinned, and a restart changes nothing). The
+// transient overshoot is bounded by one record, plus at worst one segment.
+func (s *store) appendRecord(payload []byte, force bool) error {
 	if s.ioErr != nil {
 		return s.ioErr
 	}
 	L := len(payload)
 	recLen := int64(uvarintLen(uint64(L)) + L + checksumSize)
-	if s.maxBytes > 0 {
+	if !force && s.maxBytes > 0 {
 		// Two different answers, because they call for different handling. A record
 		// that cannot fit the cap on an EMPTY queue will never fit, so retrying is
 		// futile and the caller must drop or split it. One that merely does not fit
@@ -442,7 +454,7 @@ func (s *store) append(payload []byte) error {
 
 	af := s.active()
 	if af == nil || af.size+recLen > af.capacity {
-		if err := s.cycle(recLen); err != nil {
+		if err := s.cycle(recLen, force); err != nil {
 			if errors.Is(err, ErrFull) {
 				s.nFull++
 			}
@@ -550,9 +562,9 @@ func (s *store) rollbackAppend(af *dataFile, recLen int64) {
 // cycle starts a new active segment with room for at least need record bytes. A
 // record too large for the standard geometry gets a segment sized to itself, so
 // "records never span files" holds without capping record size at SegmentSize.
-func (s *store) cycle(need int64) error {
+func (s *store) cycle(need int64, force bool) error {
 	s.dropCommitted(nil) // the soon-to-be-old active file may go; a new one follows
-	if s.maxSegments > 0 && len(s.files) >= s.maxSegments {
+	if !force && s.maxSegments > 0 && len(s.files) >= s.maxSegments {
 		return ErrFull
 	}
 	df, err := s.createFile(s.nextNum, s.writeOff, max(s.segmentSize, need))
