@@ -24,24 +24,73 @@
 //	recovery.go:36  entry filter (dir / no prefix) .. covered (TestLoadIgnoresForeignDirectoryEntries)
 //	recovery.go:40  segment number unparsable ....... covered (TestLoadIgnoresForeignDirectoryEntries)
 //	recovery.go:121 repair: ensureOpen failed ....... covered (TestLoadRepairOpenFailureFailsTheOpen)
-//	recovery.go:128 repair: writeHeader failed ...... covered (TestLoadRepairHeaderWriteFailureFailsTheOpen)
+//	recovery.go:128 repair: writeHeader failed ...... EXERCISED, not attributed (see below)
 //	recovery.go:131 repair: flushFile (sync policy) . covered (TestLoadRepairsTruncatedSegmentDurably)
 //	recovery.go:132 repair: flushFile failed ........ NOT covered (see above)
-//	recovery.go:143 repair: preallocate failed ...... covered (TestLoadRepairPreallocFailureFailsTheOpen)
+//	recovery.go:143 repair: preallocate failed ...... EXERCISED, not attributed (see below)
 //	recovery.go:151 active file: ensureOpen failed .. covered (TestLoadActiveSegmentOpenFailureFailsTheOpen)
+//
+// "EXERCISED, not attributed" means the arm really does run and really is
+// asserted, but a -coverprofile run reports it as 0. The two RLIMIT_FSIZE tests
+// run in a child process (see loadIsolate for why they must), and the child's
+// coverage counters are discarded. Do not "fix" this by inlining them back into
+// the test process: that is what made CI fail on arm64 with
+// "can't write testlog.txt: file too large", and it will pass locally when you
+// try it. If those two blocks are ever the last uncovered ones you care about,
+// merge a child -test.coverprofile rather than dropping the isolation.
 
 //go:build unix
 
 package diskqueue
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"testing"
 )
+
+// loadIsolateEnv names the test the child process should run; see loadIsolate.
+const loadIsolateEnv = "DISKQUEUE_ISOLATED_TEST"
+
+// loadIsolate re-runs the calling test in a fresh child process, and reports
+// whether THIS call is that child. Tests that lower RLIMIT_FSIZE must start with
+// `if !loadIsolate(t) { return }`.
+//
+// The cap is per-PROCESS, and that is not a detail the capped test can contain.
+// `go test` hands the test binary a -test.testlogfile it appends to on every file
+// open (it is how build caching learns what the test touched), and with the cap
+// down that append fails with EFBIG. The testing package then fails the entire
+// binary — "can't write .../testlog.txt: file too large" — whatever the test
+// itself did. The log is buffered, so whether a flush lands inside the capped
+// window is timing: this passed locally and on amd64 CI and failed on arm64.
+//
+// The child is exec'd with -test.run alone, so it has no testlog to append to and
+// the cap can reach nothing but the child. Cost: the child's coverage counters are
+// discarded, so the blocks these two tests reach are not attributed in a
+// -coverprofile run. That is the honest trade — the alternative is a test suite
+// that fails at random on someone else's machine.
+func loadIsolate(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv(loadIsolateEnv) == t.Name() {
+		return true
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.v")
+	cmd.Env = append(os.Environ(), loadIsolateEnv+"="+t.Name())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("isolated run of %s failed: %v\n%s", t.Name(), err, out)
+	}
+	if !bytes.Contains(out, []byte("PASS")) && !bytes.Contains(out, []byte("SKIP")) {
+		t.Fatalf("isolated run of %s reported neither PASS nor SKIP:\n%s", t.Name(), out)
+	}
+	return false
+}
 
 // These tests drive the arms of load() that only run when the open path itself
 // hits something it cannot do: a directory it cannot list, entries that are not
@@ -516,6 +565,9 @@ func TestLoadRepairOpenFailureFailsTheOpen(t *testing.T) {
 // failed write publishes nothing. The preallocate test below asserts the mirror
 // image, so between them the two arms cannot be confused.
 func TestLoadRepairHeaderWriteFailureFailsTheOpen(t *testing.T) {
+	if !loadIsolate(t) {
+		return // the parent; the real work happened in the child
+	}
 	dir := t.TempDir()
 	s, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
@@ -597,6 +649,9 @@ func TestLoadRepairHeaderWriteFailureFailsTheOpen(t *testing.T) {
 // ErrSegmentSizeMismatch. The records are still there — no byte was lost — but
 // the store cannot be opened with its own geometry until it can be re-extended.
 func TestLoadRepairPreallocFailureFailsTheOpen(t *testing.T) {
+	if !loadIsolate(t) {
+		return // the parent; the real work happened in the child
+	}
 	dir := t.TempDir()
 	s, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {

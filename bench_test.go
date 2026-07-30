@@ -1,6 +1,8 @@
 package diskqueue
 
 import (
+	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 )
@@ -117,9 +119,20 @@ func BenchmarkDeepBacklog(b *testing.B) {
 func BenchmarkBatchCommit(b *testing.B) {
 	const batch = 1000
 	m, u := bytesCodec()
+	// One parent directory, and each iteration's store is removed as soon as it is
+	// closed. b.TempDir() per iteration would look equivalent and is not: it defers
+	// every directory's removal to the END of the benchmark, so a run of N
+	// iterations holds N preallocated segments at once. At the default 8 MiB
+	// segment that is 8 MiB × N of real blocks — it filled the disk on a CI runner
+	// and failed the benchmark with ENOSPC from fallocate.
+	root := b.TempDir()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		w, err := New[[]byte](b.TempDir(), m, u, Options{NoSync: true, MaxSegments: -1})
+		dir := filepath.Join(root, strconv.Itoa(i))
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		w, err := New[[]byte](dir, m, u, Options{NoSync: true, MaxSegments: -1})
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -145,6 +158,9 @@ func BenchmarkBatchCommit(b *testing.B) {
 
 		b.StopTimer()
 		_ = w.Close()
+		if err := os.RemoveAll(dir); err != nil { // reclaim before the next iteration
+			b.Fatal(err)
+		}
 		b.StartTimer()
 	}
 }
