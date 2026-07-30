@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches: ['**'] # every branch; tag pushes don't trigger (so the tags this
+    # workflow creates don't re-run CI)
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Vet + the full suite on both architectures natively. The third entry pins the
+  # go directive in go.mod (the oldest toolchain importers may be on), so the
+  # declared minimum stays honest.
+  test:
+    name: test (${{ matrix.arch }}, go ${{ matrix.go }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            go: stable
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            go: stable
+          - arch: amd64
+            runner: ubuntu-latest
+            go: '1.23' # minimum supported; keep in sync with go.mod
+            gotoolchain: local
+    runs-on: ${{ matrix.runner }}
+    env:
+      # On the floor entry, refuse to fetch a newer toolchain. go.mod carries no
+      # `toolchain` directive precisely so this job tests the version it claims to —
+      # add one and the go command would silently download it and run the newest Go
+      # here, leaving the declared minimum unverified. GOTOOLCHAIN=local turns that
+      # from a silent downgrade in coverage into a build failure.
+      GOTOOLCHAIN: ${{ matrix.gotoolchain || 'auto' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Vet
+        run: go vet ./...
+      # The race detector is not optional here: the queue hands a reused buffer to
+      # user code under a mutex, every Reader reads through one shared block buffer,
+      # and the iterators release that mutex across yields. A lock regression shows
+      # up as a data race long before it shows up as a wrong answer.
+      - name: Test
+        run: go test -race -cover ./...
+
+      # The fault-injection build, which is a separate class of test rather than a
+      # variant of the same one: the tag compiles in a seam that lets a test fail
+      # append's individual fsyncs, and that is the only way to assert the
+      # data-before-header ordering the durability guarantee rests on. Skip this and
+      # those tests never run anywhere. Unfiltered by name on purpose — the tag only
+      # adds nil-hook branches, so the whole suite still passes, and a -run regex
+      # would silently drop the next fault test whose name did not match it.
+      - name: Vet (fault-injection build)
+        run: go vet -tags diskqueue_faults ./...
+      - name: Test (fault-injection build)
+        run: go test -race -tags diskqueue_faults ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable # lint on current Go, not the go.mod floor
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+  # A durability primitive is exactly the kind of code where the interesting inputs
+  # are the ones nobody thought to write a test for, so every push gets a short
+  # fuzz run on top of the committed seed corpus. A failure uploads the crasher so
+  # it can be committed to testdata/ as a regression seed.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Fuzz the store against hostile bytes
+        run: go test -run='^$' -fuzz='^FuzzStore$' -fuzztime=90s .
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-crashers
+          path: testdata/fuzz/
+
+  # Every GOOS must keep compiling. Preallocation, the directory lock and the
+  # directory fsync are all POSIX-specific, so each has a build-tagged pair with a
+  # no-op or fallback stub for the platforms that lack it — and a stub that stopped
+  # compiling would not fail any test on Linux. Only a compile sweep catches it, and
+  # it walks `go tool dist list` rather than a hand-picked subset so a newly added
+  # port is covered without anyone remembering to add it here.
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Build every GOOS/GOARCH
+        run: |
+          set -uo pipefail
+          fail=0 n=0
+          while read -r target; do
+            n=$((n + 1))
+            if ! out=$(CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build ./... 2>&1); then
+              echo "::error::build failed for $target: $(echo "$out" | head -3)"
+              fail=$((fail + 1))
+            fi
+          done < <(go tool dist list)
+          echo "checked $n targets, $fail failures"
+          exit $fail
+
+  # The zero-allocation hot path is a documented contract, not an aspiration: Add
+  # serializes through a reused buffer, reads go through a shared block buffer, and
+  # the commit walk is pure bookkeeping. All three are one careless []byte away from
+  # allocating per operation, and nothing else in CI would notice.
+  #
+  # allocs/op is the assertion and B/op deliberately is not: B/op still carries the
+  # amortized warm-up, so it is only zero once the iteration count is high enough,
+  # which makes it a flaky gate on a shared runner.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Hot paths must stay at 0 allocs/op
+        run: |
+          set -uo pipefail
+          bench='BenchmarkAddTake$|BenchmarkAddTakeCommit$|BenchmarkRead$|BenchmarkBatchCommit$'
+          out=$(go test -run='^$' -bench="$bench" -benchtime=1s -benchmem ./...) || { echo "$out"; exit 1; }
+          echo "$out"
+          bad=0
+          while read -r name _ _ _ _ _ allocs _; do
+            if [ "$allocs" != "0" ]; then
+              echo "::error::$name allocates $allocs/op; the hot path must stay at 0"
+              bad=1
+            fi
+          done < <(echo "$out" | grep -E '^Benchmark.*allocs/op')
+          n=$(echo "$out" | grep -cE '^Benchmark.*allocs/op')
+          if [ "$n" -ne 4 ]; then
+            echo "::error::expected 4 hot-path benchmarks, matched $n — was one renamed or removed?"
+            bad=1
+          fi
+          [ "$bad" -eq 0 ] && echo "OK: $n hot-path benchmarks, all at 0 allocs/op"
+          exit $bad
+
+  # On a green main build, bump the patch of the latest vX.Y.Z tag (the Go module
+  # version convention). Patch only: a major bump would require a /vN module path,
+  # and minor releases are deliberate, so make those by pushing the tag by hand.
+  tag:
+    needs: [test, lint, fuzz, cross, bench]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the new tag
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # need full history and existing tags
+      - name: Bump patch version tag
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch --tags --force
+          if tag=$(git describe --tags --exact-match 2>/dev/null); then
+            echo "HEAD is already tagged ($tag); nothing to do."
+            exit 0
+          fi
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -n1)
+          if [ -z "$latest" ]; then
+            next='v0.0.1'
+          else
+            v=${latest#v}
+            IFS=. read -r major minor patch <<<"$v"
+            next="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "Tagging $next (previous: ${latest:-none})"
+          git tag -a "$next" -m "$next"
+          git push origin "$next"
