@@ -1,0 +1,7 @@
+# Local tooling state: per-user settings and scratch git worktrees.
+.claude/
+
+# Coverage and profiling output.
+*.out
+*.test
+*.prof

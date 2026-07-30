@@ -765,11 +765,23 @@ func (s *store) forceCommitAll() error {
 			return err
 		}
 		if abandoned := df.written - df.committed; abandoned > 0 {
-			s.nCommitted += abandoned
 			s.nCommittedTotal += uint64(abandoned)
 		}
 		df.committed = df.written
 	}
+	// Square the global counter outright instead of summing the per-file moves
+	// above, because the two differ in exactly the case this arm exists to answer:
+	// a segment that left s.files without its counts being subtracted. Those records
+	// belong to no live file, so no per-file walk can retire them, and Count() would
+	// go on promising a backlog no drain can deliver while Empty() never came true —
+	// a blocking consumer waiting forever on records nothing can address.
+	//
+	// It stays consistent with reclamation because dropCommitted subtracts
+	// df.written from nWritten and df.committed from nCommitted together, so the
+	// unaccounted residue cancels on both sides and Count() holds at zero.
+	// nCommittedTotal deliberately does NOT absorb it: that counter reports records
+	// actually retired, and the phantoms were never there to retire.
+	s.nCommitted = s.nWritten
 	return nil
 }
 

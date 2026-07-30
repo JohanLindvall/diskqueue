@@ -51,6 +51,23 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
   `repairHandle` swap a segment's descriptor behind the store's back), covering the I/O-error
   paths. [recovery_fault_test.go](recovery_fault_test.go) does the on-disk (between close and
   reopen) equivalent.
+- `cover_*_test.go` — the error and edge arms of the six densest functions, which had 44
+  never-executed coverage blocks between them (78%) and now have 4 (98%): `cover_committo`,
+  `cover_load`, `cover_loadfile`, `cover_quarantine` (`skipCorruptSegment`),
+  `cover_forcecommit` (`forceCommitAll`, plus `Reader.next`'s hard-error exit) and
+  `cover_append`. Two techniques worth reusing live here: `quarantineSinkHandle` swaps in a
+  `/dev/null` descriptor, the only shape where **pwrite lands and fsync fails** (neither
+  `breakHandle` nor `reopenReadOnly` can make it — with those the write fails first and the
+  flush is never reached), and forging `s.lastFrameAt`/`lastFrameEnd` reaches `commitTo`'s
+  destination guard, which `recordLen` otherwise bounds out of reach.
+
+  Each file opens with an `// UNCOVERED:` note stating what it could **not** reach and why.
+  Keep those honest: the four remaining blocks are unreachable without a production seam, and
+  three of them (`append`'s `writeHeader` and header-`fsync` arms, `load`'s repair `flushFile`)
+  have their semantics covered by the faults build's adjacent `faultPoint` arms instead. The
+  fourth, `Reader.next`'s `if !ok`, is excluded by its own `drained`/`empty` guards. The
+  `loadFile` note also records a clamp whose *value* is pinned but whose *existence* no test can
+  detect, which is the kind of thing worth knowing before trusting a green suite.
 
 ## Build / test
 
@@ -268,6 +285,20 @@ mirrors its own `written`/`committed` counts into its header.
   fails), so a failure there cannot leave the store believing it quarantined a
   segment the next open will replay. When the segment's file has vanished there is
   no header to write, and the in-memory advance is all there is to do.
+
+  **This binds the `df == nil` arm too**, which is why it goes through
+  `forceCommitAll` rather than squaring the counters itself. It used to do the
+  latter — every `df.committed`, `nCommitted`, `nCommittedTotal` and `commitOff`
+  moved with no header written anywhere — so the next open recovered the untouched
+  cursors and replayed every record, while `nCommittedTotal` (a lifetime counter no
+  reopen undoes) had already counted them and `Stats().Committed` counted them
+  again on the way back out. Every in-process assertion passed; only a reopen
+  caught it. `forceCommitAll` publishes and flushes each file's header before
+  moving that file's counts, and moves the per-file and global counts *together*
+  because `dropCommitted` subtracts `df.committed` from `nCommitted` as it
+  reclaims. The arm is unreachable through the public API (both callers pass a
+  cursor `commitTo` keeps inside a live segment) and cannot be deleted either —
+  dropping the guard nil-derefs on the next line.
 - **Blocking waiters.** `waitLocked`/`signal` use a lazily-created `notify`
   channel, nil when nobody waits, so `Add` stays allocation-free.
 - **`Reader.Drain`/`Follow` consume** via the shared `headOff` (like iterator-
