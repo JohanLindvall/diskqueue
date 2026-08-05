@@ -53,8 +53,8 @@ func (s *store) load() error {
 	s.nextNum = nums[len(nums)-1] + 1
 	var base int64
 	commitCurs := make([]int64, 0, len(nums))
-	for _, num := range nums {
-		df, cc, err := s.loadFile(num, base)
+	for i, num := range nums {
+		df, cc, err := s.loadFile(num, base, i == len(nums)-1)
 		if err != nil {
 			return err
 		}
@@ -178,7 +178,9 @@ func (s *store) startFresh(num uint64) error {
 
 // loadFile recovers one segment from its 64-byte header, returning the file and
 // its stored commit cursor. A nil *dataFile with a nil error means the segment
-// was dropped, and the counters say why.
+// was dropped, and the counters say why. tail says whether num is the
+// highest-numbered segment in the directory, which is the only position an
+// unfinished create can occupy (see abortedCreate).
 //
 // A segment whose header cannot be believed is dropped wherever it sits in the
 // sequence — not only at the tail — and the loss is counted and later reported as
@@ -190,7 +192,7 @@ func (s *store) startFresh(num uint64) error {
 // says the file could not be read (EACCES, EMFILE, EIO) fails the open instead,
 // and an unknown format version is dropped silently as foreign rather than
 // counted as data loss.
-func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
+func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, error) {
 	path := s.filePath(num)
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -215,6 +217,14 @@ func (s *store) loadFile(num uint64, base int64) (*dataFile, int64, error) {
 	th := &dataFile{hdr: h}
 	switch {
 	case th.magic() != headerMagic:
+		// The same aborted create one reservation later: the blocks are reserved and
+		// nothing has been written into them, so the segment is a full-length file of
+		// zeros rather than a zero-length one. Counted as damage it reports a whole
+		// segment's worth of loss — 8 MiB at the default geometry — for a file that
+		// never held a byte, which is what an operator sees after a power cut.
+		if tail && s.abortedCreate(num, size, h) {
+			return nil, 0, s.removeFile(num)
+		}
 		return nil, 0, s.dropSegment(num, size, false)
 	case !th.headerChecksumOK():
 		return nil, 0, s.dropSegment(num, size, false)
@@ -349,6 +359,67 @@ func (s *store) surviveCount(df *dataFile) (int64, int64, error) {
 		n++
 	}
 	return n, off, nil
+}
+
+// abortedCreate reports whether segment num is a create interrupted between the
+// block reservation and the first header write: a preallocated file of nothing
+// but zeros. Reclaiming one is lossless, so it takes the silent path the
+// zero-length case already does instead of being booked as a lost segment.
+//
+// Three things keep that silence from swallowing real damage, and all three are
+// needed, because the accounting may over-report a loss but must never
+// under-report one:
+//
+//   - Nothing acknowledged can hide in an all-zero region. A record's bytes and
+//     the header that publishes them are both fsync'd before the append returns,
+//     so a segment whose header never landed holds nothing an Add ever confirmed
+//     — and under a deferred sync policy, what it holds is the exposure
+//     Stats().UnsyncedBytes reports, which is not corruption. Nothing is
+//     recoverable from it either: it frames as empty records, and xxhash64 of an
+//     empty payload is not zero, so every checksum word there disagrees with the
+//     payload it covers.
+//   - Only the tail can be an unfinished create: segments are created one at a
+//     time at the end of the sequence, and the number advances only once the
+//     create has succeeded. A zeroed segment with a higher-numbered sibling is
+//     therefore something else, and stays corruption.
+//   - A scan that cannot finish answers false, leaving the segment with the
+//     verdict its unbelievable header already earned. Failing to look licenses
+//     nothing here — the unlink was licensed already, and what is at stake is
+//     only whether it is counted as loss.
+//
+// Writing the header before reserving the blocks would not settle the same
+// ambiguity: the reservation is metadata and can reach the disk while the
+// header's bytes are still in the page cache, leaving exactly this file again.
+func (s *store) abortedCreate(num uint64, size int64, h []byte) bool {
+	for _, b := range h {
+		if b != 0 {
+			return false
+		}
+	}
+	f, err := os.Open(s.filePath(num))
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }() // read-only handle: nothing to lose on close
+	// The walk stops at the first nonzero byte, so a segment that holds records
+	// costs a block or two; only a genuine reservation is read end to end, and only
+	// on an open that found a header of zeros.
+	buf := make([]byte, 64<<10)
+	for off := int64(headerSize); off < size; {
+		n, rerr := f.ReadAt(buf[:min(int64(len(buf)), size-off)], off)
+		for _, b := range buf[:n] {
+			if b != 0 {
+				return false
+			}
+		}
+		if rerr != nil {
+			// The file ended before the length os.Stat reported: everything that is
+			// there has been read, and all of it was zero.
+			return isShortRead(rerr)
+		}
+		off += int64(n)
+	}
+	return true
 }
 
 // dropSegment unlinks a segment that cannot be read and books the loss: as

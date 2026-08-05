@@ -268,7 +268,7 @@ that drops the record — it is just unavailable as well as damaged.
 | Damaged segment header | that segment is dropped at open — wherever it sits — and counted; the rest stay readable |
 | Segment truncated by the filesystem | the records still present survive; the cut tail is counted in `DiscardedBytes` |
 | Segment file deleted underneath a running queue | the segment is abandoned, one `ErrCorrupt`, the queue keeps making progress |
-| Zero-length segment (a create interrupted before its header) | removed silently — it never held a record, so it is not a loss event |
+| Unfinished segment create (zero-length, or reserved and still all zeros) | removed silently — it never held a record, so it is not a loss event |
 | Unknown format version | segment dropped silently, counted in `ForeignSegments` — a format change is not data loss |
 | Segment that cannot be *read* (`EACCES`, `EMFILE`, `EIO`) | **not** damage: the open fails and nothing is deleted, because "I could not look" is not evidence |
 

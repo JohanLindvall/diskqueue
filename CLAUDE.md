@@ -16,7 +16,7 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
 - [record.go](record.go) — the record frame both ways: `writeRecord`, `recordAt`/`recordLen`/
   `frameEnd`, and the guards (`fitsInRecord`, `shortReadIsCorrupt`, `growBuf`, `uvarintLen`).
 - [recovery.go](recovery.go) — the open path and nothing else: `load`, `loadFile`,
-  `startFresh`, `dropSegment`, `removeFile`, `readHeader`.
+  `startFresh`, `abortedCreate`, `dropSegment`, `removeFile`, `readHeader`.
 - [store.go](store.go) — the `store`: the `[]byte`-only file backend (ReadAt/WriteAt). Keeps
   everything whose ordering is the invariant — the handle LRU, the segment lifecycle, the
   durability policy, `append`, the read/quarantine path, `commitTo` and the gauges. These are
@@ -255,9 +255,21 @@ mirrors its own `written`/`committed` counts into its header.
   `ErrSegmentSizeMismatch`. Checking a max over `os.Stat` sizes, as before,
   misreported a truncated single-segment store as a config mismatch and locked
   recovery out of it.
-- **A zero-length segment is not corruption.** It is a create interrupted between
-  the link and the header write, and can hold no record — `loadFile` removes it and
-  raises no loss event, so nobody is paged for an aborted create. Together with
+- **An unfinished create is not corruption.** A create interrupted between the link
+  and the header write leaves a zero-length file; one interrupted a step later,
+  between the reservation and the header write, leaves a *full-length* file of
+  zeros. Neither can hold a record, so `loadFile` removes both and raises no loss
+  event — booking the second as damage reported a whole segment (8 MiB at the
+  default geometry) of phantom loss after every power cut. The second case is not
+  self-evident from the file, so `abortedCreate` proves it: the header is all zeros,
+  the data region is all zeros (nothing acknowledged can hide there — a record's
+  bytes and the header publishing them are fsync'd together, and an all-zero frame
+  is an empty payload whose checksum word would have to be xxhash's nonzero digest
+  of nothing), and the segment is the tail, the only position a create can occupy. A
+  scan that cannot finish leaves the corruption verdict standing; the accounting may
+  over-report a loss, never under-report one. Reordering `createFile` to write the
+  header before reserving would not settle it — the reservation is metadata and can
+  reach disk while the header bytes are still in the page cache. Together with
   `createFile` unlinking its own partial file on every error path, a failed segment
   create can never brick a later open.
 - **Recovery is the behaviour, not an option** (ported from the sibling project
@@ -295,9 +307,9 @@ mirrors its own `written`/`committed` counts into its header.
   header (bad magic, bad checksum, short read) is data loss — counted in
   `lostSegments`/`lostBytes`, owed one `ErrCorrupt`; an *unknown version*
   (`knownVersion`) is a format change whose data the design accepts dropping —
-  counted in `foreignSegments` and silent. A zero-length file is an aborted create
-  and is removed with no event at all. Numbering always resumes past the highest
-  seen, never at 1.
+  counted in `foreignSegments` and silent. A zero-length file — or a tail whose
+  every byte is zero — is an aborted create and is removed with no event at all.
+  Numbering always resumes past the highest seen, never at 1.
 - **`skipCorruptSegment` applies the in-memory force-commit only *after* the
   header carrying it is durable** (and rolls the header bytes back if the write
   fails), so a failure there cannot leave the store believing it quarantined a

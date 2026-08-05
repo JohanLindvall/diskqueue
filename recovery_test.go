@@ -3,6 +3,7 @@ package diskqueue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -261,6 +262,175 @@ func TestEmptySegmentIsNotALossEvent(t *testing.T) {
 	v, ok, err := w2.NewReader().TryTake()
 	if !ok || err != nil || v != 7 {
 		t.Fatalf("record after the stub was dropped: v=%d ok=%v err=%v", v, ok, err)
+	}
+}
+
+// recoverySegSize is the geometry the aborted-create tests build their residue
+// at: small enough to zero a whole file cheaply, large enough that a phantom
+// loss report would be unmistakable in LostBytes.
+const recoverySegSize = 4096
+
+// openRecoveryQueue opens a queue on dir at recoverySegSize, the same options on
+// every open so a reopen recovers rather than rejecting the geometry.
+func openRecoveryQueue(t *testing.T, dir string) *Queue[uint64] {
+	t.Helper()
+	w, err := New[uint64](dir, marshalU64, unmarshalU64,
+		Options{NoSync: true, SegmentSize: recoverySegSize, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
+
+// zeroSegment overwrites segment num's whole file with zeros, in place, keeping
+// its length: the shape a segment has when its blocks were reserved and nothing
+// was ever written into them.
+func zeroSegment(t *testing.T, dir string, num uint64) {
+	t.Helper()
+	path := filepath.Join(dir, fmt.Sprintf("data.%08d", num))
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, make([]byte, fi.Size()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAbortedPreallocatedCreateIsNotALossEvent: a create interrupted between
+// reserving the blocks and writing the first header leaves a full-length file of
+// zeros, which is one reservation further along than the zero-length stub above
+// and just as empty. Booked as damage it reports a whole segment of loss — a
+// default-geometry queue would tell an operator it lost 8 MiB to a power cut that
+// cost it nothing — so it has to be reclaimed silently and owe the reader no
+// ErrCorrupt.
+func TestAbortedPreallocatedCreateIsNotALossEvent(t *testing.T) {
+	dir := t.TempDir()
+	w := openRecoveryQueue(t, dir)
+	if err := w.Add(7); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Exactly what createFile leaves behind when the crash lands between the
+	// preallocation and the header write: same open flags, same reservation, no
+	// header.
+	stub := filepath.Join(dir, "data.00000002")
+	f, err := os.OpenFile(stub, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := preallocate(f, headerSize+recoverySegSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if fi, serr := os.Stat(stub); serr != nil || fi.Size() != headerSize+recoverySegSize {
+		t.Fatalf("stub is %v (%v), want a full-length reservation: the shape under test", fi, serr)
+	}
+
+	w2 := openRecoveryQueue(t, dir)
+	defer func() { _ = w2.Close() }()
+	st := w2.Stats()
+	if st.Corruptions != 0 || st.LostSegments != 0 || st.LostBytes != 0 || st.DiscardedBytes != 0 {
+		t.Fatalf("an aborted create was reported as data loss: %+v", st)
+	}
+	if _, serr := os.Stat(stub); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("the reservation was not reclaimed: %v", serr)
+	}
+	// The record comes back on the *first* take: a pending corruption event would
+	// be paid out before it, which is how the phantom loss reached the consumer.
+	r := w2.NewReader()
+	v, ok, err := r.TryTake()
+	if !ok || err != nil || v != 7 {
+		t.Fatalf("first take after the reservation was reclaimed: v=%d ok=%v err=%v", v, ok, err)
+	}
+	if _, ok, err := r.TryTake(); ok || err != nil {
+		t.Fatalf("drained queue: ok=%v err=%v, want a clean empty with nothing owed", ok, err)
+	}
+}
+
+// TestZeroedHeaderOverRecordsIsStillReported is the other half of the rule above:
+// the silence is bought by the data region being zero too, so a segment whose
+// header was destroyed while its records are still on disk is real loss and stays
+// counted and reported. Getting this wrong is worse than the phantom it fixes —
+// an operator would be told nothing at all.
+func TestZeroedHeaderOverRecordsIsStillReported(t *testing.T) {
+	dir := t.TempDir()
+	w := openRecoveryQueue(t, dir)
+	for i := uint64(0); i < 8; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// One segment, holding every record, with its header zeroed: the residue of a
+	// lost page 0, not of an unfinished create.
+	path := filepath.Join(dir, "data.00000001")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < headerSize; i++ {
+		b[i] = 0
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	w2 := openRecoveryQueue(t, dir)
+	defer func() { _ = w2.Close() }()
+	st := w2.Stats()
+	if st.LostSegments != 1 || st.Corruptions != 1 {
+		t.Fatalf("LostSegments=%d Corruptions=%d, want 1 and 1: the records were real", st.LostSegments, st.Corruptions)
+	}
+	if st.LostBytes == 0 {
+		t.Fatal("LostBytes=0: a segment full of records was destroyed")
+	}
+	if _, ok, err := w2.NewReader().TryTake(); ok || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("first take: ok=%v err=%v, want the loss reported once", ok, err)
+	}
+}
+
+// TestZeroFilledMiddleSegmentIsStillReported pins the position half of the rule.
+// Segments are created one at a time at the tail, so only the highest-numbered
+// one can be an unfinished create; a zero-filled segment with a live sibling
+// above it is unexplained, and unexplained is corruption. Without this the silent
+// path would swallow a segment a filesystem repair had zeroed.
+func TestZeroFilledMiddleSegmentIsStillReported(t *testing.T) {
+	dir := t.TempDir()
+	w := openRecoveryQueue(t, dir)
+	for i := uint64(0); w.Stats().Segments < 3; i++ {
+		if err := w.Add(i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zeroSegment(t, dir, 2)
+
+	w2 := openRecoveryQueue(t, dir)
+	defer func() { _ = w2.Close() }()
+	st := w2.Stats()
+	if st.LostSegments != 1 || st.Corruptions != 1 || st.LostBytes == 0 {
+		t.Fatalf("a zeroed middle segment was not reported: %+v", st)
+	}
+	if _, serr := os.Stat(filepath.Join(dir, "data.00000002")); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("stat of the zeroed segment: %v, want it unlinked", serr)
+	}
+	r := w2.NewReader()
+	if _, ok, err := r.TryTake(); ok || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("first take: ok=%v err=%v, want the loss reported once", ok, err)
+	}
+	if _, ok, err := r.TryTake(); !ok || err != nil {
+		t.Fatalf("take after the report: ok=%v err=%v, want the surviving records", ok, err)
 	}
 }
 

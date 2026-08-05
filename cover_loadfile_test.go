@@ -9,11 +9,13 @@ import (
 	"testing"
 )
 
-// UNCOVERED: nothing. All eight target blocks in loadFile — recovery.go 196
-// (os.Stat), 213 (readHeader said ErrCorrupt), 248 and 251 (the write-cursor
-// clamps), 275 and 278 (the committed-count clamps), 282 and 285 (the
-// commit-cursor clamps) — are reached by the tests below, as is readHeader's own
-// short-read wrap (368-371), which 213 needs in order to fire.
+// UNCOVERED: nothing. All nine target blocks in loadFile — recovery.go 199
+// (os.Stat), 215 (readHeader said ErrCorrupt), 226 (the unfinished create behind
+// a zeroed header), 269 and 272 (the write-cursor clamps), 318 and 321 (the
+// committed-count clamps), 325 and 328 (the commit-cursor clamps) — are reached by
+// the tests below, as is readHeader's own short-read wrap (474), which 215 needs
+// in order to fire, and both of abortedCreate's failure arms, which 226 cannot
+// reach from here (see the last test in this file).
 //
 // One caveat, on 285 (`if cc > headerSize+df.size`). The block is executed and the
 // resulting behaviour is asserted, but *removing* the clamp does not change any
@@ -604,5 +606,61 @@ func TestLoadFileCommitCursorPastSegmentClamped(t *testing.T) {
 	}
 	if !rec.empty() {
 		t.Fatal("the store did not read empty after a full drain")
+	}
+}
+
+// TestAbortedCreateScanFailuresKeepTheCorruptionVerdict covers abortedCreate's two
+// failure arms, which decide whether a dropped segment is COUNTED as loss.
+//
+// Neither is reachable through loadFile — a segment that cannot be opened has
+// already failed readHeader, and the scan is bounded by the length os.Stat
+// reported a moment earlier — so they are exercised directly. Both must answer in
+// the conservative direction: silence is only ever bought by proof, because an
+// under-reported loss is a segment that went missing with nothing said.
+func TestAbortedCreateScanFailuresKeepTheCorruptionVerdict(t *testing.T) {
+	dir := t.TempDir()
+	s, err := openStore(dir, loadfileSegSize, 0, false, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.close() }()
+	zeroHdr := make([]byte, headerSize)
+	full := int64(headerSize + loadfileSegSize)
+
+	// The scan cannot even open the file: nothing was proved, so the segment keeps
+	// the verdict its unreadable header earned.
+	if s.abortedCreate(404, full, zeroHdr) {
+		t.Fatal("a segment that could not be opened was reclaimed as an aborted create")
+	}
+
+	// The file is shorter than the size the stat reported. Everything that is there
+	// has been read and all of it was zero, which is the whole proof.
+	writeSeg := func(num uint64, b []byte) {
+		t.Helper()
+		if werr := os.WriteFile(s.filePath(num), b, 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+	}
+	writeSeg(900, make([]byte, headerSize+16))
+	if !s.abortedCreate(900, full, zeroHdr) {
+		t.Fatal("a wholly zero file that ended early was not recognised as an aborted create")
+	}
+
+	// One nonzero byte anywhere in the data region is enough to withhold it — and it
+	// is found before the short read is.
+	late := make([]byte, headerSize+16)
+	late[len(late)-1] = 1
+	writeSeg(901, late)
+	if s.abortedCreate(901, full, zeroHdr) {
+		t.Fatal("a file with data in it was reclaimed as an aborted create")
+	}
+
+	// A header that is not all zeros is not an unfinished create whatever the data
+	// region holds, and costs no scan at all.
+	writeSeg(902, make([]byte, full))
+	nonZeroHdr := make([]byte, headerSize)
+	nonZeroHdr[headerSize-1] = 1
+	if s.abortedCreate(902, full, nonZeroHdr) {
+		t.Fatal("a segment carrying a header was reclaimed as an aborted create")
 	}
 }
