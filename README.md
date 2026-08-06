@@ -265,7 +265,8 @@ that drops the record — it is just unavailable as well as damaged.
 | Crash between `Add` and the header fsync | the record is invisible on reopen — a clean truncation, not an error |
 | One flipped byte in a record **payload** | **one record**: its length still framed it, so exactly that record is dropped |
 | One flipped byte in a record **length** | **up to one segment**: the frame boundaries behind it are gone with it |
-| Damaged segment header | that segment is dropped at open — wherever it sits — and counted; the rest stay readable |
+| Header rewrite torn by a power cut (magic/version intact, checksum bad) | the segment is **rebuilt** at open from a checksum-verified walk of its records — nothing verified is lost; the commit position is the one casualty, so that segment and everything after it replays, and one event is reported |
+| Damaged segment header (magic gone, or a header shorter than 64 bytes) | that segment is dropped at open — wherever it sits — and counted; the rest stay readable |
 | Segment truncated by the filesystem | the records still present survive; the cut tail is counted in `DiscardedBytes` |
 | Segment file deleted underneath a running queue | the segment is abandoned, one `ErrCorrupt`, the queue keeps making progress |
 | Unfinished segment create (zero-length, or reserved and still all zeros) | removed silently — it never held a record, so it is not a loss event |

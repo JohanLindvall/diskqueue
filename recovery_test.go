@@ -172,18 +172,12 @@ func TestDamagedSegmentDroppedAtOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Rot the header of a middle segment — the case that used to fail the open
-	// outright and take every intact segment down with it.
-	forgeHeader(t, dir, 2, func(h []byte) { h[8] ^= 0xFF })
-	path := filepath.Join(dir, "data.00000002")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b[60] ^= 0xFF // break the header checksum itself
-	if err := os.WriteFile(path, b, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	// Destroy a middle segment's magic — damage no torn header rewrite can
+	// produce (the magic is identical in every header image), so it stays a drop
+	// rather than a salvage. A failed checksum over an intact magic and version
+	// is the torn-rewrite signature and is rebuilt from the records instead;
+	// torn_header_test.go pins that path.
+	forgeHeader(t, dir, 2, func(h []byte) { h[0] ^= 0xFF })
 
 	w2, err := New[uint64](dir, marshalU64, unmarshalU64,
 		Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1})

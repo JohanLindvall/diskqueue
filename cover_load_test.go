@@ -631,28 +631,22 @@ func TestLoadRepairHeaderWriteFailureFailsTheOpen(t *testing.T) {
 	}
 }
 
-// TestLoadRepairPreallocFailureFailsTheOpen: the last step of the repair puts the
-// segment back to its full preallocated length, and a failure there fails the
-// open too.
+// TestLoadRepairPreallocFailureIsBestEffort: the last step of the repair puts
+// the segment back to its full preallocated length, and a failure there does
+// NOT fail the open — the clamped cursor is already durable, so a later open
+// re-detects the short file with nothing new to book and retries the extension.
+// Truncation plus no room to extend is exactly what a disk-full incident
+// produces, and failing here would lock the full disk out of the very queue
+// that must be drained to free it.
 //
 // The cap is set to the truncated segment's own length, so the 64-byte header
 // write still fits and only the fallocate that would grow the file to
 // headerSize+SegmentSize is refused. The header on disk therefore has to be the
-// *repaired* one — which is the ordering the loop is written for: the clamped
-// cursor is made durable first, and only then is the file re-extended, so a crash
-// in between can never leave a full-length segment whose header points past its
+// *repaired* one — the ordering the loop is written for: the clamped cursor is
+// made durable first, and only then is the file re-extended, so a crash in
+// between can never leave a full-length segment whose header points past its
 // real records (the zero fill would read back as a phantom backlog).
-//
-// There used to be a price for that ordering: with the header matching the
-// file's shortened length, the old file-size discriminator read the segment as a
-// store built with a smaller SegmentSize and refused the configured geometry —
-// the store was locked out of its own directory until someone guessed the
-// surviving length as SegmentSize. The header now states the geometry it was
-// created under, so the next open reads the short file as exactly what it is:
-// one that lost only preallocated zero fill. It finishes the re-extension the
-// failed open could not, raises no loss event (no published byte is missing),
-// and the survivor is delivered under the configured geometry.
-func TestLoadRepairPreallocFailureFailsTheOpen(t *testing.T) {
+func TestLoadRepairPreallocFailureIsBestEffort(t *testing.T) {
 	if !loadIsolate(t) {
 		return // the parent; the real work happened in the child
 	}
@@ -668,28 +662,18 @@ func TestLoadRepairPreallocFailureFailsTheOpen(t *testing.T) {
 	if err := s.close(); err != nil {
 		t.Fatal(err)
 	}
-	loadCutSegment(t, dir, 1, idxRecLen)
+	cut := loadCutSegment(t, dir, 1, idxRecLen)
 	shortSize := loadFileSize(t, dir, 1)
 
 	// Room for the header write, none for the re-extension.
 	restore := loadCapFileSize(t, uint64(shortSize))
-	bad, err := openStore(dir, 4096, 0, false, 0, 0)
+	capped, err := openStore(dir, 4096, 0, false, 0, 0)
 	restore()
-	if err == nil {
-		_ = bad.close()
-		t.Fatal("a repair that cannot re-extend the segment must fail the open")
-	}
-	if !errors.Is(err, syscall.EFBIG) {
-		t.Fatalf("open: %v, want the injected allocation failure (EFBIG)", err)
-	}
-	if errors.Is(err, ErrCorrupt) {
-		t.Fatalf("open: %v — a failed allocation is not damage", err)
-	}
-	if errors.Is(err, ErrIO) {
-		t.Fatalf("open: %v — a failed allocation publishes nothing, so it must not latch", err)
+	if err != nil {
+		t.Fatalf("open with the re-extension refused: %v, want it to succeed and drain", err)
 	}
 	if got := loadFileSize(t, dir, 1); got != shortSize {
-		t.Fatalf("segment size=%d, want %d unchanged", got, shortSize)
+		t.Fatalf("segment size=%d, want %d: only the header write fits under the cap", got, shortSize)
 	}
 	// The clamped cursor got there first, which is the whole point of doing the
 	// re-extension last.
@@ -698,11 +682,21 @@ func TestLoadRepairPreallocFailureFailsTheOpen(t *testing.T) {
 		t.Fatalf("header on disk: writeCursor=%d written=%d, want the repaired %d and 1",
 			cursor, written, headerSize+idxRecLen)
 	}
+	// The store is live despite the short segment: the loss is booked and the
+	// survivor is reachable right now, which is the point of not failing.
+	if capped.discardedBytes != cut {
+		t.Fatalf("DiscardedBytes=%d, want %d", capped.discardedBytes, cut)
+	}
+	if c := capped.count(); c != 1 {
+		t.Fatalf("count=%d, want the 1 survivor", c)
+	}
+	if err := capped.close(); err != nil {
+		t.Fatal(err)
+	}
 
-	// With the cap lifted, reopening under the CONFIGURED geometry succeeds and
-	// completes the re-extension the failed open could not. The old file-size
-	// discriminator refused this open with ErrSegmentSizeMismatch — a store locked
-	// out of its own directory over lost zero fill.
+	// With the cap lifted, reopening under the CONFIGURED geometry completes the
+	// re-extension the capped open could not — and books nothing new, because the
+	// repaired header already agrees with the short file.
 	good, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
 		t.Fatalf("reopen with the configured segment size: %v", err)

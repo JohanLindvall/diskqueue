@@ -114,10 +114,17 @@ put, since the bytes may still be there next time.
 
 Reopening reads no records — one 64-byte header pread per segment, and the header
 is the single source of truth for the write cursor, the resume point and the
-record count. The one exception is a segment whose header proves it lost bytes to
-truncation; that one gets a bounded frame walk, because its recorded count
-describes records that no longer exist and believing it would promise a backlog
-no drain could deliver.
+record count. Two kinds of segment are excepted, both already known to be
+damaged, so every healthy open keeps the cost model. A segment whose header
+proves it lost bytes to truncation gets a bounded frame walk, because its
+recorded count describes records that no longer exist and believing it would
+promise a backlog no drain could deliver. And a segment whose header checksum
+fails while its magic and version are intact — the residue of a header rewrite
+torn by a power cut — is rebuilt from a checksum-verified walk of its records
+rather than dropped: the header was the only casualty, the records beneath it
+vouch for themselves, and the one thing that cannot be reconstructed is the
+commit position, so that segment and everything after it replays
+(at-least-once). One corruption event is reported for it.
 
 On reopen the read cursor resets to the persisted commit cursor, so uncommitted
 items replay: the crash guarantee is at-least-once. [Queue.Rewind] does the same

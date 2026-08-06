@@ -682,9 +682,11 @@ func TestStoreChecksumDetectsCorruption(t *testing.T) {
 	}
 }
 
-// TestStoreHeaderChecksumDetected corrupts a header field on disk. The segment
-// cannot be trusted, so it is dropped and counted rather than failing the open —
-// an unopenable queue helps nobody, and the intact segments must stay reachable.
+// TestStoreHeaderChecksumDetected corrupts a header field on disk, leaving
+// magic and version intact — the signature of a rewrite torn by a power cut.
+// The header is the only casualty: the record beneath it carries its own
+// checksum, so the open rebuilds the header from a verified walk instead of
+// dropping the segment. One event is owed to the reader; nothing is lost.
 func TestStoreHeaderChecksumDetected(t *testing.T) {
 	dir := t.TempDir()
 	s, err := openStore(dir, 4096, 0, false, 0, 0)
@@ -706,12 +708,26 @@ func TestStoreHeaderChecksumDetected(t *testing.T) {
 	}
 	s2, err := openStore(dir, 4096, 0, false, 0, 0)
 	if err != nil {
-		t.Fatalf("reopen with a corrupt header: %v, want the segment dropped", err)
+		t.Fatalf("reopen with a torn header: %v, want the segment salvaged", err)
 	}
 	defer func() { _ = s2.close() }()
-	assertSegmentLoss(t, s2, 1)
-	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the unreadable segment is still on disk: %v", err)
+	if s2.corruptionCount() != 1 || s2.lostSegments != 0 || s2.lostRecords != 0 {
+		t.Fatalf("corruptions=%d lostSegments=%d lostRecords=%d, want 1/0/0: the record survived",
+			s2.corruptionCount(), s2.lostSegments, s2.lostRecords)
+	}
+	// The event is reported once, then the salvaged record is delivered.
+	if _, _, ok, err := s2.takeHead(); ok || !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("owed report: ok=%v err=%v, want ErrCorrupt", ok, err)
+	}
+	p, _, ok, err := s2.takeHead()
+	if err != nil || !ok || recIdx(p) != 0 {
+		t.Fatalf("salvaged record: idx=%d ok=%v err=%v", recIdx(p), ok, err)
+	}
+	if _, _, ok, err := s2.takeHead(); ok || err != nil {
+		t.Fatalf("after the salvage: ok=%v err=%v, want a clean empty", ok, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("the salvaged segment must stay on disk: %v", err)
 	}
 }
 
@@ -856,9 +872,10 @@ func highestDataFileNum(t *testing.T, dir string) uint64 {
 	return max
 }
 
-// TestStoreRecoverTornTail corrupts the highest segment's header and verifies
-// that, with recovery, the open drops it instead of failing and the earlier
-// segments stay readable in order.
+// TestStoreRecoverTornTail corrupts the highest segment's header (magic and
+// version intact — a torn rewrite) and verifies the open salvages it: every
+// record in the store, the torn tail's included, is still delivered in order,
+// with the one event reported.
 func TestStoreRecoverTornTail(t *testing.T) {
 	dir := t.TempDir()
 	s, err := openStore(dir, 64, 0, false, 0, 0)
@@ -900,8 +917,8 @@ func TestStoreRecoverTornTail(t *testing.T) {
 	if events != 1 {
 		t.Fatalf("%d corruption events reported to the reader, want 1", events)
 	}
-	if len(got) == 0 {
-		t.Fatal("expected earlier segments to survive")
+	if len(got) != n {
+		t.Fatalf("drained %d records, want all %d: the torn tail's records vouch for themselves", len(got), n)
 	}
 	assertAscending(t, got)
 }

@@ -16,7 +16,8 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
 - [record.go](record.go) — the record frame both ways: `writeRecord`, `recordAt`/`recordLen`/
   `frameEnd`, and the guards (`fitsInRecord`, `shortReadIsCorrupt`, `growBuf`, `uvarintLen`).
 - [recovery.go](recovery.go) — the open path and nothing else: `load`, `loadFile`,
-  `startFresh`, `abortedCreate`, `dropSegment`, `removeFile`, `readHeader`.
+  `startFresh`, `abortedCreate`, `salvageTornHeader`/`countVerified`, `dropSegment`,
+  `removeFile`, `readHeader`.
 - [store.go](store.go) — the `store`: the `[]byte`-only file backend (ReadAt/WriteAt). Keeps
   everything whose ordering is the invariant — the handle LRU, the segment lifecycle, the
   durability policy, `append`, the read/quarantine path, `commitTo` and the gauges. These are
@@ -219,7 +220,10 @@ mirrors its own `written`/`committed` counts into its header.
   take a second record. `Stats().DiskBytes` sums per-file capacity (`diskBytes()`),
   not `len(files) × segmentSize`. `Add` drops an outsized `w.scratch` on **success**
   as well as failure, or one huge record pins its buffer for the queue's lifetime.
-- **Recovery (`load`) reads no records — with exactly one licensed exception.** Reopen preads each file's 64-byte header
+- **Recovery (`load`) reads no records — with exactly two licensed exceptions,
+  both confined to segments already proven damaged** (`surviveCount` for a
+  truncated segment, `countVerified` for a torn header — see below), so every
+  healthy open still costs one 64-byte pread per segment. Reopen preads each file's 64-byte header
   (no mapping) in `loadFile`, validates it, and takes the data end from the write
   cursor and the `written` count from the header, with `commitOff` from the first
   file whose commit cursor is short of its end; `headOff = commitOff`. Only the
@@ -302,13 +306,30 @@ mirrors its own `written`/`committed` counts into its header.
   the count is paid down one per `takeHead` call — otherwise the records are
   simply missing from the stream with nothing said. `empty()` accounts for it, so
   a blocking consumer wakes up to collect the reports.
+- **A torn header rewrite salvages; other damaged headers drop.** Every commit
+  rewrites the 64-byte header in place, so a power cut can tear it — and that
+  used to be the one way a routine, successful operation could destroy a whole
+  segment of already-durable records. The torn-rewrite signature is *magic and
+  version intact, checksum bad* (neither field changes between header images,
+  so both survive any interleaving); on that signature `salvageTornHeader`
+  rebuilds the header from `countVerified`, a bounded walk that trusts only
+  frames whose payload checksum verifies — a frame that merely decodes is what
+  zero fill does. The commit position is unrecoverable, so the salvaged
+  segment's cursor resets to its start and everything from it forward replays
+  (at-least-once); one corruption event is booked with **no** bytes (the bytes
+  past the clamp are usually fill, and LostBytes is a lower bound). The rebuilt
+  capacity comes from the file's own length floored at `segmentSize`, so the
+  repair pass can only ever extend the file, and a walk that cannot run leaves
+  the drop verdict standing.
 - **`load` drops a damaged segment wherever it sits**, not only at the tail, and
   the open succeeds. `dropSegment` splits the two reasons apart: a *damaged*
-  header (bad magic, bad checksum, short read) is data loss — counted in
-  `lostSegments`/`lostBytes`, owed one `ErrCorrupt`; an *unknown version*
-  (`knownVersion`) is a format change whose data the design accepts dropping —
-  counted in `foreignSegments` and silent. A zero-length file — or a tail whose
-  every byte is zero — is an aborted create and is removed with no event at all.
+  header (bad magic, short read, or a bad checksum the salvage above could not
+  redeem) is data loss — counted in `lostSegments`/`lostBytes`, owed one
+  `ErrCorrupt`; an *unknown version* (`knownVersion`) is a format change whose
+  data the design accepts dropping — counted in `foreignSegments` and silent. A
+  zero-length file — or a tail whose every byte is zero — is an aborted create
+  and is removed with no event at all. Duplicate segment numbers from unpadded
+  strays (`data.1` beside `data.00000001`) are collapsed to one load.
   Numbering always resumes past the highest seen, never at 1.
 - **`skipCorruptSegment` applies the in-memory force-commit only *after* the
   header carrying it is durable** (and rolls the header bytes back if the write
@@ -429,9 +450,19 @@ mirrors its own `written`/`committed` counts into its header.
 - I/O is `os.File` `ReadAt`/`WriteAt`/`Sync` plus a directory `fsync` (`fsyncDir`)
   for durable creates/removes, `syscall.Fallocate` for preallocation and
   `syscall.Flock` for the directory lock — all stdlib, so still no
-  `golang.org/x/sys` dependency. The platform-specific bits live in the three
-  build-tagged file pairs; every `GOOS` in `go tool dist list` must keep compiling
-  (`GOOS=windows go build ./...` etc.).
+  `golang.org/x/sys` dependency. The platform-specific bits live in the
+  build-tagged file pairs, sharing the `fdControl` EINTR-retry helper
+  ([fdcontrol_unix.go](fdcontrol_unix.go)); every `GOOS` in `go tool dist list`
+  must keep compiling (`GOOS=windows go build ./...` etc.).
+- The truncation repair in `load` re-extends the file **best-effort** (like the
+  active file's reservation): the clamped cursor is already durable, so a later
+  open re-detects the short file with nothing new to book and retries — making
+  it fatal would lock a full disk out of the queue that must be drained to free
+  it. The header republish above it stays fatal, or the same loss would be
+  booked on every open.
+- **Deliberately out of scope** (decided, not merely missing — don't add them):
+  a dead-letter quarantine for corrupt segments (they are unlinked, not moved
+  aside) and any offline inspection/repair tool. Recovery is in-process only.
 - The fault-injection helpers in `robust_test.go` work by swapping `df.f` behind the
   store's back, and rely on `ensureOpen` *not* reopening a file whose `f` is
   non-nil. If that ever changes, those tests silently stop injecting anything.

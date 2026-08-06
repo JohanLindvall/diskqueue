@@ -300,9 +300,10 @@ An honest accounting, because most of this table is not a scoreboard:
   no compression, no encryption, no TLS, no backpressure protocol, no multi-pipeline
   routing. Vector, Fluent Bit and the Collector are solving a much larger problem, and
   their buffer designs answer to constraints this library does not have.
-- **The cap is in segments, not bytes.** `MaxSegments × SegmentSize` is a blunt instrument
-  next to Logstash's `queue.max_bytes` or syslog-ng's `capacity-bytes()`. Preallocation
-  makes the number honest, but you still cannot say "use at most 700 MB".
+- ~~**The cap is in segments, not bytes.**~~ No longer true: `MaxBytes` caps the
+  uncommitted backlog in bytes, composing with `MaxSegments` (whichever binds first
+  returns `ErrFull`) — the same shape as Logstash's `queue.max_bytes` and syslog-ng's
+  `capacity-bytes()`. Preallocation still makes the disk-footprint number honest.
 - **One process, one writer.** An advisory `flock` on the directory; no shared access, no
   multi-process fan-in. Fluent Bit's per-input chunk directories and Logstash's per-
   pipeline queues are more flexible.

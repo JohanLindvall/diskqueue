@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 // The open path: everything that runs before the store serves its first
@@ -43,6 +45,11 @@ func (s *store) load() error {
 		nums = append(nums, num)
 	}
 	slices.Sort(nums)
+	// Distinct names can parse to one number ("data.1" beside "data.00000001"),
+	// and filePath resolves both to the padded form: loading the number twice
+	// would load the same segment twice, double-counting its records and its
+	// bytes. First occurrence wins; the unpadded stray is inert and stays.
+	nums = slices.Compact(nums)
 
 	if len(nums) == 0 {
 		return s.startFresh(1)
@@ -134,15 +141,17 @@ func (s *store) load() error {
 			}
 		}
 		// Restore the geometry too, and only after the clamped cursor is durable.
-		// Segments are preallocated to a known length, so a short file is read as a
-		// different SegmentSize unless its own header proves it lost bytes — and the
-		// header no longer says that, because we just fixed it. Left short, the next
-		// open would reject the whole store with ErrSegmentSizeMismatch. Re-extended,
-		// it is an ordinary partly-filled segment whose tail is zero fill, which is
-		// what every other segment looks like.
-		if err := preallocate(df.f, headerSize+df.capacity); err != nil {
-			return err
-		}
+		// Re-extended, the segment is an ordinary partly-filled file whose tail is
+		// zero fill, which is what every other segment looks like.
+		//
+		// Best-effort, like the active-file reservation below, and for the same
+		// reason: the repaired cursor above is already durable, so a later open
+		// re-detects the short file with its header agreeing (writeCursor at the
+		// real end — no loss to re-book) and simply retries this extension. Failing
+		// the open here would lock a full disk out of the very queue that must be
+		// drained to free it — truncation plus ENOSPC is precisely the double
+		// failure a disk-full incident produces.
+		_ = preallocate(df.f, headerSize+df.capacity)
 		df.truncated = false
 	}
 
@@ -227,6 +236,19 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 		}
 		return nil, 0, s.dropSegment(num, size, false)
 	case !th.headerChecksumOK():
+		// Magic and version intact with a failing checksum is the signature of a
+		// torn in-place header rewrite: neither field ever changes between one
+		// header image and the next, so both survive any interleaving of old and
+		// new bytes. Every commit rewrites the header in place, which made this the
+		// one way a routine, successful operation plus a power cut could destroy a
+		// whole segment of already-durable records. Only the header is gone — the
+		// records beneath it carry their own framing and checksums — so rebuild it
+		// from a verified walk instead of dropping the segment.
+		if knownVersion(th.version()) {
+			if df, cc, ok := s.salvageTornHeader(num, path, base, size); ok {
+				return df, cc, nil
+			}
+		}
 		return nil, 0, s.dropSegment(num, size, false)
 	case !knownVersion(th.version()):
 		// A deliberate format change, or a rollback to a build that predates one.
@@ -354,6 +376,119 @@ func (s *store) surviveCount(df *dataFile) (int64, int64, error) {
 		next, ok, err := s.recordLen(df, off)
 		if err != nil || !ok {
 			break // no whole frame starts here; the rest is gone
+		}
+		off = next
+		n++
+	}
+	return n, off, nil
+}
+
+// salvageTornHeader rebuilds a segment whose header checksum fails while its
+// magic and version bytes are intact — the residue of a header rewrite torn by
+// a power cut, since those two fields are identical in the old and new images
+// and survive any interleaving of the two. The header is the only casualty:
+// the records beneath it are individually framed and checksummed, so a bounded
+// walk that verifies every checksum recovers exactly the records that were
+// really written, and the header is reconstructed from what the walk proved.
+//
+// The walk stops at the first frame that does not both decode and verify.
+// Everything past that point is zero fill, a partial append the lost header
+// never published, or damage; none of it is tellable apart without the header,
+// so the extent is clamped to the last verified frame and nothing behind the
+// clamp is ever addressed. For a segment that also lost payload bytes mid-run
+// this under-recovers — records past the damage are cut with it — but that
+// takes two independent failures in one segment, and the bias is the right
+// way: nothing unverified is ever delivered.
+//
+// What cannot be reconstructed is the commit position: the torn header was the
+// only witness. It resets to the segment's start, so everything from this
+// segment forward replays — at-least-once already permits that, and a replay
+// is the opposite of the loss this path used to book. The geometry witness is
+// gone with it, so the capacity is rebuilt from the file's own length (never
+// smaller, so the repair in load can only ever extend the file), and a store
+// reopened under a different SegmentSize slips this one segment past the
+// mismatch check — delivering its records under the wrong geometry beats
+// unlinking them.
+//
+// One corruption event is booked and owed to the reader: a torn header did
+// happen, and Corruptions climbing is how an operator learns of it. No bytes
+// are booked with it — the bytes past the clamp are usually preallocated zero
+// fill, and counting a near-whole segment of phantom loss for every torn
+// header is exactly what abortedCreate exists to avoid. LostBytes is
+// documented as a lower bound, and the walk cannot tell fill from loss.
+//
+// A walk that cannot run at all answers ok=false and the torn-header verdict
+// stands: failing to look licenses nothing.
+func (s *store) salvageTornHeader(num uint64, path string, base, size int64) (*dataFile, int64, bool) {
+	df := &dataFile{
+		num:  num,
+		path: path,
+		hdr:  make([]byte, headerSize),
+		base: base,
+		size: size - headerSize, // bound the walk by what is physically there
+	}
+	n, end, err := s.countVerified(df)
+	if err != nil {
+		if df.f != nil {
+			_ = df.f.Close() // nothing written through it; nothing to lose
+			df.f = nil
+			s.untrackOpen(df)
+		}
+		return nil, 0, false
+	}
+	df.size = end - base
+	df.written = n
+	// The walk read through the block cache, which may now hold bytes past the
+	// clamped extent — bytes a later append will legitimately overwrite. Served
+	// stale they would mis-frame the fresh record; drop the block.
+	s.dropBlock()
+
+	// Capacity from the file's own length, floored at the configured geometry so
+	// the extension in load never truncates the file: an ordinary full-length
+	// segment lands exactly on segmentSize, an oversized one on its own framed
+	// length (and is re-flagged so reopen keeps exempting it), and a file that
+	// lost tail bytes is re-extended to the standard geometry.
+	capacity := max(size-headerSize, s.segmentSize)
+	df.capacity = capacity
+	mods := []func(*dataFile){
+		(*dataFile).initHeader,
+		setCommitCursor(headerSize), // the old position is unknowable; replay
+		setWriteCursor(headerSize + df.size),
+		setWrittenCount(df.written),
+		setCommittedCount(0),
+		setHdrCapacity(capacity),
+		setHdrSegSize(s.segmentSize),
+	}
+	if capacity > s.segmentSize {
+		mods = append(mods, setOversized())
+	}
+	df.header(mods...)
+	// Mark it for the repair pass in load, which republishes the rebuilt header
+	// durably and re-extends the file — the same aftercare a truncated segment
+	// gets, for the same reason: the next open must find a header it can believe.
+	df.truncated = true
+
+	s.corruptions++
+	s.pendingCorrupt++
+	return df, headerSize, true
+}
+
+// countVerified counts the whole, checksum-verified record frames at the start
+// of df's data region, returning the count and the offset just past the last
+// one. It is surviveCount with the trust turned all the way down: with no
+// believable header, a frame that merely decodes is not evidence — in the
+// region past the true (lost) write cursor, decoding is exactly what zero fill
+// does — so only a payload matching its stored checksum extends the walk.
+func (s *store) countVerified(df *dataFile) (int64, int64, error) {
+	if err := s.ensureOpen(df); err != nil {
+		return 0, 0, err
+	}
+	var n int64
+	off := df.base
+	for off < df.base+df.size {
+		payload, sum, next, ok, err := s.recordAt(df, off)
+		if err != nil || !ok || xxhash.Sum64(payload) != sum {
+			break // no verifiable frame starts here; the rest is unaddressable
 		}
 		off = next
 		n++
