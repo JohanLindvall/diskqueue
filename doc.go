@@ -64,12 +64,26 @@ deliberately leaves the record in place (see [ErrCodec]). [Reader.Requeue] moves
 to the back instead, so a single poison record costs a reordering rather than
 either data loss or a stalled queue.
 
+[Reader.TryPeek] inspects the front item without consuming it: no cursor moves
+— unlike Reserve, which advances the shared read cursor — and the next read by
+any Reader returns the same item. A damaged head previews as [ErrCorrupt] with
+nothing dropped and nothing counted; the consume op that eventually steps past
+the damage books it exactly once.
+
 # Durability
 
 Every [Queue.Add] writes the record and then, separately, the header that
 publishes it — data before header, each with its own fsync. A power loss can
 therefore truncate the log cleanly but can never expose a record whose payload
 never landed.
+
+Under the default per-op policy those fsyncs are shared, not repeated: an Add
+that arrives while another Add's fsync is in flight joins the next flush span,
+so one data fsync and one header fsync cover every record that joined (group
+commit). Each Add still returns only once its own record is durable — the
+sharing changes the cost, not the contract. [Queue.AddBatch] amortizes the
+same way across a batch from one goroutine, and returns how many leading items
+were placed, each durable, when it stops early.
 
 How often that fsync happens is the main throughput knob:
 
@@ -167,6 +181,11 @@ store built at a different SegmentSize. [ErrRecordTooLarge] is now reserved for 
 record larger than [Options].MaxBytes, which no amount of draining can ever admit —
 as opposed to [ErrFull], which clears as the consumer catches up.
 
+[Queue.AddWait] is the blocking half of that backpressure: where Add answers
+[ErrFull], AddWait parks until a commit frees capacity (or its context is
+done) and then retries, so a producer can lean on the queue instead of polling
+it. [ErrRecordTooLarge] still returns immediately — waiting cannot fix it.
+
 Segments are preallocated with fallocate where available, so a full filesystem is
 discovered at segment creation rather than mid-record. [Options].MaxOpenFiles
 bounds open descriptors for deep backlogs by closing least-recently-used handles;
@@ -208,10 +227,14 @@ another reads would have its bytes rewritten from a different goroutine.
 
 # Performance
 
-The hot paths are allocation-free once warm. Add serializes through a reused
-buffer and writes each record with a single pwrite; reads go through a shared
-block buffer that holds a run of a segment rather than a single record, so
-consuming a backlog costs roughly one pread per block instead of two per record.
+The hot paths are allocation-free once warm. Add serializes through a pooled
+buffer BEFORE taking the queue's lock — so codecs run concurrently across
+producers and never stall a consumer — and writes each record with a single
+pwrite; reads go through a shared block buffer that holds a run of a segment
+rather than a single record, so consuming a backlog costs roughly one pread
+per block instead of two per record. Under per-op durability, concurrent Adds
+share their fsyncs through group commit, so durable throughput scales with
+producers instead of serializing on the disk.
 
 # On-disk format
 

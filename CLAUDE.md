@@ -24,9 +24,11 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
   deliberately *not* split further: pulling `writeHeader`/`flushFile` away from `append` and
   `commitTo` would separate the calls whose order is the whole point (see the
   data-before-header invariant below).
-- [diskqueue.go](diskqueue.go) — the generic `Queue[T]` writer/owner (Add, Empty/Count/Size,
-  Stats/Rewind/Sync/Err/Close, NewReader) on top of `store`.
-- [reader.go](reader.go) — `Reader[T]`: all consume ops (Reserve/Take/Commit/
+- [diskqueue.go](diskqueue.go) — the generic `Queue[T]` writer/owner (Add/AddWait/AddBatch,
+  Empty/Count/Size, Stats/Rewind/Sync/Err/Close, NewReader) on top of `store`,
+  including the group-commit leader/follower machinery (`addDurableLocked`,
+  `leadFlushLocked`, the quiesce/space signals).
+- [reader.go](reader.go) — `Reader[T]`: all consume ops (TryPeek/Reserve/Take/Commit/
   Drain/Follow/Err); copies each record into its own scratch buffer.
 - [prealloc_linux.go](prealloc_linux.go) / [prealloc_other.go](prealloc_other.go) — `preallocate`:
   `syscall.Fallocate` (stdlib, Linux) with an `ftruncate` fallback everywhere else and on
@@ -350,8 +352,57 @@ mirrors its own `written`/`committed` counts into its header.
   reclaims. The arm is unreachable through the public API (both callers pass a
   cursor `commitTo` keeps inside a live segment) and cannot be deleted either —
   dropping the guard nil-derefs on the next line.
+- **Staged records are invisible until their span publishes.** The per-op
+  append path (Queue-level: `addDurableLocked`/`leadFlushLocked`/
+  `publishBatchLocked` over the store's `stagePending`/`takeSpan`/
+  `publishSpan`) writes record bytes past the published extent and tracks them
+  only in `pendingBytes`/`inFlight`: `df.hdr`, `af.size`, `writeOff` and
+  `nWritten` move at publication, never at staging. That single rule is what
+  lets the flush leader release the queue mutex during its fsyncs — readers,
+  `commitTo`, `Stats` and a crash all see the published extent only, so
+  nothing can deliver, commit or recover a record whose bytes are not yet
+  durable. A header write racing the data fsync is the torn state the solo
+  append's ordering exists to prevent; staging keeps the header out of reach
+  by construction.
+- **Every staged record lives in the active file** — cycling, `AddBatch`,
+  `Requeue`, `Sync` and `Close` quiesce first (`waitFlushQuiescedLocked`) — so
+  a failed publication discards exactly one contiguous tail
+  (`discardStaged`/`unpublishSpan`) and the in-memory view snaps back to the
+  header that never changed. The span failure arms mirror the solo append's:
+  data-fsync failure latches with nothing published, header-write failure
+  discards with nothing latched, header-fsync failure latches with the span
+  real in the page cache. `faults_test.go` pins the ordering for all three
+  shapes (solo, group, batch) under the same injection-point names.
+- **Group commit shares the fsyncs, not the contract.** A solo Add leads a span
+  of one and allocates nothing (the `flushGroup` is created only by a follower
+  that arrives mid-flush), which is what keeps `BenchmarkAddTake` at 0
+  allocs/op. Followers wait on their group's `done` channel and take the
+  span's verdict; the leader drains spans until nothing is pending, then
+  clears `flushing` and wakes the quiesce waiters. After ANY wait that
+  released the lock (quiesce, space, follower), re-check `closed` — staging
+  onto a closed store would reopen handles Close just released. `Requeue`
+  quiesces BEFORE its `takeHead`, because its rotation must be atomic under
+  one continuous lock hold (its `rewindHead` on failure may not undo another
+  reader's progress). The leader deliberately leaves `af.dirty` set after its
+  header fsync — a commit may have rewritten the header while the lock was
+  away, and clearing it would skip that write's flush.
+- **Marshal runs outside the lock for Add/AddWait** (pooled `marshalBuf`, so
+  codecs run concurrently across producers and a slow codec cannot stall
+  consumers); `AddBatch` marshals under the lock through `w.scratch`. Both
+  keep the no-callback rule: `MarshalFunc` must never call back into the
+  queue.
+- **`peekHead` previews, it never books.** `Reader.TryPeek` moves no cursor,
+  pays down no `pendingCorrupt`, and its `ErrCorrupt` is uncounted — the
+  consume op that steps past the damage books the event exactly once. Don't
+  add accounting to the peek path; double-counting a loss is how operators
+  stop trusting `Corruptions`.
 - **Blocking waiters.** `waitLocked`/`signal` use a lazily-created `notify`
-  channel, nil when nobody waits, so `Add` stays allocation-free.
+  channel, nil when nobody waits, so `Add` stays allocation-free. The same
+  pattern runs the other two waits: `spaceNotify` (consume ops wake `AddWait`
+  producers; every commit-capable Reader op signals it, spurious wakes are
+  re-checked) and `flushDrained` (the flush leader wakes quiesce waiters).
+  `Close` closes `notify` AND `spaceNotify`, then quiesces the flush before
+  `st.close()` so a leader mid-fsync finishes on live handles.
 - **`Reader.Drain`/`Follow` consume** via the shared `headOff` (like iterator-
   shaped `Take`): read **and `commitTo` under the lock**, then release and yield —
   so they commit-on-read (at-most-once) and are safe for concurrent cooperating

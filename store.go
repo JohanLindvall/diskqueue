@@ -57,6 +57,26 @@ type store struct {
 	lruLRU *dataFile
 	nOpen  int
 
+	// Staged appends (per-op policy only). A staged record's bytes are written
+	// past the published extent and tracked here; NOTHING else knows about it —
+	// df.hdr is untouched (a header write racing the data fsync would publish
+	// bytes not yet durable), af.size/writeOff/nWritten move only when a span
+	// publishes, so readers, recovery and Stats never see a staged record.
+	// pendingBytes/pendingRecs accumulate records waiting for a flush;
+	// inFlight/inFlightRecs are the span a leader is currently making durable.
+	// Every staged record lives in the ACTIVE file — cycling quiesces first —
+	// so a failed publication discards one contiguous tail and nothing more.
+	pendingBytes int64
+	pendingRecs  int64
+	inFlight     int64
+	inFlightRecs int64
+	// flushing is true while a flush leader is between fsyncs with the queue
+	// lock released; curGroup collects the followers who staged during that
+	// window (they are covered by the NEXT span and wait on its verdict). A
+	// solo append leads its own span and allocates no group.
+	flushing bool
+	curGroup *flushGroup
+
 	// lastFrameAt/lastFrameEnd cache the boundary of the record the most recent
 	// read crossed. Every consume path is read-then-commit under one lock, so the
 	// commit walk starts exactly where that read started and would otherwise pread
@@ -439,22 +459,16 @@ func (s *store) appendRecord(payload []byte, force bool) error {
 	}
 	L := len(payload)
 	recLen := int64(uvarintLen(uint64(L)) + L + checksumSize)
-	if !force && s.maxBytes > 0 {
-		// Two different answers, because they call for different handling. A record
-		// that cannot fit the cap on an EMPTY queue will never fit, so retrying is
-		// futile and the caller must drop or split it. One that merely does not fit
-		// right now is backpressure, and clears as the consumer drains.
-		if recLen > s.maxBytes {
-			return ErrRecordTooLarge
-		}
-		if s.size()+recLen > s.maxBytes {
-			s.nFull++
-			return ErrFull
-		}
+	// Two different answers, because they call for different handling. A record
+	// that cannot fit the cap on an EMPTY queue will never fit, so retrying is
+	// futile and the caller must drop or split it. One that merely does not fit
+	// right now is backpressure, and clears as the consumer drains.
+	if err := s.admitRecord(recLen, force); err != nil {
+		return err
 	}
 
 	af := s.active()
-	if af == nil || af.size+recLen > af.capacity {
+	if s.needsCycle(recLen) {
 		if err := s.cycle(recLen, force); err != nil {
 			if errors.Is(err, ErrFull) {
 				s.nFull++
@@ -479,8 +493,7 @@ func (s *store) appendRecord(payload []byte, force bool) error {
 	if werr != nil {
 		return werr // nothing advanced; the bytes are unreferenced and overwritable
 	}
-	perOp := !s.noSync && !s.batched()
-	if perOp {
+	if s.perOp() {
 		// Per-op: fsync the record bytes before the header publishes them. Syncing
 		// the data first guarantees a crash can only ever lose the header update (a
 		// clean truncation), never leave a published record whose payload never
@@ -551,6 +564,151 @@ func (s *store) rollbackAppend(af *dataFile, recLen int64) {
 		setWriteCursor(headerSize+af.size),
 		setWrittenCount(af.written),
 	)
+}
+
+// flushGroup carries the verdict of one flush span to the followers who staged
+// records into it while the previous span's fsyncs were in flight. Allocated
+// only under actual producer concurrency: a solo append leads its own span,
+// waits on nobody, and creates no group — which is what keeps the single-
+// producer hot path at zero allocations.
+type flushGroup struct {
+	done chan struct{}
+	err  error
+}
+
+// stagedBytes is what has been written but not yet published — the in-flight
+// span plus the pending tail behind it.
+func (s *store) stagedBytes() int64 { return s.inFlight + s.pendingBytes }
+
+// perOp reports the default durability policy: fsync per operation. The staged
+// span machinery exists only for this policy — the deferred policies already
+// amortize their fsyncs and use the plain append path.
+func (s *store) perOp() bool { return !s.noSync && !s.batched() }
+
+// admitRecord applies the byte cap to a record of framed length recLen,
+// counting the staged backlog: staged records occupy real disk and memory, so
+// backpressure must see them even though readers cannot yet.
+func (s *store) admitRecord(recLen int64, force bool) error {
+	if !force && s.maxBytes > 0 {
+		if recLen > s.maxBytes {
+			return ErrRecordTooLarge
+		}
+		if s.size()+s.stagedBytes()+recLen > s.maxBytes {
+			s.nFull++
+			return ErrFull
+		}
+	}
+	return nil
+}
+
+// needsCycle reports whether a record of framed length recLen fits the active
+// file behind everything already staged into it.
+func (s *store) needsCycle(recLen int64) bool {
+	af := s.active()
+	return af == nil || af.size+s.stagedBytes()+recLen > af.capacity
+}
+
+// stagePending writes payload as a record past everything already staged,
+// touching no header and no cursor: the record is invisible to readers,
+// recovery and Stats until publishSpan moves it into the published extent.
+// The caller has already handled admission and cycling; the active file is
+// open (every stage path ensures it).
+func (s *store) stagePending(payload []byte) error {
+	af := s.active()
+	if err := s.ensureOpen(af); err != nil {
+		return err
+	}
+	if err := faultPoint("append.writeRecord"); err != nil {
+		return err
+	}
+	werr := s.writeRecord(af, af.size+s.stagedBytes(), payload)
+	s.writeBuf = trimOver(s.writeBuf, s.segmentSize)
+	if werr != nil {
+		return werr // nothing tracked; the bytes are unreferenced and overwritable
+	}
+	L := len(payload)
+	s.pendingBytes += int64(uvarintLen(uint64(L)) + L + checksumSize)
+	s.pendingRecs++
+	return nil
+}
+
+// takeSpan moves the pending records into the in-flight span a leader is about
+// to make durable. The previous span must have settled (published or
+// discarded) first; the leader loop guarantees it.
+func (s *store) takeSpan() {
+	s.inFlight, s.inFlightRecs = s.pendingBytes, s.pendingRecs
+	s.pendingBytes, s.pendingRecs = 0, 0
+}
+
+// publishSpan moves the in-flight span into the published extent and writes
+// the header that publishes it — data-before-header holds span-wide, because
+// the caller fsync'd the span's bytes before calling. A failed header write
+// discards the span AND the pending tail staged behind it: the two are one
+// contiguous run past the (unchanged) published cursor, which is exactly what
+// the quiesce-before-cycle rule buys, so the store's view snaps back to the
+// header that never changed and the next stage overwrites the dead bytes.
+func (s *store) publishSpan() error {
+	af := s.active()
+	af.size += s.inFlight
+	af.written += s.inFlightRecs
+	s.writeOff += s.inFlight
+	s.nWritten += s.inFlightRecs
+	s.nAdded += uint64(s.inFlightRecs)
+	af.header(
+		setWriteCursor(headerSize+af.size),
+		setWrittenCount(af.written),
+	)
+	if err := faultPoint("append.writeHeader"); err != nil {
+		s.unpublishSpan(af)
+		return err
+	}
+	if err := s.writeHeader(af); err != nil {
+		s.unpublishSpan(af)
+		return err
+	}
+	s.inFlight, s.inFlightRecs = 0, 0
+	return nil
+}
+
+// unpublishSpan reverses publishSpan's in-memory advance after a failed header
+// write and discards everything staged. Nothing on disk moved: the header
+// bytes never left df.hdr, and the record bytes sit past the write cursor
+// where nothing can address them.
+func (s *store) unpublishSpan(af *dataFile) {
+	af.size -= s.inFlight
+	af.written -= s.inFlightRecs
+	s.writeOff -= s.inFlight
+	s.nWritten -= s.inFlightRecs
+	s.nAdded -= uint64(s.inFlightRecs)
+	af.header(
+		setWriteCursor(headerSize+af.size),
+		setWrittenCount(af.written),
+	)
+	s.discardStaged()
+}
+
+// discardStaged forgets every staged-but-unpublished record — the response to
+// any failure that makes the staged tail unpublishable (a failed data fsync, a
+// failed header write). Their bytes lie past the published write cursor, where
+// the next stage overwrites them.
+func (s *store) discardStaged() {
+	s.inFlight, s.inFlightRecs = 0, 0
+	s.pendingBytes, s.pendingRecs = 0, 0
+}
+
+// peekHead returns the record at the head cursor without consuming anything:
+// no cursor moves, no count changes, no owed report is paid, and no loss is
+// booked. An ErrCorrupt from here is a PREVIEW, not an event — the consume op
+// that eventually steps past the damage books and reports it exactly once.
+func (s *store) peekHead() ([]byte, bool, error) {
+	payload, sum, _, ok, err := s.read(s.headOff)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	if xxhash.Sum64(payload) != sum {
+		return nil, false, fmt.Errorf("%w: record checksum", ErrCorrupt)
+	}
+	return payload, true, nil
 }
 
 // cycle drops any now fully-committed files and starts a fresh active file. It
@@ -960,7 +1118,7 @@ func (s *store) commitTo(off int64) error {
 	// Per-op policy flushes each file's header once, not once per record: commits
 	// cross files in order, so flush a file when the commit leaves it, and the
 	// last at the end. A crash before the flush replays the batch (at-least-once).
-	perOp := !s.noSync && !s.batched()
+	perOp := s.perOp()
 	var cur *dataFile // file with header changes not yet written out
 	var stop error
 	advanced := false

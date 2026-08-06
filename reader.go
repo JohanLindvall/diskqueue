@@ -38,12 +38,48 @@ type Reader[T any] struct {
 // afterwards. Stats().LostBytes and LostRecords say how much was lost.
 func (r *Reader[T]) Err() error { return r.err }
 
+// TryPeek returns the front item WITHOUT consuming it: no cursor moves, the
+// item stays exactly where it is, and the next read — by any Reader — returns
+// it again. ok is false when the queue is empty.
+//
+// It is the inspection the consume ops cannot provide: TryReserve advances the
+// shared read cursor (that is why Empty can be true while Count is not zero),
+// while TryPeek leaves every cursor alone. The value is decoded through this
+// Reader's buffer and is valid until the Reader's next read, like every other
+// delivery.
+//
+// A damaged head returns ErrCorrupt as a PREVIEW: nothing is dropped, nothing
+// is counted, and Stats does not move — the consume op that eventually steps
+// past the damage books and reports it exactly once. Likewise TryPeek does not
+// surface the corruption reports owed for segments dropped at open; those
+// belong to the consume ops.
+func (r *Reader[T]) TryPeek() (T, bool, error) {
+	var zero T
+	r.w.mu.Lock()
+	defer r.w.mu.Unlock()
+	if r.w.closed {
+		return zero, false, ErrClosed
+	}
+	payload, ok, err := r.w.st.peekHead()
+	if err != nil || !ok {
+		return zero, false, err
+	}
+	r.scratch = append(r.scratch[:0], payload...) // copy out of the store's read buffer
+	v, uerr := r.w.unmarshal(r.scratch)
+	if uerr != nil {
+		return zero, false, fmt.Errorf("%w: %w", ErrCodec, uerr)
+	}
+	r.trimScratch()
+	return v, true, nil
+}
+
 // TryReserve returns the front item and its offset without committing; ok is
 // false when empty. Pass the offset to Commit (or call Take) to consume it.
 func (r *Reader[T]) TryReserve() (T, bool, int64, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // a quarantine on the read path can advance the commit cursor
 	if r.w.closed {
 		return zero, false, 0, ErrClosed
 	}
@@ -63,6 +99,7 @@ func (r *Reader[T]) TryTake() (T, bool, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return zero, false, ErrClosed
 	}
@@ -79,6 +116,7 @@ func (r *Reader[T]) Reserve(ctx context.Context) (T, bool, int64, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // a quarantine on the read path can advance the commit cursor
 	for {
 		if r.w.closed {
 			return zero, false, 0, ErrClosed
@@ -103,6 +141,7 @@ func (r *Reader[T]) Take(ctx context.Context) (T, bool, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
 	for {
 		if r.w.closed {
 			return zero, false, ErrClosed
@@ -132,6 +171,7 @@ func (r *Reader[T]) Take(ctx context.Context) (T, bool, error) {
 func (r *Reader[T]) Commit(offset int64) error {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return ErrClosed
 	}
@@ -161,6 +201,7 @@ func (r *Reader[T]) Commit(offset int64) error {
 func (r *Reader[T]) Skip() (bool, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return false, ErrClosed
 	}
@@ -227,6 +268,7 @@ func (r *Reader[T]) next(ctx context.Context, follow bool, end int64) (T, bool, 
 	w := r.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	defer w.signalSpace() // iterators commit as they read; producers may be waiting
 	for {
 		if w.closed {
 			return zero, false, nil
@@ -365,6 +407,15 @@ func (r *Reader[T]) trimScratch() {
 func (r *Reader[T]) Requeue() (bool, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // the head commit may free capacity a producer waits on
+	if r.w.closed {
+		return false, ErrClosed
+	}
+	// Quiesce any in-flight flush BEFORE the takeHead: the rotation must be
+	// atomic under one continuous lock hold (its rewindHead on failure may not
+	// undo another reader's progress), so its append runs the synchronous
+	// solo path, which requires nothing staged and no leader mid-span.
+	r.w.waitFlushQuiescedLocked()
 	if r.w.closed {
 		return false, ErrClosed
 	}

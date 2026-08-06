@@ -275,3 +275,223 @@ func TestCrashBetweenDataSyncAndHeader(t *testing.T) {
 		t.Fatalf("segment stat: size=%v err=%v", fi.Size(), err)
 	}
 }
+
+// The group-commit path (Queue.Add under the per-op policy) and the batch path
+// (Queue.AddBatch) restate append's ordering invariant span-wide: every staged
+// record's bytes are fsync'd before the header that publishes the span is
+// written. The same injection point names fire in the same order, so the
+// contract is pinned identically for all three shapes of durable append.
+
+// TestGroupAppendOrdersDataBeforeHeader: a solo Add through the Queue leads a
+// span of one, and the four points pass in exactly the solo order.
+func TestGroupAppendOrdersDataBeforeHeader(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	seen := injectAt(t, "", nil)
+	if err := w.Add(7); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"append.writeRecord", "append.syncData", "append.writeHeader", "append.syncHeader"}
+	if len(*seen) != len(want) {
+		t.Fatalf("group append passed %v, want %v", *seen, want)
+	}
+	for i, s := range want {
+		if (*seen)[i] != s {
+			t.Fatalf("group append order %v, want %v", *seen, want)
+		}
+	}
+}
+
+// TestBatchOrdersDataBeforeHeader: the batch writes every record first, then
+// one data fsync, one header write, one header fsync — the amortization the
+// method exists for, with the ordering intact.
+func TestBatchOrdersDataBeforeHeader(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	seen := injectAt(t, "", nil)
+	if n, err := w.AddBatch([]uint64{1, 2, 3}); n != 3 || err != nil {
+		t.Fatalf("AddBatch: n=%d err=%v", n, err)
+	}
+	want := []string{
+		"append.writeRecord", "append.writeRecord", "append.writeRecord",
+		"append.syncData", "append.writeHeader", "append.syncHeader",
+	}
+	if len(*seen) != len(want) {
+		t.Fatalf("batch passed %v, want %v", *seen, want)
+	}
+	for i, s := range want {
+		if (*seen)[i] != s {
+			t.Fatalf("batch order %v, want %v", *seen, want)
+		}
+	}
+}
+
+// TestGroupHeaderWriteFailureRollsBack: the span's header never reached the
+// page cache, so nothing is published, nothing latches, and the retry lands in
+// the same space — the solo arm's contract, span-wide.
+func TestGroupHeaderWriteFailureRollsBack(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Add(0); err != nil {
+		t.Fatal(err)
+	}
+
+	injectAt(t, "append.writeHeader", errInjected)
+	if err := w.Add(1); !errors.Is(err, errInjected) {
+		t.Fatalf("Add with a failing header write: %v, want the injected error", err)
+	}
+	if w.Err() != nil {
+		t.Fatalf("Err=%v: a failed header WRITE must not poison the queue", w.Err())
+	}
+	if got := w.Count(); got != 1 {
+		t.Fatalf("Count=%d, want 1: the failed span must not be visible", got)
+	}
+	faultHook = nil
+	if err := w.Add(1); err != nil {
+		t.Fatal(err)
+	}
+	r := w.NewReader()
+	for i := uint64(0); i < 2; i++ {
+		v, ok, err := r.TryTake()
+		if err != nil || !ok || v != i {
+			t.Fatalf("record %d: v=%d ok=%v err=%v", i, v, ok, err)
+		}
+	}
+}
+
+// TestGroupDataSyncFailureLatches: the span's bytes may already be gone, so
+// nothing is published and the store poisons — and the record is NOT in the
+// queue, exactly as a solo append's data-fsync arm promises.
+func TestGroupDataSyncFailureLatches(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Add(0); err != nil {
+		t.Fatal(err)
+	}
+
+	injectAt(t, "append.syncData", errInjected)
+	if err := w.Add(1); !errors.Is(err, ErrIO) {
+		t.Fatalf("Add with a failing data fsync: %v, want ErrIO", err)
+	}
+	if got := w.Count(); got != 1 {
+		t.Fatalf("Count=%d, want 1: the unfsync'd record must not be visible", got)
+	}
+	if !errors.Is(w.Err(), ErrIO) {
+		t.Fatalf("Err=%v, want the latched ErrIO", w.Err())
+	}
+}
+
+// TestGroupHeaderSyncFailureKeepsRecord: the header reached the page cache, so
+// the record is real to everything short of a power loss — it stays, the error
+// reports the durability gap, and the store poisons.
+func TestGroupHeaderSyncFailureKeepsRecord(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	injectAt(t, "append.syncHeader", errInjected)
+	if err := w.Add(7); !errors.Is(err, ErrIO) {
+		t.Fatalf("Add with a failing header fsync: %v, want ErrIO", err)
+	}
+	if got := w.Count(); got != 1 {
+		t.Fatalf("Count=%d, want 1: the page-cache-published record stays", got)
+	}
+	v, ok, err := w.NewReader().TryTake()
+	if !ok || v != 7 {
+		t.Fatalf("reading the record back: v=%d ok=%v err=%v", v, ok, err)
+	}
+}
+
+// TestBatchDataSyncFailureLatches: the batch's span could not be made durable,
+// so none of it is published — n says zero, the error says latched.
+func TestBatchDataSyncFailureLatches(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	injectAt(t, "append.syncData", errInjected)
+	n, berr := w.AddBatch([]uint64{1, 2, 3})
+	if n != 0 || !errors.Is(berr, ErrIO) {
+		t.Fatalf("AddBatch with a failing data fsync: n=%d err=%v, want 0 and ErrIO", n, berr)
+	}
+	if got := w.Count(); got != 0 {
+		t.Fatalf("Count=%d, want 0: an unpublished span must not be visible", got)
+	}
+}
+
+// TestBatchHeaderWriteFailureDiscards: the span's header never reached the
+// page cache — the whole staged batch is discarded, nothing latches, and the
+// retry succeeds into the same space.
+func TestBatchHeaderWriteFailureDiscards(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	injectAt(t, "append.writeHeader", errInjected)
+	n, berr := w.AddBatch([]uint64{1, 2, 3})
+	if n != 0 || !errors.Is(berr, errInjected) {
+		t.Fatalf("AddBatch with a failing header write: n=%d err=%v, want 0 and the injected error", n, berr)
+	}
+	if w.Err() != nil {
+		t.Fatalf("Err=%v: a failed header WRITE must not poison the queue", w.Err())
+	}
+	faultHook = nil
+	n, berr = w.AddBatch([]uint64{1, 2, 3})
+	if n != 3 || berr != nil {
+		t.Fatalf("retry: n=%d err=%v", n, berr)
+	}
+	r := w.NewReader()
+	for _, want := range []uint64{1, 2, 3} {
+		v, ok, err := r.TryTake()
+		if err != nil || !ok || v != want {
+			t.Fatalf("record %d: v=%d ok=%v err=%v", want, v, ok, err)
+		}
+	}
+}
+
+// TestBatchHeaderSyncFailureKeepsRecords: the header reached the page cache,
+// so the span's records are real short of a power loss — n counts them, the
+// latched error carries the durability gap.
+func TestBatchHeaderSyncFailureKeepsRecords(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, Options{SegmentSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+
+	injectAt(t, "append.syncHeader", errInjected)
+	n, berr := w.AddBatch([]uint64{1, 2, 3})
+	if n != 3 || !errors.Is(berr, ErrIO) {
+		t.Fatalf("AddBatch with a failing header fsync: n=%d err=%v, want 3 and ErrIO", n, berr)
+	}
+	if got := w.Count(); got != 3 {
+		t.Fatalf("Count=%d, want 3: page-cache-published records stay", got)
+	}
+	r := w.NewReader()
+	for _, want := range []uint64{1, 2, 3} {
+		v, ok, err := r.TryTake()
+		if !ok || v != want {
+			t.Fatalf("record %d: v=%d ok=%v err=%v", want, v, ok, err)
+		}
+	}
+}

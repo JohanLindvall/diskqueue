@@ -164,3 +164,58 @@ func BenchmarkBatchCommit(b *testing.B) {
 		b.StartTimer()
 	}
 }
+
+// BenchmarkAddBatch measures the amortized durable append against its per-Add
+// equivalent: one lock round and (per segment) one data fsync + one header
+// write + one header fsync for the whole batch. Must stay 0 allocs/op like
+// every other hot path.
+func BenchmarkAddBatch(b *testing.B) {
+	const batch = 100
+	m, u := bytesCodec()
+	w, err := New[[]byte](b.TempDir(), m, u, Options{MaxSegments: -1}) // per-op durability
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	r := w.NewReader()
+	items := make([][]byte, batch)
+	for i := range items {
+		items[i] = benchPayload
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if n, err := w.AddBatch(items); n != batch || err != nil {
+			b.Fatalf("AddBatch: n=%d err=%v", n, err)
+		}
+		b.StopTimer()
+		for j := 0; j < batch; j++ { // drain so the backlog stays flat
+			if _, ok, err := r.TryTake(); !ok || err != nil {
+				b.Fatalf("drain: ok=%v err=%v", ok, err)
+			}
+		}
+		b.StartTimer()
+	}
+}
+
+// BenchmarkAddParallel is the group-commit case: many producers on the per-op
+// policy, each Add individually durable, the fsyncs shared across whoever
+// arrived while the previous span was in flight. Compare against
+// BenchmarkAddDurable/SyncEvery1 to see what the sharing buys.
+func BenchmarkAddParallel(b *testing.B) {
+	m, u := bytesCodec()
+	w, err := New[[]byte](b.TempDir(), m, u, Options{MaxSegments: -1}) // per-op durability
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := w.Add(benchPayload); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

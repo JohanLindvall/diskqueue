@@ -179,7 +179,9 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | Method | Description |
 | --- | --- |
 | `New[T](path, marshal, unmarshal, ...Options)` | Open/create a Queue at `path` (segment cap via `Options.MaxSegments`, default 32). |
-| `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments` or `MaxBytes` (transient), `ErrRecordTooLarge` if it can never fit under `MaxBytes` (permanent). A record too big for one segment gets a segment of its own. |
+| `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments` or `MaxBytes` (transient), `ErrRecordTooLarge` if it can never fit under `MaxBytes` (permanent). A record too big for one segment gets a segment of its own. Serialization runs before the lock, and under the default policy concurrent `Add`s share their fsyncs (group commit) while each record stays individually durable. |
+| `AddWait(ctx, v T) error` | `Add` with backpressure: blocks while the queue is full, until a commit frees capacity or `ctx` is done. `ErrRecordTooLarge` still returns immediately. |
+| `AddBatch(items []T) (int, error)` | Append items in order with the fsyncs amortized over the whole batch (per segment: one data fsync, one header write, one header fsync). Returns how many leading items were placed — on error the first `n` are in and durable, the rest are not. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
 | `Empty() bool` | Whether anything is available to read. |
 | `Count() int` | Number of items added but not yet committed. |
@@ -194,6 +196,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 
 | Method | Description |
 | --- | --- |
+| `TryPeek() (T, bool, error)` | Look at the front item without consuming it: no cursor moves, and the next read (by any Reader) returns the same item. A damaged head previews as `ErrCorrupt` with nothing dropped or counted. |
 | `TryReserve() (T, bool, int64, error)` | Non-blocking read; returns the item and its offset. |
 | `TryTake() (T, bool, error)` | Non-blocking read + commit. |
 | `Reserve(ctx) (T, bool, int64, error)` | Block until an item is available, then read it. |
