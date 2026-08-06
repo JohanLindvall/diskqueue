@@ -224,7 +224,9 @@ type Queue[T any] struct {
 
 // New opens (creating if necessary) a Queue under the directory path. The segment
 // count, durability, and recovery behaviour are tuned via Options (see
-// Options.MaxSegments for the file-count cap, which defaults to 32).
+// Options.MaxSegments for the file-count cap, which defaults to 32). The
+// variadic opts exists only to make the whole argument optional: the first
+// value is used and any further ones are ignored.
 func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T], opts ...Options) (*Queue[T], error) {
 	if marshal == nil || unmarshal == nil {
 		// Caught here rather than as a nil call on the first Add: construction is
@@ -338,18 +340,11 @@ func (w *Queue[T]) Add(data T) error {
 
 // dropOversizedScratch releases the marshal buffer once it has grown past the
 // segment geometry — the size of the largest ORDINARY record, and therefore of
-// anything the steady state ever needs.
-//
-// Oversized records are admitted (into segments of their own), so this runs on
-// success as well as failure: keeping the buffer would pin the largest record
-// ever marshalled for the life of the queue. The store's frame and block buffers
-// and the Reader's copy follow the same rule at their own sites (append,
-// dropBlock, trimScratch). On the hot path this is one integer compare, so the
-// zero-allocation property stands.
+// anything the steady state ever needs. Oversized records are admitted (into
+// segments of their own), so this runs on success as well as failure; see
+// trimOver for the package-wide policy.
 func (w *Queue[T]) dropOversizedScratch() {
-	if int64(cap(w.scratch)) > w.st.segmentSize {
-		w.scratch = nil
-	}
+	w.scratch = trimOver(w.scratch, w.st.segmentSize)
 }
 
 // Empty reports whether there are no items available to read.

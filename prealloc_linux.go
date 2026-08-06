@@ -23,20 +23,11 @@ import (
 // sparse segment. A real out-of-space answer (ENOSPC, EDQUOT) is returned to the
 // caller.
 func preallocate(f *os.File, size int64) error {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var ferr error
-	if cerr := rc.Control(func(fd uintptr) {
-		for {
-			ferr = syscall.Fallocate(int(fd), 0, 0, size)
-			if !errors.Is(ferr, syscall.EINTR) {
-				return
-			}
-		}
-	}); cerr != nil {
-		return cerr
+	ctlErr, ferr := fdControl(f, func(fd uintptr) error {
+		return syscall.Fallocate(int(fd), 0, 0, size)
+	})
+	if ctlErr != nil {
+		return ctlErr
 	}
 	switch {
 	case ferr == nil:

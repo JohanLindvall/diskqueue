@@ -18,20 +18,11 @@ import (
 // Filesystems without lock support answer ENOTSUP/ENOLCK/EINVAL — there we run
 // unlocked rather than refusing to open.
 func tryLockDir(d *os.File) error {
-	rc, err := d.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var lerr error
-	if cerr := rc.Control(func(fd uintptr) {
-		for {
-			lerr = syscall.Flock(int(fd), syscall.LOCK_EX|syscall.LOCK_NB)
-			if !errors.Is(lerr, syscall.EINTR) {
-				return
-			}
-		}
-	}); cerr != nil {
-		return cerr
+	ctlErr, lerr := fdControl(d, func(fd uintptr) error {
+		return syscall.Flock(int(fd), syscall.LOCK_EX|syscall.LOCK_NB)
+	})
+	if ctlErr != nil {
+		return ctlErr
 	}
 	switch {
 	case lerr == nil:

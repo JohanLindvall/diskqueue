@@ -126,6 +126,9 @@ func (r *Reader[T]) Take(ctx context.Context) (T, bool, error) {
 // The offset must be one a read handed out: committing past the shared read
 // cursor returns ErrInvalidOffset rather than reclaiming records nobody has seen
 // (which would delete them, and the segment a reader is positioned in with them).
+// An offset that falls inside a record rather than on a boundary is not an
+// error: the commit stops at the last record ending at or before it — the bias
+// everywhere is to redeliver, never to retire something nobody said was done.
 func (r *Reader[T]) Commit(offset int64) error {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
@@ -150,6 +153,11 @@ func (r *Reader[T]) Commit(offset int64) error {
 // may be a record another Reader would have handled — so call it from one
 // consumer, or coordinate. It is the one consume operation that destroys a record
 // without reading it, and the loss is not counted as corruption.
+//
+// Like every consume op, Skip can also surface a pending corruption report:
+// ok=false with ErrCorrupt means the queue collected a loss (and may have
+// stepped past damaged data), not that the record Skip was aimed at is gone —
+// call it again to skip the record now at the head.
 func (r *Reader[T]) Skip() (bool, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
@@ -320,9 +328,7 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 // aliases the old array keeps it alive on its own, so the release only ever
 // costs the next read one allocation.
 func (r *Reader[T]) trimScratch() {
-	if int64(cap(r.scratch)) > r.w.st.segmentSize {
-		r.scratch = nil
-	}
+	r.scratch = trimOver(r.scratch, r.w.st.segmentSize)
 }
 
 // Requeue moves the record at the head of the queue to the BACK, without

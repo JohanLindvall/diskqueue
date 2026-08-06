@@ -3,6 +3,7 @@
 package diskqueue
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
@@ -20,22 +21,10 @@ import (
 // A filesystem without fdatasync support answers ENOSYS; fall back rather than
 // treating that as a durability failure.
 func datasync(f *os.File) error {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		return f.Sync()
-	}
-	var serr error
-	if cerr := rc.Control(func(fd uintptr) {
-		for {
-			serr = syscall.Fdatasync(int(fd))
-			if serr != syscall.EINTR {
-				return
-			}
-		}
-	}); cerr != nil {
-		return f.Sync()
-	}
-	if serr == syscall.ENOSYS {
+	ctlErr, serr := fdControl(f, func(fd uintptr) error {
+		return syscall.Fdatasync(int(fd))
+	})
+	if ctlErr != nil || errors.Is(serr, syscall.ENOSYS) {
 		return f.Sync()
 	}
 	return serr

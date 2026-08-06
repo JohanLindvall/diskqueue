@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"github.com/cespare/xxhash/v2"
 )
@@ -472,14 +473,9 @@ func (s *store) appendRecord(payload []byte, force bool) error {
 		return err
 	}
 	werr := s.writeRecord(af, af.size, payload)
-	if int64(cap(s.writeBuf)) > s.segmentSize {
-		// An oversized record grew the frame buffer past anything an ordinary
-		// record can need. Keep it and the largest record ever seen stays resident
-		// for the queue's lifetime; drop it and the next oversized append pays one
-		// allocation. Ordinary appends never reach this — the comparison is the
-		// whole cost, so the hot path stays zero-alloc.
-		s.writeBuf = nil
-	}
+	// An oversized record grew the frame buffer past anything an ordinary record
+	// can need; release it (see trimOver for the package-wide policy).
+	s.writeBuf = trimOver(s.writeBuf, s.segmentSize)
 	if werr != nil {
 		return werr // nothing advanced; the bytes are unreferenced and overwritable
 	}
@@ -631,11 +627,19 @@ func (s *store) dropCommitted(keep *dataFile) {
 
 // fileForOffset returns the file holding the record that starts at the global
 // offset off (base <= off < base+size).
+//
+// Binary search, not a scan: files ascend by base and are contiguous, so
+// base+size is nondecreasing and "extends past off" is a sorted predicate. The
+// default segment cap makes the difference academic, but this runs once per
+// read, and with MaxSegments unbounded a deep backlog made every read walk the
+// whole slice under the queue lock.
 func (s *store) fileForOffset(off int64) *dataFile {
-	for _, df := range s.files {
-		if off >= df.base && off < df.base+df.size {
-			return df
-		}
+	i := sort.Search(len(s.files), func(i int) bool {
+		df := s.files[i]
+		return df.base+df.size > off
+	})
+	if i < len(s.files) && off >= s.files[i].base {
+		return s.files[i]
 	}
 	return nil
 }
@@ -782,6 +786,43 @@ func (s *store) progress() progress { return progress{head: s.headOff, pending: 
 // watched the cursor alone would never collect those reports.
 func (s *store) drained(end int64) bool { return s.headOff >= end && s.pendingCorrupt == 0 }
 
+// publishFullCommit durably publishes df's header as fully committed — commit
+// cursor at the end of its data, committed count equal to written. It is the
+// write-the-header-first half of every force-commit: the caller applies its
+// in-memory advance only after this returns nil, because an advance the header
+// does not carry is replayed wholesale by the next open (see skipCorruptSegment
+// for the full argument). A failed header write rolls the in-memory header
+// bytes back, so they never disagree with what reached the page cache.
+//
+// gone reports that df's file has vanished from the directory: no header is
+// left to record anything in, and nothing is left to replay from it either, so
+// the caller's in-memory accounting is all there is to do — that case returns
+// a nil error on purpose.
+func (s *store) publishFullCommit(df *dataFile) (gone bool, err error) {
+	switch err := s.ensureOpen(df); {
+	case err == nil:
+		prevCursor, prevCount := df.commitCursor(), df.committedCount()
+		df.header(
+			setCommitCursor(headerSize+df.size),
+			setCommittedCount(df.written),
+		)
+		if err := s.writeHeader(df); err != nil {
+			df.header(setCommitCursor(prevCursor), setCommittedCount(prevCount))
+			return false, err
+		}
+		if !s.noSync {
+			if err := s.flushFile(df); err != nil { // recovery wants this durable now
+				return false, err
+			}
+		}
+		return false, nil
+	case errors.Is(err, os.ErrNotExist):
+		return true, nil
+	default:
+		return false, err
+	}
+}
+
 // forceCommitAll marks every live segment fully committed, publishing each
 // file's header before the in-memory counts follow it — the same ordering the
 // per-segment quarantine uses, and for the same reason: an advance the headers do
@@ -798,27 +839,7 @@ func (s *store) forceCommitAll() error {
 		if df.committed >= df.written && df.commitCursor() >= headerSize+df.size {
 			continue // already fully committed: nothing to publish, nothing to count
 		}
-		switch err := s.ensureOpen(df); {
-		case err == nil:
-			prevCursor, prevCount := df.commitCursor(), df.committedCount()
-			df.header(
-				setCommitCursor(headerSize+df.size),
-				setCommittedCount(df.written),
-			)
-			if err := s.writeHeader(df); err != nil {
-				df.header(setCommitCursor(prevCursor), setCommittedCount(prevCount))
-				return err
-			}
-			if !s.noSync {
-				if err := s.flushFile(df); err != nil { // recovery wants this durable now
-					return err
-				}
-			}
-		case errors.Is(err, os.ErrNotExist):
-			// Gone from the directory: no header left to record the quarantine in, and
-			// nothing left to replay out of it either, so the in-memory squaring below
-			// is all there is to do.
-		default:
+		if _, err := s.publishFullCommit(df); err != nil {
 			return err
 		}
 		if abandoned := df.written - df.committed; abandoned > 0 {
@@ -885,29 +906,11 @@ func (s *store) skipCorruptSegment(off int64) error {
 	}
 	end := df.base + df.size
 	if s.commitOff >= df.base {
-		err := s.ensureOpen(df)
-		switch {
-		case err == nil:
-			prevCursor, prevCount := df.commitCursor(), df.committedCount()
-			df.header(
-				setCommitCursor(headerSize+df.size),
-				setCommittedCount(df.written),
-			)
-			if err := s.writeHeader(df); err != nil {
-				df.header(setCommitCursor(prevCursor), setCommittedCount(prevCount))
-				return err
-			}
-			if !s.noSync {
-				if err := s.flushFile(df); err != nil { // recovery wants this durable now
-					return err
-				}
-			}
-		case errors.Is(err, os.ErrNotExist):
-			// The segment is gone from the directory: there is no header left to
-			// record the quarantine in, and nothing left to replay from it either,
-			// so the in-memory advance below is all there is to do. dropCommitted
-			// then retires the entry.
-		default:
+		// A vanished segment (gone == true inside publishFullCommit) leaves no
+		// header to record the quarantine in and nothing to replay from it, so the
+		// in-memory advance below is all there is to do; dropCommitted then
+		// retires the entry.
+		if _, err := s.publishFullCommit(df); err != nil {
 			return err
 		}
 		if abandoned := df.written - df.committed; abandoned > 0 {

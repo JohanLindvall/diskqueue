@@ -18,11 +18,15 @@ import (
 const (
 	headerSize   = 64 // [magic][cursors+counts][version][reserved][header checksum]
 	checksumSize = 8  // xxhash64 trailer per record
-	// readAhead is how much of a segment a read fetches in its first pread. It is
-	// sized so that a whole record of ordinary size arrives in one syscall instead
-	// of a length probe followed by a re-read of the same bytes; the kernel serves
-	// a page either way, so the extra bytes are free.
-	readAhead     = 4096
+	// readAhead is how much of a segment a read fetches in its first pread.
+	// Consumption is sequential, so a bigger run means proportionally fewer
+	// syscalls when draining a backlog — 64 KiB costs one pread where page-sized
+	// runs cost sixteen — and it still lands a whole record of ordinary size in
+	// one fetch instead of a length probe plus a re-read. The buffer never grows
+	// past the segment's remaining published bytes (fillBlock caps the run by
+	// avail), so a small-segment store never pays the full width, and dropBlock
+	// releases anything an oversized record grew beyond segmentSize.
+	readAhead     = 64 << 10
 	formatVersion = 1
 	hdrSumCovered = 56 // header bytes the header checksum is computed over ([0:56])
 	filePrefix    = "data."

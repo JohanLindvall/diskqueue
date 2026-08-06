@@ -28,6 +28,21 @@ func growBuf(b []byte, n int) []byte {
 	return b[:n]
 }
 
+// trimOver returns nil once b's capacity has grown past limit — the release
+// half of the package-wide buffer policy. Every reused buffer (the store's
+// frame and block buffers, the Queue's marshal scratch, each Reader's copy)
+// applies it at its own site with limit = segmentSize: only an oversized
+// record can grow past that, keeping the buffer would pin the largest record
+// ever seen for the owner's lifetime, and the next oversized use pays one
+// allocation. For ordinary records the comparison is the whole cost, so the
+// zero-alloc steady state stands.
+func trimOver(b []byte, limit int64) []byte {
+	if int64(cap(b)) > limit {
+		return nil
+	}
+	return b
+}
+
 // growKeeping is growBuf that preserves the first keep bytes across a
 // reallocation, so a buffer can be extended without re-reading what it holds.
 func growKeeping(b []byte, n, keep int) []byte {
@@ -107,9 +122,7 @@ func (s *store) blockAt(dataOff int64, n int) []byte {
 // drops the block, nothing aliases the bytes.
 func (s *store) dropBlock() {
 	s.blockFile, s.blockOff, s.blockLen = nil, 0, 0
-	if int64(cap(s.readBuf)) > s.segmentSize {
-		s.readBuf = nil
-	}
+	s.readBuf = trimOver(s.readBuf, s.segmentSize)
 }
 
 // fillBlock makes the cached block cover at least need bytes of df starting at
