@@ -1,6 +1,8 @@
-// UNCOVERED: recovery.go:132 — the `return err` arm of `flushFile` inside load's
-// truncated-segment repair loop — is not reached by this file, and cannot be
-// reached without adding a seam to non-test code.
+// UNCOVERED: the `return err` arms of `writeHeader` and `flushFile` inside load's
+// header write-back loop (the one that republishes what recovery concluded) are not
+// reached by this file, and cannot be reached without adding a seam to non-test code.
+//
+// Named rather than numbered on purpose: these notes have gone stale by line before.
 //
 // At that point flushFile can only fail in datasync: writeHeader has just set
 // df.dirty and ensureOpen has just installed df.f, so neither early return in

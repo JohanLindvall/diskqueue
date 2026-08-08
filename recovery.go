@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -42,6 +43,19 @@ func (s *store) load() error {
 		if perr != nil {
 			continue
 		}
+		// Everything below addresses a segment by NUMBER, and filePath turns a
+		// number back into the padded name this store writes. An entry that is not
+		// in that form ("data.7", "data.007", "data.2024") therefore names a file
+		// recovery would look for under a different name — and if the padded twin
+		// does not exist, every later open fails with an ENOENT naming a file that
+		// never existed. Load such a number only when the padded file is really
+		// there (the duplicate case below); otherwise the stray is inert, exactly
+		// like a "data.notanumber".
+		if e.Name() != filepath.Base(s.filePath(num)) {
+			if _, serr := os.Lstat(s.filePath(num)); serr != nil {
+				continue
+			}
+		}
 		nums = append(nums, num)
 	}
 	slices.Sort(nums)
@@ -72,6 +86,7 @@ func (s *store) load() error {
 		base += df.size
 		s.nWritten += df.written
 		s.files = append(s.files, df)
+		s.diskBytes += headerSize + df.capacity
 	}
 
 	// Every segment was dropped. Resume numbering *past* the highest seen, never
@@ -111,18 +126,44 @@ func (s *store) load() error {
 		s.nCommitted += df.committed
 	}
 
-	// A truncated segment has had its size clamped to what survived, but its header
-	// still publishes the old write cursor. Republish the clamped one now, or the
-	// next open re-detects the same short file and books the same loss again — and
-	// again on the open after that, forever.
+	// Write back everything the two passes above concluded, for every segment whose
+	// header on disk does not already say it. Recovery is not finished until its
+	// conclusions are durable: a correction that lives only in memory is believed
+	// again by the next open, and the whole point of the passes was that the header
+	// could not be believed.
 	//
-	// EVERY truncated segment, not just the active one: a middle segment is never
+	// Two shapes need it. A truncated segment has had its size clamped to what
+	// survived while its header still publishes the old write cursor — republish the
+	// clamped one, or the next open re-detects the same short file and books the same
+	// loss again, forever. And a segment whose committed count the reconciliation
+	// above overrode still carries the stale figure; once the segments ahead of it are
+	// drained and reclaimed it becomes the leading one, and its untouched header is
+	// then believed outright — silently retiring records this session reported as
+	// backlog.
+	//
+	// EVERY such segment, not just the active one: a middle segment is never
 	// re-extended and never appended to, so nothing else would ever correct it. It
 	// also has to happen before the reservation below, which would otherwise leave
 	// the active file full-size with a header pointing past its surviving records,
 	// so the zero fill reads back as a phantom backlog.
+	//
+	// On a healthy open the guard never fires — every field already agrees — so
+	// reopening still costs one 64-byte pread per segment and no writes.
 	for _, df := range s.files {
-		if !df.truncated {
+		// The commit cursor this segment must publish, reconciled against the
+		// recovered GLOBAL cursor exactly as the count pass above reconciles the
+		// counts: everything below it is committed, everything above it is not, and
+		// the segment straddling it keeps the position the cursor came from.
+		cc := int64(headerSize)
+		switch {
+		case df.base+df.size <= s.commitOff:
+			cc = headerSize + df.size
+		case df.base < s.commitOff:
+			cc = headerSize + (s.commitOff - df.base)
+		}
+		if !df.truncated &&
+			df.writeCursor() == headerSize+df.size && df.writtenCount() == df.written &&
+			df.commitCursor() == cc && df.committedCount() == df.committed {
 			continue
 		}
 		if err := s.ensureOpen(df); err != nil {
@@ -131,6 +172,8 @@ func (s *store) load() error {
 		df.header(
 			setWriteCursor(headerSize+df.size),
 			setWrittenCount(df.written),
+			setCommitCursor(cc),
+			setCommittedCount(df.committed),
 		)
 		if err := s.writeHeader(df); err != nil {
 			return err
@@ -151,8 +194,10 @@ func (s *store) load() error {
 		// the open here would lock a full disk out of the very queue that must be
 		// drained to free it — truncation plus ENOSPC is precisely the double
 		// failure a disk-full incident produces.
-		_ = preallocate(df.f, headerSize+df.capacity)
-		df.truncated = false
+		if df.truncated {
+			_ = preallocate(df.f, headerSize+df.capacity)
+			df.truncated = false
+		}
 	}
 
 	// Open the active file so appends can write into it; the rest open on demand.
@@ -178,6 +223,7 @@ func (s *store) startFresh(num uint64) error {
 	}
 	s.nextNum = num + 1
 	s.files = append(s.files, df)
+	s.diskBytes += headerSize + df.capacity
 	s.trackOpen(df)
 	if !s.noSync {
 		return s.syncDir()
@@ -212,8 +258,18 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 	// A zero-length segment is a create interrupted between linking the file and
 	// writing its header. It cannot hold a record, so removing it loses nothing
 	// and must not raise a data-loss event.
+	//
+	// But only at the TAIL, for the same reason abortedCreate insists on it:
+	// segments are created one at a time at the end of the sequence and the number
+	// advances only once the create has succeeded, so a zero-length file with a
+	// live sibling ABOVE it was never an unfinished create — it is a segment that
+	// lost every byte it had. Unlinking that silently is the one thing recovery must
+	// never do, so it takes the ordinary corruption path and is counted and owed.
 	if size == 0 {
-		return nil, 0, s.removeFile(num)
+		if tail {
+			return nil, 0, s.removeFile(num)
+		}
+		return nil, 0, s.dropSegment(num, size, false)
 	}
 
 	h, herr := s.readHeader(num)
@@ -374,7 +430,17 @@ func (s *store) surviveCount(df *dataFile) (int64, int64, error) {
 	off := df.base
 	for off < df.base+df.size {
 		next, ok, err := s.recordLen(df, off)
-		if err != nil || !ok {
+		if err != nil {
+			// A read that FAILED says nothing about the frames: only corruption
+			// licenses the caller to clamp the segment, and clamping on a transient
+			// EIO would destroy records that are still on disk. Fail the open
+			// instead — "I could not look" is not evidence of damage.
+			if !errors.Is(err, ErrCorrupt) {
+				return 0, 0, err
+			}
+			break
+		}
+		if !ok {
 			break // no whole frame starts here; the rest is gone
 		}
 		off = next
@@ -487,7 +553,17 @@ func (s *store) countVerified(df *dataFile) (int64, int64, error) {
 	off := df.base
 	for off < df.base+df.size {
 		payload, sum, next, ok, err := s.recordAt(df, off)
-		if err != nil || !ok || xxhash.Sum64(payload) != sum {
+		if err != nil {
+			// As in surviveCount: a failed read is not a verdict on the bytes, and
+			// this walk's caller responds to failure by DROPPING the segment. Report
+			// it so the open fails instead, leaving the segment on disk to be read
+			// again once whatever failed has cleared.
+			if !errors.Is(err, ErrCorrupt) {
+				return 0, 0, err
+			}
+			break
+		}
+		if !ok || xxhash.Sum64(payload) != sum {
 			break // no verifiable frame starts here; the rest is unaddressable
 		}
 		off = next

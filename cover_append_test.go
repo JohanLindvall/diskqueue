@@ -4,7 +4,8 @@ package diskqueue
 // without changing production code. The reasoning, so nobody re-litigates it:
 //
 //  1. store.go, append's `if err := s.writeHeader(af); err != nil` arm (the
-//     rollback arm; profile block store.go:458.42,463.3 in this tree). To reach
+//     rollback arm; named rather than numbered, because these notes have gone
+//     stale by line before). To reach
 //     it the record's WriteAt at
 //     data offset headerSize+af.size must SUCCEED and the header's WriteAt of 64
 //     bytes at offset 0 must FAIL — on the *same* descriptor, inside one call,

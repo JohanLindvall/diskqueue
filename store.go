@@ -48,6 +48,10 @@ type store struct {
 
 	files   []*dataFile // sorted by num ascending; last is the active write file
 	nextNum uint64
+	// diskBytes is the sum of headerSize+capacity over s.files, maintained as files
+	// are added and reclaimed. Summing it per call made Stats() O(segments) with the
+	// queue mutex held, which a monitoring scrape pays on every tick.
+	diskBytes int64
 
 	// Intrusive LRU list of currently open files, so touch/evict/remove are O(1)
 	// pointer splices rather than O(n) slice shifts. lruMRU is the
@@ -304,8 +308,12 @@ func (s *store) batched() bool { return !s.noSync && s.syncEvery > 1 }
 
 // recordOp counts one durable operation (a write or a commit) and flushes every
 // segment once syncEvery have accumulated. Used only on the batched path.
-func (s *store) recordOp() error {
-	s.unsynced++
+func (s *store) recordOp() error { return s.recordOps(1) }
+
+// recordOps is recordOp for n operations at once — a published batch span, whose
+// records were each a write even though one header covers them all.
+func (s *store) recordOps(n int) error {
+	s.unsynced += n
 	if s.unsynced >= s.syncEvery {
 		return s.flushBatch()
 	}
@@ -319,7 +327,7 @@ func (s *store) recordOp() error {
 func (s *store) flushBatch() error {
 	var errs error
 	for _, df := range s.files {
-		errs = errors.Join(errs, s.flushFile(df))
+		errs = errors.Join(errs, s.flushFile(df)) // keep going; flush what can be flushed
 	}
 	if errs != nil {
 		return errs
@@ -457,8 +465,7 @@ func (s *store) appendRecord(payload []byte, force bool) error {
 	if s.ioErr != nil {
 		return s.ioErr
 	}
-	L := len(payload)
-	recLen := int64(uvarintLen(uint64(L)) + L + checksumSize)
+	recLen := framedLen(len(payload))
 	// Two different answers, because they call for different handling. A record
 	// that cannot fit the cap on an EMPTY queue will never fit, so retrying is
 	// futile and the caller must drop or split it. One that merely does not fit
@@ -626,8 +633,7 @@ func (s *store) stagePending(payload []byte) error {
 	if werr != nil {
 		return werr // nothing tracked; the bytes are unreferenced and overwritable
 	}
-	L := len(payload)
-	s.pendingBytes += int64(uvarintLen(uint64(L)) + L + checksumSize)
+	s.pendingBytes += framedLen(len(payload))
 	s.pendingRecs++
 	return nil
 }
@@ -727,6 +733,7 @@ func (s *store) cycle(need int64, force bool) error {
 	}
 	s.nextNum++
 	s.files = append(s.files, df)
+	s.diskBytes += headerSize + df.capacity
 	s.trackOpen(df)
 	// Persist the new (and removed) entries before records land in the file.
 	if !s.noSync {
@@ -760,27 +767,36 @@ func (s *store) dropCommitted(keep *dataFile) {
 	// a segment that is about to stop existing.
 	s.lastFrameAt, s.lastFrameEnd = 0, 0
 	s.dropBlock()
+	// Reclaimable files are a strict PREFIX — the guard above already proved
+	// files[0] is one, and base+size is nondecreasing — so stop at the first
+	// survivor instead of walking the whole backlog. This runs on every commit, and
+	// with MaxSegments unbounded and a deep queue it was scanning every live segment
+	// each time.
 	survive := s.files[:0]
-	for _, df := range s.files {
-		if df != keep && df.base+df.size <= s.commitOff {
-			if df.f != nil {
-				_ = df.f.Close() // read-only from here on; nothing left to lose
-				df.f = nil
-				s.untrackOpen(df)
-			}
-			if err := os.Remove(df.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				s.unreclaimed++
-				survive = append(survive, df)
-				continue
-			}
-			// written == committed here, so this keeps Count exact.
-			s.nWritten -= df.written
-			s.nCommitted -= df.committed
+	i := 0
+	for ; i < len(s.files); i++ {
+		df := s.files[i]
+		if df == keep || df.base+df.size > s.commitOff {
+			break
+		}
+		if df.f != nil {
+			_ = df.f.Close() // read-only from here on; nothing left to lose
+			df.f = nil
+			s.untrackOpen(df)
+		}
+		if err := os.Remove(df.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			s.unreclaimed++
+			survive = append(survive, df)
 			continue
 		}
-		survive = append(survive, df)
+		// written == committed here, so this keeps Count exact.
+		s.nWritten -= df.written
+		s.nCommitted -= df.committed
+		s.diskBytes -= headerSize + df.capacity
 	}
-	s.files = survive
+	// survive holds only the files that would not unlink, so it is never longer
+	// than the prefix just scanned and this copy always moves left.
+	s.files = append(survive, s.files[i:]...)
 }
 
 // fileForOffset returns the file holding the record that starts at the global
@@ -880,11 +896,29 @@ func (s *store) takeHead() ([]byte, int64, bool, error) {
 		return nil, 0, false, nil // empty
 	}
 	if xxhash.Sum64(payload) != sum {
-		s.lostBytes += uint64(next - s.headOff)
+		head := s.headOff
+		s.lostBytes += uint64(next - head)
 		s.lostRecords++
 		s.corruptions++
 		s.headOff = next
-		return nil, 0, false, fmt.Errorf("%w: record checksum", ErrCorrupt)
+		cerr := fmt.Errorf("%w: record checksum", ErrCorrupt)
+		// Retire the record that was just reported destroyed. Nothing else ever
+		// would: every consume op returns on this error without committing, so a
+		// damaged record left at the head keeps Count() above zero for good, pins its
+		// segment against reclamation, and is re-read and re-reported on every reopen
+		// — one ErrCorrupt and one LostRecords per restart, forever.
+		//
+		// Only when the commit cursor stood exactly here, though. With records
+		// reserved behind it the cursor may not jump: that would retire work no
+		// consumer has acknowledged. Those cases heal on their own, because the
+		// eventual Commit walks across this record like any other — its framing is
+		// intact, only the payload failed its checksum.
+		if head == s.commitOff {
+			if err := s.commitTo(next); err != nil {
+				return nil, 0, false, errors.Join(cerr, err)
+			}
+		}
+		return nil, 0, false, cerr
 	}
 	// Hand the boundary to the commit that is about to follow: every consume path
 	// reads and then commits this same record while still holding the lock.
@@ -952,11 +986,10 @@ func (s *store) drained(end int64) bool { return s.headOff >= end && s.pendingCo
 // for the full argument). A failed header write rolls the in-memory header
 // bytes back, so they never disagree with what reached the page cache.
 //
-// gone reports that df's file has vanished from the directory: no header is
-// left to record anything in, and nothing is left to replay from it either, so
-// the caller's in-memory accounting is all there is to do — that case returns
-// a nil error on purpose.
-func (s *store) publishFullCommit(df *dataFile) (gone bool, err error) {
+// A file that has VANISHED from the directory succeeds with a nil error on
+// purpose: no header is left to record anything in, and nothing is left to replay
+// from it either, so the caller's in-memory accounting is all there is to do.
+func (s *store) publishFullCommit(df *dataFile) error {
 	switch err := s.ensureOpen(df); {
 	case err == nil:
 		prevCursor, prevCount := df.commitCursor(), df.committedCount()
@@ -966,18 +999,18 @@ func (s *store) publishFullCommit(df *dataFile) (gone bool, err error) {
 		)
 		if err := s.writeHeader(df); err != nil {
 			df.header(setCommitCursor(prevCursor), setCommittedCount(prevCount))
-			return false, err
+			return err
 		}
 		if !s.noSync {
 			if err := s.flushFile(df); err != nil { // recovery wants this durable now
-				return false, err
+				return err
 			}
 		}
-		return false, nil
+		return nil
 	case errors.Is(err, os.ErrNotExist):
-		return true, nil
+		return nil
 	default:
-		return false, err
+		return err
 	}
 }
 
@@ -997,7 +1030,7 @@ func (s *store) forceCommitAll() error {
 		if df.committed >= df.written && df.commitCursor() >= headerSize+df.size {
 			continue // already fully committed: nothing to publish, nothing to count
 		}
-		if _, err := s.publishFullCommit(df); err != nil {
+		if err := s.publishFullCommit(df); err != nil {
 			return err
 		}
 		if abandoned := df.written - df.committed; abandoned > 0 {
@@ -1064,11 +1097,11 @@ func (s *store) skipCorruptSegment(off int64) error {
 	}
 	end := df.base + df.size
 	if s.commitOff >= df.base {
-		// A vanished segment (gone == true inside publishFullCommit) leaves no
-		// header to record the quarantine in and nothing to replay from it, so the
-		// in-memory advance below is all there is to do; dropCommitted then
-		// retires the entry.
-		if _, err := s.publishFullCommit(df); err != nil {
+		// A segment whose file has vanished leaves no header to record the
+		// quarantine in and nothing to replay from it, so publishFullCommit
+		// succeeds and the in-memory advance below is all there is to do;
+		// dropCommitted then retires the entry.
+		if err := s.publishFullCommit(df); err != nil {
 			return err
 		}
 		if abandoned := df.written - df.committed; abandoned > 0 {
@@ -1190,12 +1223,10 @@ func (s *store) commitTo(off int64) error {
 		s.nCommitted++
 		s.nCommittedTotal++
 		df.committed++
-		// header() rebuilds the checksum in memory; the bytes are written once per
-		// file (on leaving it, and the last below).
-		df.header(
-			setCommitCursor(headerSize+(s.commitOff-df.base)),
-			setCommittedCount(df.committed),
-		)
+		// The header BYTES are laid down once per file (on leaving it, and the last
+		// below), so persistCommit is where they are built. Rebuilding them here
+		// recomputed the 56-byte checksum for every record crossed and threw all but
+		// the last away — 43% of the commit walk, with the queue mutex held.
 		cur = df
 		advanced = true
 	}
@@ -1228,9 +1259,16 @@ func (s *store) commitTo(off int64) error {
 	return stop
 }
 
-// persistCommit writes df's header out and, on the per-op policy, makes it
-// durable.
+// persistCommit stamps the commit cursor and count into df's header and writes it
+// out, making it durable on the per-op policy.
+//
+// The cursor is clamped to df's own extent, because this is also the call that
+// finalizes a file the walk has already left — and such a file is fully committed.
 func (s *store) persistCommit(df *dataFile, perOp bool) error {
+	df.header(
+		setCommitCursor(headerSize+min(s.commitOff-df.base, df.size)),
+		setCommittedCount(df.committed),
+	)
 	if err := s.writeHeader(df); err != nil {
 		return err
 	}
@@ -1271,7 +1309,7 @@ func (s *store) stats() Stats {
 		// Segments are preallocated to their full length, so what they occupy is the
 		// sum of their reserved capacities — not count × segmentSize, once an
 		// oversized record has a segment sized to itself.
-		DiskBytes:       s.diskBytes(),
+		DiskBytes:       s.diskBytesTotal(),
 		Added:           s.nAdded,
 		Delivered:       s.nDelivered,
 		Committed:       s.nCommittedTotal,
@@ -1294,15 +1332,10 @@ func (s *store) sync() error {
 	if s.ioErr != nil {
 		return s.ioErr
 	}
-	var errs error
-	for _, df := range s.files {
-		errs = errors.Join(errs, s.flushFile(df)) // keep going; flush what can be flushed
-	}
-	if errs != nil {
-		return errs
-	}
-	s.unsynced, s.unsyncedBytes = 0, 0 // a full flush makes the batched ops durable
-	return nil
+	// Identical to flushBatch below the latch check, and deliberately delegated
+	// rather than duplicated. Not the other way round: flushBatch has no latch guard
+	// because its callers (recordOp, from append/commitTo) already check s.ioErr.
+	return s.flushBatch()
 }
 
 // syncDir fsyncs the directory so segment creations/removals are durable: an
@@ -1346,6 +1379,13 @@ func (s *store) close() error {
 		}
 		df.f = nil
 	}
+	if first == nil {
+		// Every file reached stable storage, so the power-loss exposure is genuinely
+		// zero — and Stats stays readable after Close, so it has to say so. A latched
+		// or failed flush leaves the figure standing, which over-reports rather than
+		// under-reports: the same bias flushBatch and sync use.
+		s.unsynced, s.unsyncedBytes = 0, 0
+	}
 	// Keep the slice. Every handle is closed and nil'd above, so nothing here is
 	// live — but Stats stays readable after Close, and a shutdown scrape that
 	// reported "0 segments, 0 bytes on disk" for a directory still holding a
@@ -1363,10 +1403,4 @@ func (s *store) close() error {
 // diskBytes is what the live segments occupy, preallocated slack included. It
 // sums each segment's own capacity rather than multiplying by segmentSize,
 // because an oversized record's segment is sized to that record.
-func (s *store) diskBytes() int64 {
-	var n int64
-	for _, df := range s.files {
-		n += headerSize + df.capacity
-	}
-	return n
-}
+func (s *store) diskBytesTotal() int64 { return s.diskBytes }

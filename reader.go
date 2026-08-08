@@ -65,11 +65,14 @@ func (r *Reader[T]) TryPeek() (T, bool, error) {
 		return zero, false, err
 	}
 	r.scratch = append(r.scratch[:0], payload...) // copy out of the store's read buffer
+	// Deferred so the oversized-release rule also applies on the codec-error exit;
+	// otherwise one huge record the codec rejects pins its buffer for the Reader's
+	// lifetime. Safe after the return value is set: see trimScratch.
+	defer r.trimScratch()
 	v, uerr := r.w.unmarshal(r.scratch)
 	if uerr != nil {
 		return zero, false, fmt.Errorf("%w: %w", ErrCodec, uerr)
 	}
-	r.trimScratch()
 	return v, true, nil
 }
 
@@ -175,7 +178,9 @@ func (r *Reader[T]) Commit(offset int64) error {
 	if r.w.closed {
 		return ErrClosed
 	}
-	if offset > r.w.st.writeOffset() || offset > r.w.st.headOffset() {
+	// The read cursor is the only bound that has to be stated: it never passes the
+	// write cursor, so testing that as well would be dead.
+	if offset > r.w.st.headOffset() {
 		return ErrInvalidOffset
 	}
 	return r.w.st.commitTo(offset)
@@ -320,6 +325,11 @@ func (r *Reader[T]) next(ctx context.Context, follow bool, end int64) (T, bool, 
 		// A commit that fails stops the iteration without yielding, so the item is
 		// replayed after a reopen rather than handed out as if it were consumed.
 		if err := w.st.commitTo(off); err != nil {
+			// Deliberately NOT un-counted: Delivered counts records read out of the
+			// store, and this one was read — only its commit failed. Nor may the read
+			// cursor be rewound, because a partially successful commit advances the
+			// commit cursor and drags the read cursor with it; putting it back would
+			// leave it behind the commit cursor, addressing reclaimable records.
 			return zero, false, err
 		}
 		return v, true, nil
@@ -349,6 +359,7 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 			r.w.st.rewindHead(start)
 		}
 	}()
+	defer r.trimScratch() // on the codec exit too; see TryPeek
 	v, err := r.w.unmarshal(r.scratch)
 	if err != nil {
 		// Wrap it so a codec error can never impersonate a library sentinel. A
@@ -360,7 +371,6 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 		return zero, 0, false, fmt.Errorf("%w: %w", ErrCodec, err)
 	}
 	delivered = true
-	r.trimScratch()
 	return v, off, true, nil
 }
 

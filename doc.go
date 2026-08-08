@@ -32,8 +32,12 @@ codec pair:
 	}
 
 [MarshalFunc] appends to a caller-supplied buffer rather than allocating, which
-is what keeps [Queue.Add] allocation-free. Both codec funcs run under the queue's
-lock and must not call back into the queue or its readers.
+is what keeps [Queue.Add] allocation-free. Where it runs differs by method, and
+the difference matters: [Queue.Add] and [Queue.AddWait] marshal BEFORE taking the
+queue's lock, so a MarshalFunc must be safe for concurrent use — several producers
+run it at once — while [Queue.AddBatch] marshals under the lock, as does every
+[UnmarshalFunc]. Neither codec may call back into the queue or its readers; the
+mutex is not reentrant.
 
 # Consuming
 

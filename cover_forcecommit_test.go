@@ -1,3 +1,13 @@
+// UNCOVERED: nothing. forceCommitAll is at 100% of its coverage blocks — the
+// already-fully-committed skip, the publishFullCommit failure, the abandoned-count
+// bump and the global squaring are all executed and asserted below.
+//
+// The arm this file exists for is unreachable through the public API: both callers
+// of skipCorruptSegment pass a cursor commitTo keeps inside a live segment, so
+// `fileForOffset` never returns nil there. It cannot be deleted either — dropping
+// the guard nil-derefs on the next line — so it is reached here by driving the
+// store directly, which is what makes this file worth its length.
+
 package diskqueue
 
 import (

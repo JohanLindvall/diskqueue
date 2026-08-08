@@ -65,6 +65,8 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
   destination guard, which `recordLen` otherwise bounds out of reach.
 
   Each file opens with an `// UNCOVERED:` note stating what it could **not** reach and why.
+  Those notes name the block rather than numbering it: line numbers in them have gone stale
+  before, which is worse than no reference at all.
   Keep those honest: the four remaining blocks are unreachable without a production seam, and
   three of them (`append`'s `writeHeader` and header-`fsync` arms, `load`'s repair `flushFile`)
   have their semantics covered by the faults build's adjacent `faultPoint` arms instead. The
@@ -78,7 +80,8 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
 go build ./...
 go test -race ./...
 go vet ./...
-go test -run=^$ -bench=BenchmarkAddTake -benchtime=1s ./...   # must stay 0 allocs/op
+go test -run=^$ -bench=BenchmarkAddTake -benchtime=1s ./...   # 0 allocs/op (NoSync path)
+go test -run=^$ -bench='BenchmarkAddBatch|BenchmarkAddParallel' -benchmem ./...  # per-op path
 go test -cover ./...
 ```
 
@@ -154,15 +157,22 @@ mirrors its own `written`/`committed` counts into its header.
   corrupt prefix decodes to an arbitrary uint64; narrowing it first and summing
   `n+L+checksumSize` in `int` wraps *negative*, sails past a signed bounds check and
   panics reslicing `readBuf` in `growBuf` — a corrupt byte on disk killing the
-  process, which is exactly what this library must never do. `commitTo` additionally
+  process, which is exactly what this library must never do. Bound the **whole frame**, not
+  just the payload length: `avail` itself can exceed `maxInt` on a 32-bit build, so
+  `v <= maxInt` is not enough and `n+int(v)+checksumSize` wrapped anyway (reproduced on
+  `GOARCH=386` with a segment above 2 GiB). `commitTo` additionally
   refuses any decoded `next` that is not strictly forward and within `writeOff`.
 - **The read cursor may never lag the commit cursor.** `commitTo` drags `headOff` up
   to `commitOff` before `dropCommitted`; otherwise a `Commit` past the read cursor
   reclaims the file `headOff` is standing in and every later read addresses a
   deleted file. `Reader.Commit` also rejects an offset beyond `headOffset()`.
 - **Zero-alloc hot path.** `append` frames the record in the reused `s.writeBuf`
-  and `WriteAt`s it; `Add` serializes via the reused `w.scratch` and the
-  append-style `MarshalFunc`. `Reader.read` copies the payload (a slice of the
+  and `WriteAt`s it; `Add`/`AddWait` serialize through the pooled `marshalBuf`
+  (`w.bufs`, so codecs run concurrently across producers) and `AddBatch` through the
+  reused `w.scratch`, both with the append-style `MarshalFunc`. Every reused buffer is
+  released past `segmentSize` by `trimOver` at its own site — `putBuf` for the pool,
+  `dropOversizedScratch` for the batch scratch, `Reader.trimScratch` for the reader copy,
+  `dropBlock` for `readBuf`. `Reader.read` copies the payload (a slice of the
   reused `s.readBuf`, filled by `ReadAt`) into the reused `r.scratch` (one memcpy,
   no alloc once warm) before `unmarshal`. The `s.writeBuf`/`s.readBuf` grow via
   `growBuf` (allocates only when a bigger record appears). Don't add per-op heap
@@ -178,6 +188,15 @@ mirrors its own `written`/`committed` counts into its header.
   them. That was mmap-era reasoning and it is no longer the operative reason,
   though the conclusion it reached is still true.) Valid until that Reader's next
   read. A `Reader` is single-goroutine; use one per consumer.
+- **The per-record paths must not become O(segments).** Three were, each under the queue
+  mutex: `dropCommitted` walked the whole live set per reclaim although reclaimable files are
+  a strict *prefix* (it now breaks at the first survivor and splices the tail); `commitTo`
+  rebuilt the header's 56-byte xxhash for every record crossed although the bytes are written
+  once per file (`persistCommit` builds them now — that halved `BenchmarkBatchCommit`); and
+  `Stats()` summed every segment's capacity, costing 391 µs at 60k segments, so `s.diskBytes`
+  is maintained instead — update it at **every** `s.files` append (`cycle`, `startFresh`,
+  `load`) and in `dropCommitted`. `flushBatch`/`sync` still walk the whole set, deliberately:
+  a `df.dirty` test per file is cheaper than a second intrusive list.
 - **Reclamation is whole-file, on write *and* commit.** `dropCommitted(keep)`
   deletes files whose every record is committed (`base+size <= commitOff`), except
   `keep`. A file whose `os.Remove` fails stays in `s.files` (counts not subtracted,
@@ -243,6 +262,20 @@ mirrors its own `written`/`committed` counts into its header.
   otherwise sits above the header's count and never fires. So a *truncated* segment,
   and only a truncated one, gets a bounded frame walk over the bytes that survived.
   Every healthy open still costs one 64-byte pread per segment.
+- **Recovery is not finished until its conclusions are durable.** Both passes above
+  correct a header that could not be believed — the truncation clamp rewrites the write
+  cursor, the reconciliation rewrites the committed count — and a correction that lives
+  only in memory is believed *again* by the next open. So `load` ends with a write-back
+  loop that stamps `setWriteCursor`/`setWrittenCount`/`setCommitCursor`/`setCommittedCount`
+  into every segment whose header does not already say them, with the commit cursor
+  reconciled against the recovered *global* cursor exactly as the counts are. Two failures
+  this closes, both of which lost acknowledged records with every loss counter reading zero:
+  a truncated segment used to keep its old commit cursor, which later appends grew the
+  segment past and the next open then believed; and a segment whose committed count the
+  reconciliation overrode kept the stale figure, which became authoritative once the
+  segments ahead of it were reclaimed and it became the leading one. On a healthy open every
+  field already agrees, so the guard never fires and reopening still costs one 64-byte pread
+  per segment and no writes.
 - **Committed counts come from the recovered cursor, not from each header.** The
   counts are per-segment while the cursor is global, and writeback across segments
   is not ordered — a header can claim "fully committed" for records the (rewound)
@@ -261,7 +294,14 @@ mirrors its own `written`/`committed` counts into its header.
   `ErrSegmentSizeMismatch`. Checking a max over `os.Stat` sizes, as before,
   misreported a truncated single-segment store as a config mismatch and locked
   recovery out of it.
-- **An unfinished create is not corruption.** A create interrupted between the link
+- **An unfinished create is not corruption — but only at the tail.** BOTH the
+  zero-length and the all-zero shape are gated on being the highest-numbered segment, for
+  the reason `abortedCreate` gives: segments are created one at a time at the end of the
+  sequence and the number advances only once the create has succeeded, so a zeroed file with
+  a live sibling *above* it was never an unfinished create. It is a segment that lost every
+  byte it had, and it takes the ordinary corruption path — counted, and owed one
+  `ErrCorrupt`. The zero-length branch used to skip that gate, so a middle segment truncated
+  to nothing was unlinked in silence. A create interrupted between the link
   and the header write leaves a zero-length file; one interrupted a step later,
   between the reservation and the header write, leaves a *full-length* file of
   zeros. Neither can hold a record, so `loadFile` removes both and raises no loss
@@ -297,6 +337,16 @@ mirrors its own `written`/`committed` counts into its header.
   `shortReadIsCorrupt` and the `os.ErrNotExist` wrap in `read` are what route the
   second class in; without them a truncated or vanished segment arrives as a bare
   `io.EOF`/`ENOENT` that no recovery path recognises, and the reader wedges.
+- **A record reported destroyed must also be retired.** `takeHead`'s checksum-mismatch arm
+  drops one record and advances `headOff`, and nothing else would ever move the commit cursor
+  past it: every consume op returns on the error without committing. Left alone, a damaged
+  record at the tail kept `Count()` above zero for good, pinned its segment against
+  reclamation, and was re-read and re-reported on every reopen — one `ErrCorrupt` and one
+  `LostRecords` per restart, forever. So the arm commits past it, but *only* when the commit
+  cursor stood exactly there; with records reserved behind it the cursor may not jump,
+  because that would retire work no consumer has acknowledged. Those cases heal on their own,
+  since the eventual `Commit` walks across the record like any other — its framing is intact,
+  only the payload failed.
 - **A segment counts as lost only if something in it was.** `skipCorruptSegment`
   books `lostSegments` inside the `lost := end - s.headOff; lost > 0` guard, not
   beside it. Reached from the commit path the read cursor is often already past the
@@ -364,6 +414,16 @@ mirrors its own `written`/`committed` counts into its header.
   durable. A header write racing the data fsync is the torn state the solo
   append's ordering exists to prevent; staging keeps the header out of reach
   by construction.
+- **`AddBatch` stages on EVERY policy, not just per-op.** The deferred policies ran the
+  plain `append` loop, which writes a 64-byte header per record — so the method whose whole
+  purpose is amortization cost two pwrites per record on exactly the policies chosen for
+  throughput, against 1.01 on per-op. One staged path now serves all of them, and
+  `publishBatchLocked` branches only on whether the span needs its two fsyncs. The span still
+  counts every record through `recordOps`, because `SyncEvery` is documented as a count of
+  *writes* and collapsing a batch into one tick would silently widen the power-loss window it
+  exists to bound. Every early return in that loop either publishes what is staged or
+  discards it — the `ioErr` arm used to do neither, leaving a span no leader would settle and
+  wedging every later quiesce, `Close` included, forever.
 - **Every staged record lives in the active file** — cycling, `AddBatch`,
   `Requeue`, `Sync` and `Close` quiesce first (`waitFlushQuiescedLocked`) — so
   a failed publication discards exactly one contiguous tail
@@ -375,8 +435,13 @@ mirrors its own `written`/`committed` counts into its header.
   shapes (solo, group, batch) under the same injection-point names.
 - **Group commit shares the fsyncs, not the contract.** A solo Add leads a span
   of one and allocates nothing (the `flushGroup` is created only by a follower
-  that arrives mid-flush), which is what keeps `BenchmarkAddTake` at 0
-  allocs/op. Followers wait on their group's `done` channel and take the
+  that arrives mid-flush). Note which benchmark proves what: `BenchmarkAddTake` and
+  `TestAddTakeZeroAlloc` both run under `NoSync`, so they guard the *plain* append path
+  and never execute `addDurableLocked`/`stagePending`/`leadFlushLocked`/`publishSpan`.
+  The per-op path is guarded by `BenchmarkAddBatch` and `BenchmarkAddParallel`, also
+  0 allocs/op; measured directly, a solo per-op Add+Take is 0 allocs/op, a per-op
+  `AddBatch` is 0, and 8 concurrent producers cost ~0.27 allocs/op — the one
+  `flushGroup` and channel per flush window, which is the design. Followers wait on their group's `done` channel and take the
   span's verdict; the leader drains spans until nothing is pending, then
   clears `flushing` and wakes the quiesce waiters. After ANY wait that
   released the lock (quiesce, space, follower), re-check `closed` — staging
@@ -386,6 +451,24 @@ mirrors its own `written`/`committed` counts into its header.
   reader's progress). The leader deliberately leaves `af.dirty` set after its
   header fsync — a commit may have rewritten the header while the lock was
   away, and clearing it would skip that write's flush.
+- **Quiescing needs a barrier, and it must not be `waitFlushQuiescedLocked`.** The flush
+  leader leaves its span loop only when no follower staged during the last span, so a steady
+  producer stream keeps `flushing` true across hundreds of consecutive spans and everything
+  that quiesces — `Sync`, `AddBatch`, `Requeue`, `Close` — waits behind the producers rather
+  than behind the flush. Measured before the fix: a worst-case `Sync` of 36.9s at 8
+  producers, one leader driving 703 spans; `AddBatch`'s tail at 1.92s. So
+  `waitFlushQuiescedLocked` holds `quiesceWant` for the duration of its wait, and
+  `addDurableLocked` parks arriving producers on `quiesceRelease` *before staging* — a
+  staged record is what keeps the waiter's predicate true.
+
+  The barrier has to be a SEPARATE channel. Sending producers into
+  `waitFlushQuiescedLocked` instead livelocks: a producer whose predicate is already false
+  returns immediately still holding the mutex, re-checks the barrier, re-enters, and spins on
+  the lock — starving the very waiter it was meant to yield to. That was implemented and
+  measured (30 Syncs failed to complete in 25s) before the current shape. Both fields are
+  zero/nil when nobody quiesces, so the uncontended Add path is one int compare; a
+  pathological tight `Sync` loop can hold `quiesceWant` above zero and invert the fairness,
+  which is the deliberate trade.
 - **Marshal runs outside the lock for Add/AddWait** (pooled `marshalBuf`, so
   codecs run concurrently across producers and a slow codec cannot stall
   consumers); `AddBatch` marshals under the lock through `w.scratch`. Both
@@ -498,10 +581,12 @@ mirrors its own `written`/`committed` counts into its header.
   write 64 bytes.
 - Offsets are byte positions, monotonic within a session, not stable across a
   reopen (head resets to the recovered commit cursor).
-- I/O is `os.File` `ReadAt`/`WriteAt`/`Sync` plus a directory `fsync` (`fsyncDir`)
-  for durable creates/removes, `syscall.Fallocate` for preallocation and
-  `syscall.Flock` for the directory lock — all stdlib, so still no
-  `golang.org/x/sys` dependency. The platform-specific bits live in the
+- I/O is `os.File` `ReadAt`/`WriteAt` for records and headers; every per-record and
+  per-header flush goes through `datasync` — `syscall.Fdatasync` on Linux, `f.Sync()`
+  elsewhere and for `createFile`, the one write that changes metadata. Plus a directory
+  `fsync` (`fsyncDir`) for durable creates/removes, `syscall.Fallocate` for preallocation
+  and `syscall.Flock` for the directory lock — all stdlib, so still no `golang.org/x/sys`
+  dependency. The platform-specific bits live in the
   build-tagged file pairs, sharing the `fdControl` EINTR-retry helper
   ([fdcontrol_unix.go](fdcontrol_unix.go)); every `GOOS` in `go tool dist list`
   must keep compiling (`GOOS=windows go build ./...` etc.).

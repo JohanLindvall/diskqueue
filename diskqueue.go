@@ -28,9 +28,14 @@ type UnmarshalFunc[T any] func(data []byte) (T, error)
 
 // Errors returned by the package.
 var (
-	// ErrClosed is returned once the Queue has been closed.
+	// ErrClosed is returned by every operation that would touch the store once the
+	// Queue has been closed. The pure observers are deliberately exempt and keep
+	// reporting the final state: Count, Empty, Size, Stats and Err.
 	ErrClosed = errors.New("diskqueue: closed")
-	// ErrFull is returned by Add when a new segment would exceed maxSegments.
+	// ErrFull is returned by Add when the write cannot be admitted right now:
+	// either a new segment would exceed Options.MaxSegments, or the uncommitted
+	// backlog would exceed Options.MaxBytes. It is the TRANSIENT refusal — it
+	// clears as the consumer commits — where ErrRecordTooLarge is permanent.
 	ErrFull = errors.New("diskqueue: full")
 	// ErrInvalidOffset is returned by Commit for an offset beyond the last record.
 	ErrInvalidOffset = errors.New("diskqueue: invalid offset")
@@ -96,7 +101,11 @@ type Options struct {
 	SyncEvery int
 
 	// SegmentSize sets each segment file's capacity. Default 8 MiB, floored at
-	// 4 KiB and rounded up to a page. It is not a ceiling on record size: a
+	// 4 KiB and rounded up to a multiple of 4 KiB — a fixed constant, deliberately
+	// NOT the host's page size, so a store created on a 4 KiB-page machine still
+	// reopens on a 64 KiB-page one. Values above 2^48-4096 are clamped to that
+	// ceiling, which is what the 6-byte geometry field in each header can hold.
+	// It is not a ceiling on record size: a
 	// record too big for the geometry gets a segment sized to exactly itself.
 	// Fixed at creation: reopening with a different (post-rounding) value is
 	// rejected with ErrSegmentSizeMismatch.
@@ -161,6 +170,12 @@ type Stats struct {
 	// which fsyncs before Add returns, and climbs under NoSync or SyncEvery > 1
 	// until a Sync, a batch flush or Close brings it back to zero.
 	//
+	// One window it does not cover, by construction: under group commit a span is
+	// published — and therefore readable and counted in Backlog — for the duration
+	// of its header fsync, during which those bytes are not yet durable. The gauge
+	// stays zero there because the per-op policy's contract is that it is zero; the
+	// Add that owns the span has not returned yet.
+	//
 	// A process crash does not lose these bytes — the kernel owns the pages — so
 	// this measures exposure to power loss and kernel panic specifically. Watch it
 	// against SyncInterval: if it keeps climbing, the backstop is not keeping up.
@@ -177,8 +192,13 @@ type Stats struct {
 	DiskBytes     int64 // what the segment files occupy, including preallocated slack
 
 	// Counters since New.
-	Added     uint64 // records accepted by Add
-	Delivered uint64 // records handed to a reader, redeliveries included
+	Added uint64 // records accepted by Add
+	// Delivered counts records READ OUT OF THE STORE by a Reader, redeliveries
+	// included. That is one step earlier than "processed": a record whose commit
+	// then failed, or whose UnmarshalFunc rejected it, is counted here even though
+	// the caller never received it — the read is what happened, and the record
+	// replays. Compare against Committed to see work being taken and not retired.
+	Delivered uint64
 	Committed uint64 // records retired by a commit
 	Full      uint64 // Adds refused with ErrFull
 	// Unreclaimed counts failed attempts to unlink a fully-committed segment.
@@ -199,6 +219,12 @@ type Stats struct {
 	// framing. Each one was, or will be, surfaced as exactly one ErrCorrupt from a
 	// read — this is the number an operator alerts on, and the Lost* fields above
 	// say how much each event cost.
+	//
+	// It counts EVENTS, not damaged regions, and one region can produce more than
+	// one: a segment the read path quarantines is quarantined again when the commit
+	// walk later crosses it, so a single unframable record can read as Corruptions=2
+	// with LostSegments=1. The byte and record figures are booked once; this one
+	// tracks the reports actually handed to consumers.
 	Corruptions uint64
 }
 
@@ -234,6 +260,15 @@ type Queue[T any] struct {
 	// Close all need that before touching what a span could still move.
 	// nil when nobody waits.
 	flushDrained chan struct{}
+
+	// quiesceWant counts goroutines currently inside waitFlushQuiescedLocked, and
+	// quiesceRelease parks arriving producers while any of them are. Without that
+	// barrier the flush leader keeps finding a follower staged into its last span
+	// and never leaves its loop, so a quiesce waits behind the producer stream
+	// rather than behind the flush — seconds, not milliseconds. Both are zero/nil
+	// when nobody is quiescing, so the uncontended Add path is one int compare.
+	quiesceWant    int
+	quiesceRelease chan struct{}
 
 	// syncStop/syncDone coordinate the optional background syncer (SyncInterval);
 	// both nil when it is not running.
@@ -355,11 +390,17 @@ func (w *Queue[T]) putBuf(mb *marshalBuf) {
 // Add appends data to the back of the log.
 //
 // A write that cannot be placed at all (ErrFull, ErrRecordTooLarge, a failed
-// pwrite) leaves the queue untouched: the error means the item is not in it. The
-// exception is a durability failure — if the error wraps ErrIO the record's bytes
-// and the header publishing them did reach the page cache, so the item is in the
-// log and readable, and only its power-loss durability is in doubt; the queue is
-// then poisoned and every later operation repeats the error.
+// pwrite) leaves the queue untouched: the error means the item is not in it.
+//
+// A durability failure is the one AMBIGUOUS answer. If the error wraps ErrIO the
+// item may or may not be in the log, and the two arms are not distinguishable
+// from the error: a failed HEADER fsync leaves the record real to everything
+// short of a power loss (its bytes and the header publishing them both reached
+// the page cache), while a failed DATA fsync publishes nothing at all. Either way
+// the queue is poisoned and every later operation repeats the error, so the only
+// recourse is to close and reopen — and a reopen answers the question definitively
+// through Count and Stats. Treat an ErrIO as at-least-once ambiguous rather than
+// as a confirmed placement.
 //
 // Serialization happens before the lock, and under the default per-op policy
 // the two fsyncs are SHARED: concurrent Adds that arrive while a flush is in
@@ -435,28 +476,22 @@ func (w *Queue[T]) AddBatch(items []T) (int, error) {
 	return n, err
 }
 
+// addBatchLocked stages every record and publishes one span per segment crossed,
+// on EVERY durability policy. The per-op policy gets the fsyncs amortized; the
+// deferred policies get the header writes amortized, which is the cost that
+// dominates there — the plain append path writes a 64-byte header per record, so
+// a batch used to cost two pwrites per record on exactly the policies chosen for
+// throughput.
+//
+// Every early return either publishes what is staged or discards it, so the store
+// is never left holding a staged tail no leader will settle. Each publish call is
+// sequenced BEFORE the return statement that reports its count: reading
+// `published` in the same return that mutates it through a pointer would depend on
+// an evaluation order the Go spec leaves unspecified.
 func (w *Queue[T]) addBatchLocked(items []T) (int, error) {
 	st := w.st
-	if !st.perOp() {
-		// The deferred policies already amortize their fsyncs; the plain append
-		// path is the batch path, minus the per-item lock round trips.
-		for n, it := range items {
-			b, err := w.marshal(w.scratch[:0], it)
-			if b != nil {
-				w.scratch = b
-			}
-			if err != nil {
-				return n, err
-			}
-			if err := st.append(b); err != nil {
-				return n, err
-			}
-		}
-		return len(items), nil
-	}
-
-	// Per-op: stage every record, publish in spans. Quiesce first so the batch
-	// is the only thing staging — its spans then discard cleanly on failure.
+	// Quiesce first so the batch is the only thing staging — its spans then
+	// discard cleanly on failure.
 	w.waitFlushQuiescedLocked()
 	if w.closed {
 		return 0, ErrClosed // Close ran while the quiesce had the lock released
@@ -468,15 +503,21 @@ func (w *Queue[T]) addBatchLocked(items []T) (int, error) {
 			w.scratch = b
 		}
 		if err != nil {
-			return published, errors.Join(err, w.publishBatchLocked(&published))
+			perr := w.publishBatchLocked(&published)
+			return published, errors.Join(err, perr)
 		}
-		L := len(b)
-		recLen := int64(uvarintLen(uint64(L)) + L + checksumSize)
+		recLen := framedLen(len(b))
 		if st.ioErr != nil {
+			// Discard rather than publish: the store is latched, so publishing would
+			// fail anyway — and returning with a staged tail in place leaves
+			// pendingBytes with no leader to settle it, which wedges every later
+			// quiesce (Close included) forever.
+			st.discardStaged()
 			return published, st.ioErr
 		}
 		if err := st.admitRecord(recLen, false); err != nil {
-			return published, errors.Join(err, w.publishBatchLocked(&published))
+			perr := w.publishBatchLocked(&published)
+			return published, errors.Join(err, perr)
 		}
 		if st.needsCycle(recLen) {
 			// Records never span files, and neither do spans: publish what is
@@ -492,11 +533,11 @@ func (w *Queue[T]) addBatchLocked(items []T) (int, error) {
 			}
 		}
 		if err := st.stagePending(b); err != nil {
-			return published, errors.Join(err, w.publishBatchLocked(&published))
+			perr := w.publishBatchLocked(&published)
+			return published, errors.Join(err, perr)
 		}
 	}
-	err := w.publishBatchLocked(&published)
-	return published, err
+	return published, w.publishBatchLocked(&published)
 }
 
 // publishBatchLocked makes every pending staged record durable without
@@ -514,6 +555,25 @@ func (w *Queue[T]) publishBatchLocked(published *int) error {
 	st.takeSpan()
 	af := st.active()
 	recs := int(st.inFlightRecs)
+	span := st.inFlight
+	if !st.perOp() {
+		// Deferred policies: the record bytes and the header both land in the page
+		// cache and one later flush covers them, exactly as the plain append path
+		// does. A torn tail from a power loss between flushes is caught by the
+		// per-record checksum.
+		if err := st.publishSpan(); err != nil {
+			return err // the span and anything behind it were discarded
+		}
+		*published += recs
+		st.unsyncedBytes += span
+		if st.batched() {
+			// Count every record, not the span: SyncEvery is documented as a count
+			// of writes, and collapsing a batch into one tick would silently widen
+			// the power-loss window it exists to bound.
+			return st.recordOps(recs)
+		}
+		return nil
+	}
 	if err := faultPoint("append.syncData"); err != nil {
 		st.discardStaged()
 		return st.failIO(err)
@@ -565,8 +625,7 @@ func (w *Queue[T]) addBytesLocked(payload []byte) error {
 // the page cache.
 func (w *Queue[T]) addDurableLocked(payload []byte, force bool) error {
 	st := w.st
-	L := len(payload)
-	recLen := int64(uvarintLen(uint64(L)) + L + checksumSize)
+	recLen := framedLen(len(payload))
 	for {
 		// Re-checked every pass: a quiesce below releases the lock, and the
 		// store may have closed or latched while it was away — staging onto a
@@ -576,6 +635,12 @@ func (w *Queue[T]) addDurableLocked(payload []byte, force bool) error {
 		}
 		if st.ioErr != nil {
 			return st.ioErr
+		}
+		// Yield to anyone waiting to quiesce, before staging rather than after: a
+		// staged record is what keeps the waiter's predicate true.
+		if w.quiesceWant > 0 {
+			w.waitQuiesceReleaseLocked()
+			continue
 		}
 		if err := st.admitRecord(recLen, force); err != nil {
 			return err
@@ -705,6 +770,17 @@ func (w *Queue[T]) leadFlushLocked() error {
 // is settled; with the lock then held continuously, nothing can begin staging
 // underneath the caller.
 func (w *Queue[T]) waitFlushQuiescedLocked() {
+	// Hold arriving producers off for the duration of the wait. The count, not a
+	// bool: several goroutines can be quiescing at once, and the last one out is
+	// what releases the producers.
+	w.quiesceWant++
+	defer func() {
+		w.quiesceWant--
+		if w.quiesceWant == 0 && w.quiesceRelease != nil {
+			close(w.quiesceRelease)
+			w.quiesceRelease = nil
+		}
+	}()
 	for w.st.flushing || w.st.stagedBytes() > 0 {
 		if w.flushDrained == nil {
 			w.flushDrained = make(chan struct{})
@@ -714,6 +790,25 @@ func (w *Queue[T]) waitFlushQuiescedLocked() {
 		<-ch
 		w.mu.Lock()
 	}
+}
+
+// waitQuiesceReleaseLocked parks a producer until no goroutine is quiescing,
+// reacquiring the lock before returning. The caller must hold w.mu and must
+// re-evaluate everything afterwards — the lock was released.
+//
+// It is deliberately NOT waitFlushQuiescedLocked. Sending producers there
+// livelocks: a producer whose predicate is already false returns immediately
+// still holding the mutex, re-checks the barrier, re-enters, and spins on the
+// lock — starving the very waiter it was meant to yield to. A separate channel,
+// closed only when the last quiescer leaves, is what actually hands the lock over.
+func (w *Queue[T]) waitQuiesceReleaseLocked() {
+	if w.quiesceRelease == nil {
+		w.quiesceRelease = make(chan struct{})
+	}
+	ch := w.quiesceRelease
+	w.mu.Unlock()
+	<-ch
+	w.mu.Lock()
 }
 
 // signalFlushDrained wakes everything blocked in waitFlushQuiescedLocked.
@@ -768,6 +863,14 @@ func (w *Queue[T]) dropOversizedScratch() {
 }
 
 // Empty reports whether there are no items available to read.
+//
+// It also stays false while corruption reports are owed — losses from segments
+// dropped at open, which no read of their own will ever fail on. Only a consume
+// op discharges those (TryPeek deliberately does not), so a blocking consumer
+// wakes up, collects each ErrCorrupt, and only then sees an empty queue. That is
+// why Empty can be false with Count, Size and TryPeek all saying nothing is there.
+//
+// It remains readable after Close and reports the final observed state.
 func (w *Queue[T]) Empty() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -825,6 +928,11 @@ func (w *Queue[T]) Err() error {
 // ahead of the commit cursor with no way back: Empty reported true, Follow
 // blocked, and the records were unreachable until the process restarted, even
 // though they were still on disk and still uncommitted.
+//
+// Offsets handed out before a Rewind become invalid with it: Commit rejects
+// anything past the shared read cursor, so a Commit of a pre-Rewind offset answers
+// ErrInvalidOffset. That is the nack doing its job — the record was returned to the
+// queue — but a consumer holding reserved offsets has to expect it.
 //
 // It moves the *shared* cursor, which is why it is here and not on Reader. With
 // cooperating readers it replays records other readers may still be working on,
@@ -917,6 +1025,11 @@ func (w *Queue[T]) syncLoop(d time.Duration) {
 
 // waitLocked releases the lock, blocks until Add signals or ctx is done, then
 // reacquires it. The caller must hold w.mu.
+//
+// The channel is created per wait and closed to broadcast, so a consumer that
+// keeps up — and therefore parks between records — costs one channel allocation
+// per record. That is inherent to close-as-broadcast and is the only allocation
+// on any hot path; every non-blocking operation stays at zero.
 func (w *Queue[T]) waitLocked(ctx context.Context) error {
 	if w.notify == nil {
 		w.notify = make(chan struct{})

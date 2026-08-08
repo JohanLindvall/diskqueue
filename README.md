@@ -14,9 +14,10 @@ every record in them has been committed.
 The package is designed for high throughput and minimal per-operation heap
 allocation:
 
-- Serialization reuses an internal scratch buffer, so `Add` performs **no heap
-  allocation** once warm (given a `MarshalFunc` that appends into the supplied
-  buffer).
+- Serialization reuses a pooled buffer and runs **before** the queue's lock is taken,
+  so `Add` performs **no heap allocation** once warm (given a `MarshalFunc` that appends
+  into the supplied buffer) and concurrent producers marshal concurrently. A `MarshalFunc`
+  must therefore be safe for concurrent use; `AddBatch` marshals under the lock instead.
 - A `Reader` copies each record once into its own reusable scratch buffer before
   handing it to `UnmarshalFunc` — **no per-read allocation** once warm, and the
   value never aliases the store's reused read buffer.
@@ -45,7 +46,9 @@ has flock; on Windows, Solaris, AIX, plan9 and js the lock is a no-op and
 nothing prevents two processes from opening the same directory. Each file
 begins with a 64-byte header — a magic number, a format version, the commit
 cursor (persisted read position), write cursor (data end), written and committed
-record counts, and an `xxhash64` over the header itself — followed by records,
+record counts, the segment's own capacity, the `SegmentSize` the store was created
+with (these last two are what decide geometry and truncation, never the file's
+length), and an `xxhash64` over the header itself — followed by records,
 each `uvarint(len) || payload || xxhash64(payload)` (an 8-byte little-endian
 checksum trailer). Because the cursors and counts all live in the header,
 reopening reads no records at all; the header checksum is verified on open (a
@@ -181,7 +184,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `New[T](path, marshal, unmarshal, ...Options)` | Open/create a Queue at `path` (segment cap via `Options.MaxSegments`, default 32). |
 | `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments` or `MaxBytes` (transient), `ErrRecordTooLarge` if it can never fit under `MaxBytes` (permanent). A record too big for one segment gets a segment of its own. Serialization runs before the lock, and under the default policy concurrent `Add`s share their fsyncs (group commit) while each record stays individually durable. |
 | `AddWait(ctx, v T) error` | `Add` with backpressure: blocks while the queue is full, until a commit frees capacity or `ctx` is done. `ErrRecordTooLarge` still returns immediately. |
-| `AddBatch(items []T) (int, error)` | Append items in order with the fsyncs amortized over the whole batch (per segment: one data fsync, one header write, one header fsync). Returns how many leading items were placed — on error the first `n` are in and durable, the rest are not. |
+| `AddBatch(items []T) (int, error)` | Append items in order with the per-record cost amortized over the whole batch: one header write per segment crossed on every policy, plus (under per-op durability) one data fsync and one header fsync. Returns how many leading items were placed — on error the first `n` are in and durable, the rest are not. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
 | `Empty() bool` | Whether anything is available to read. |
 | `Count() int` | Number of items added but not yet committed. |

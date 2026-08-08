@@ -58,7 +58,7 @@ func growKeeping(b []byte, n, keep int) []byte {
 // writeBuf and writes it at data offset off with a single WriteAt.
 func (s *store) writeRecord(df *dataFile, off int64, payload []byte) error {
 	L := len(payload)
-	total := uvarintLen(uint64(L)) + L + checksumSize
+	total := int(framedLen(L)) // the one definition of what a record costs
 	s.writeBuf = growBuf(s.writeBuf, total)
 	n := binary.PutUvarint(s.writeBuf, uint64(L))
 	copy(s.writeBuf[n:], payload)
@@ -112,8 +112,12 @@ func (s *store) blockAt(dataOff int64, n int) []byte {
 	return s.readBuf[i : i+n]
 }
 
-// dropBlock forgets the cached block. Called wherever a segment's published
-// extent can shrink or its file can go away.
+// dropBlock forgets the cached block. Called wherever a segment's published extent
+// can shrink or its file can go away: dropCommitted, which unlinks a reclaimed
+// segment, and the two recovery clamps that cut a segment back to its last whole
+// frame. The quarantine does NOT need it — skipCorruptSegment moves cursors past a
+// segment without changing a byte in it, so a block read from it stays exactly as
+// valid as it was.
 //
 // It is also where a buffer grown by an oversized record is released: readBuf
 // sized for the largest record ever read would otherwise stay resident for the
@@ -140,10 +144,19 @@ func (s *store) fillBlock(df *dataFile, dataOff, avail int64, need int) error {
 			s.dropBlock()
 			return err
 		}
-		if err := s.readBlock(df, dataOff, min(int64(need), avail)); err != nil {
-			s.dropBlock()
-			return shortReadIsCorrupt(err)
+		// Retry at exactly what this record needs — but only if that is actually a
+		// smaller read. For a frame at least readAhead wide the two are the same
+		// pread, and re-issuing one that has already reported EOF just costs a
+		// syscall to learn the same thing.
+		if narrowed := min(int64(need), avail); narrowed < want {
+			if err := s.readBlock(df, dataOff, narrowed); err != nil {
+				s.dropBlock()
+				return shortReadIsCorrupt(err)
+			}
+			return nil
 		}
+		s.dropBlock()
+		return shortReadIsCorrupt(err)
 	}
 	return nil
 }
@@ -181,10 +194,12 @@ func (s *store) readBlock(df *dataFile, dataOff, n int64) error {
 func (s *store) frameHeader(df *dataFile, dataOff, avail int64) (n, total int, ok bool, err error) {
 	probe := int(min(int64(binary.MaxVarintLen64), avail))
 	if !s.blockHas(df, dataOff, probe) {
+		// fillBlock either covers `probe` bytes at dataOff or reports an error —
+		// its narrowest successful read is exactly min(need, avail), and probe is
+		// already <= avail — so there is nothing left to clamp against blockLen.
 		if err := s.fillBlock(df, dataOff, avail, probe); err != nil {
 			return 0, 0, false, err
 		}
-		probe = min(probe, s.blockLen)
 	}
 	v, n := binary.Uvarint(s.blockAt(dataOff, probe))
 	if n <= 0 || !fitsInRecord(v, n, avail) {
@@ -272,9 +287,20 @@ func fitsInRecord(v uint64, n int, avail int64) bool {
 	// narrowing in the caller would wrap negative again. Bounding by both keeps
 	// the guard true on every word size.
 	const maxInt = uint64(^uint(0) >> 1)
-	return v <= uint64(avail) && v <= maxInt &&
-		uint64(n)+v+checksumSize <= uint64(avail)
+	// Bound the TOTAL frame, not just v. On a 32-bit build avail itself can exceed
+	// maxInt, so a v that satisfies `v <= maxInt` can still make n+int(v)+checksumSize
+	// wrap negative in the caller — which sails past the signed bounds check and
+	// panics reslicing readBuf. The uint64 sum cannot overflow: the first comparison
+	// already bounds v by avail, and avail is bounded by real file bytes.
+	return v <= uint64(avail) &&
+		uint64(n)+v+checksumSize <= min(uint64(avail), maxInt)
 }
+
+// framedLen is the on-disk cost of a record with a payload of L bytes: the uvarint
+// length prefix, the payload, and the checksum trailer. Every admission check,
+// cycle decision and staged-span tally has to agree with what writeRecord actually
+// lays down, so the arithmetic is spelled once.
+func framedLen(L int) int64 { return int64(uvarintLen(uint64(L)) + L + checksumSize) }
 
 func uvarintLen(x uint64) int {
 	n := 1
