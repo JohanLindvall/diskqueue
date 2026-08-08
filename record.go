@@ -90,6 +90,7 @@ func isShortRead(err error) bool {
 
 // The read block. readBuf holds a run of one segment's data region — not just
 // the record a read asked for — and blockFile/blockOff/blockLen say which run.
+// dropBlock names the sites that invalidate it.
 //
 // Records are immutable once published: append only ever writes past the write
 // cursor, and the header that publishes those bytes is written afterwards. So a
@@ -180,6 +181,9 @@ func (s *store) readBlock(df *dataFile, dataOff, n int64) error {
 	} else {
 		s.dropBlock() // readBuf is about to be overwritten, and may be reallocated
 		s.readBuf = growBuf(s.readBuf, int(n))
+	}
+	if err := faultPoint("read.block"); err != nil {
+		return err // the caller decides; the block still describes what is valid
 	}
 	if _, err := df.f.ReadAt(s.readBuf[have:n], headerSize+dataOff+int64(have)); err != nil {
 		return err // the caller decides; the block still describes what is valid
@@ -292,6 +296,14 @@ func fitsInRecord(v uint64, n int, avail int64) bool {
 	// wrap negative in the caller — which sails past the signed bounds check and
 	// panics reslicing readBuf. The uint64 sum cannot overflow: the first comparison
 	// already bounds v by avail, and avail is bounded by real file bytes.
+	return fitsWithin(v, n, avail, maxInt)
+}
+
+// fitsWithin is fitsInRecord with the word size as a parameter, so the 32-bit bound
+// can be exercised from a 64-bit test run. Without it the guard is reachable only
+// under GOARCH=386, which no CI leg here executes — and a bound nothing can test is
+// a bound that drifts back.
+func fitsWithin(v uint64, n int, avail int64, maxInt uint64) bool {
 	return v <= uint64(avail) &&
 		uint64(n)+v+checksumSize <= min(uint64(avail), maxInt)
 }
@@ -300,7 +312,11 @@ func fitsInRecord(v uint64, n int, avail int64) bool {
 // length prefix, the payload, and the checksum trailer. Every admission check,
 // cycle decision and staged-span tally has to agree with what writeRecord actually
 // lays down, so the arithmetic is spelled once.
-func framedLen(L int) int64 { return int64(uvarintLen(uint64(L)) + L + checksumSize) }
+func framedLen(L int) int64 {
+	// Widen before summing, not after: on a 32-bit build the int sum can wrap for a
+	// payload near maxInt, and every admission and cycle decision is made from this.
+	return int64(uvarintLen(uint64(L))) + int64(L) + checksumSize
+}
 
 func uvarintLen(x uint64) int {
 	n := 1

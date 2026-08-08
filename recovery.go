@@ -166,7 +166,17 @@ func (s *store) load() error {
 			df.commitCursor() == cc && df.committedCount() == df.committed {
 			continue
 		}
+		// Fatal only for a TRUNCATED segment, whose republish must land or the same
+		// loss is re-booked on every open. For the reconciliation-only population
+		// this is best-effort, like the re-extension below: a segment that can be
+		// read but not written (a read-only file, a full disk) must not take its
+		// healthy siblings down with it, and leaving that header uncorrected is
+		// exactly the state every release before this one shipped.
+		fatal := df.truncated
 		if err := s.ensureOpen(df); err != nil {
+			if !fatal {
+				continue
+			}
 			return err
 		}
 		df.header(
@@ -176,10 +186,16 @@ func (s *store) load() error {
 			setCommittedCount(df.committed),
 		)
 		if err := s.writeHeader(df); err != nil {
+			if !fatal {
+				continue
+			}
 			return err
 		}
 		if !s.noSync {
 			if err := s.flushFile(df); err != nil {
+				if !fatal {
+					continue
+				}
 				return err
 			}
 		}
@@ -301,7 +317,15 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 		// records beneath it carry their own framing and checksums — so rebuild it
 		// from a verified walk instead of dropping the segment.
 		if knownVersion(th.version()) {
-			if df, cc, ok := s.salvageTornHeader(num, path, base, size); ok {
+			df, cc, ok, serr := s.salvageTornHeader(num, path, base, size)
+			if serr != nil {
+				// The walk could not be completed. Falling through would DROP the
+				// segment — dropSegment unlinks it — on the strength of a read that
+				// failed, which is the one thing "failing to look licenses nothing"
+				// forbids. Fail the open instead; the records are still on disk.
+				return nil, 0, serr
+			}
+			if ok {
 				return df, cc, nil
 			}
 		}
@@ -363,7 +387,18 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 		// An arithmetic bound (size / smallest possible frame) is not enough: it is
 		// only tight when the records are minimal, and for anything larger it sits
 		// above the header's count and never fires at all. Count the frames.
-		if n, end, err := s.surviveCount(df); err == nil {
+		n, end, werr := s.surviveCount(df)
+		if werr != nil {
+			// The walk could not be completed, so nothing is known about how many
+			// frames survived or where the last whole one ends. Skipping the
+			// correction is NOT the safe default: df.size would keep the raw
+			// truncation point, leaving a partial frame inside the published extent
+			// for the repair below to republish and the next append to land behind.
+			// Fail the open — the segment is untouched and a retry once the error
+			// clears recovers everything.
+			return nil, 0, werr
+		}
+		{
 			if gone := df.written - n; gone > 0 {
 				s.lostRecords += uint64(gone)
 			}
@@ -433,8 +468,9 @@ func (s *store) surviveCount(df *dataFile) (int64, int64, error) {
 		if err != nil {
 			// A read that FAILED says nothing about the frames: only corruption
 			// licenses the caller to clamp the segment, and clamping on a transient
-			// EIO would destroy records that are still on disk. Fail the open
-			// instead — "I could not look" is not evidence of damage.
+			// EIO would destroy records that are still on disk. Report it so the
+			// caller fails the OPEN — "I could not look" is not evidence of damage,
+			// and the caller must not treat a missing answer as a clean one.
 			if !errors.Is(err, ErrCorrupt) {
 				return 0, 0, err
 			}
@@ -485,7 +521,10 @@ func (s *store) surviveCount(df *dataFile) (int64, int64, error) {
 //
 // A walk that cannot run at all answers ok=false and the torn-header verdict
 // stands: failing to look licenses nothing.
-func (s *store) salvageTornHeader(num uint64, path string, base, size int64) (*dataFile, int64, bool) {
+// A non-nil error means the walk could not be completed and NOTHING was proven
+// about the bytes. It is returned rather than folded into ok=false because the
+// caller's answer to ok=false is to unlink the segment.
+func (s *store) salvageTornHeader(num uint64, path string, base, size int64) (*dataFile, int64, bool, error) {
 	df := &dataFile{
 		num:  num,
 		path: path,
@@ -500,7 +539,7 @@ func (s *store) salvageTornHeader(num uint64, path string, base, size int64) (*d
 			df.f = nil
 			s.untrackOpen(df)
 		}
-		return nil, 0, false
+		return nil, 0, false, err
 	}
 	df.size = end - base
 	df.written = n
@@ -536,7 +575,7 @@ func (s *store) salvageTornHeader(num uint64, path string, base, size int64) (*d
 
 	s.corruptions++
 	s.pendingCorrupt++
-	return df, headerSize, true
+	return df, headerSize, true, nil
 }
 
 // countVerified counts the whole, checksum-verified record frames at the start
@@ -554,10 +593,11 @@ func (s *store) countVerified(df *dataFile) (int64, int64, error) {
 	for off < df.base+df.size {
 		payload, sum, next, ok, err := s.recordAt(df, off)
 		if err != nil {
-			// As in surviveCount: a failed read is not a verdict on the bytes, and
-			// this walk's caller responds to failure by DROPPING the segment. Report
-			// it so the open fails instead, leaving the segment on disk to be read
-			// again once whatever failed has cleared.
+			// As in surviveCount: a failed read is not a verdict on the bytes — and
+			// this walk's caller responds to a bare "no" by UNLINKING the segment,
+			// so the error must travel out distinctly. salvageTornHeader returns it
+			// rather than answering ok=false, and the open fails with the records
+			// still on disk, to be read again once whatever failed has cleared.
 			if !errors.Is(err, ErrCorrupt) {
 				return 0, 0, err
 			}

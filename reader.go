@@ -441,6 +441,7 @@ func (r *Reader[T]) Requeue() (bool, error) {
 	r.scratch = append(r.scratch[:0], payload...)
 	if err := r.w.st.appendRecord(r.scratch, true); err != nil {
 		r.w.st.rewindHead(start) // nothing was published; leave it at the head
+		r.trimScratch()          // the copy is dead either way; don't pin an oversized one
 		return false, err
 	}
 	r.w.signal() // a waiter blocked on an empty queue can have this one

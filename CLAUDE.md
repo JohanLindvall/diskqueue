@@ -262,6 +262,18 @@ mirrors its own `written`/`committed` counts into its header.
   otherwise sits above the header's count and never fires. So a *truncated* segment,
   and only a truncated one, gets a bounded frame walk over the bytes that survived.
   Every healthy open still costs one 64-byte pread per segment.
+- **A recovery walk that cannot finish must not answer.** `surviveCount` and
+  `countVerified` are the only two places recovery reads records, and both can be cut off
+  mid-run by a bad sector — after some frames are proven and before the rest are. Neither may
+  fold that into its ordinary "no more frames" answer, because the callers' responses to that
+  answer are destructive: `loadFile` would keep the raw truncation point, leaving a partial
+  frame inside the published extent for the write-back to republish and the next append to
+  land behind; and `salvageTornHeader`'s `ok=false` sends `loadFile` into `dropSegment`, which
+  **unlinks** the file. So both walks return the error, `salvageTornHeader` carries it out as
+  a fourth result rather than as `ok=false`, and `loadFile` fails the open — nothing deleted,
+  nothing mis-published, and a retry once the error clears recovers everything. The
+  `read.block` injection point in the faults build is the seam that reaches this; no
+  descriptor trick does.
 - **Recovery is not finished until its conclusions are durable.** Both passes above
   correct a header that could not be believed — the truncation clamp rewrites the write
   cursor, the reconciliation rewrites the committed count — and a correction that lives
@@ -274,8 +286,9 @@ mirrors its own `written`/`committed` counts into its header.
   segment past and the next open then believed; and a segment whose committed count the
   reconciliation overrode kept the stale figure, which became authoritative once the
   segments ahead of it were reclaimed and it became the leading one. On a healthy open every
-  field already agrees, so the guard never fires and reopening still costs one 64-byte pread
-  per segment and no writes.
+  field already agrees, so the guard never fires: reopening still costs one 64-byte pread per
+  segment and writes no headers. (The active file's reservation is still re-asserted, as it
+  always was, so its mtime moves.)
 - **Committed counts come from the recovered cursor, not from each header.** The
   counts are per-segment while the cursor is global, and writeback across segments
   is not ordered — a header can claim "fully committed" for records the (rewound)
@@ -423,7 +436,12 @@ mirrors its own `written`/`committed` counts into its header.
   *writes* and collapsing a batch into one tick would silently widen the power-loss window it
   exists to bound. Every early return in that loop either publishes what is staged or
   discards it — the `ioErr` arm used to do neither, leaving a span no leader would settle and
-  wedging every later quiesce, `Close` included, forever.
+  wedging every later quiesce, `Close` included, forever. The one exit that is not a return is
+  a **panic out of the caller's `MarshalFunc`**, which `AddBatch` alone runs under the queue
+  mutex; a deferred `recover` discards the staged tail and re-panics, because the caller's
+  panic is theirs and the store's state is not. And the batch publishes at each `SyncEvery`
+  tick boundary *inside* itself: the option bounds unsynced **writes**, so one span per batch
+  would make the peak window `len(items)` rather than N.
 - **Every staged record lives in the active file** — cycling, `AddBatch`,
   `Requeue`, `Sync` and `Close` quiesce first (`waitFlushQuiescedLocked`) — so
   a failed publication discards exactly one contiguous tail
@@ -441,7 +459,9 @@ mirrors its own `written`/`committed` counts into its header.
   The per-op path is guarded by `BenchmarkAddBatch` and `BenchmarkAddParallel`, also
   0 allocs/op; measured directly, a solo per-op Add+Take is 0 allocs/op, a per-op
   `AddBatch` is 0, and 8 concurrent producers cost ~0.27 allocs/op — the one
-  `flushGroup` and channel per flush window, which is the design. Followers wait on their group's `done` channel and take the
+  `flushGroup` and channel per flush window, which is the design. A *benchmark* cannot
+  fail, though: `TestAddTakeZeroAlloc` is the only assertion and it covers the NoSync
+  path, so the per-op figures above are measurements, not gates. Followers wait on their group's `done` channel and take the
   span's verdict; the leader drains spans until nothing is pending, then
   clears `flushing` and wakes the quiesce waiters. After ANY wait that
   released the lock (quiesce, space, follower), re-check `closed` — staging

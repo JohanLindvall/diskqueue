@@ -194,13 +194,18 @@ type Stats struct {
 	// Counters since New.
 	Added uint64 // records accepted by Add
 	// Delivered counts records READ OUT OF THE STORE by a Reader, redeliveries
-	// included. That is one step earlier than "processed": a record whose commit
-	// then failed, or whose UnmarshalFunc rejected it, is counted here even though
-	// the caller never received it — the read is what happened, and the record
-	// replays. Compare against Committed to see work being taken and not retired.
+	// included — one step earlier than "processed". A record whose COMMIT then
+	// failed is counted, because the read is what happened and the record replays.
+	// A record the codec REJECTED is not: Reader.read puts it back at the head, and
+	// un-counts the delivery with it, so a permanently-failing UnmarshalFunc does
+	// not inflate this. Compare against Committed to see work taken and not retired.
 	Delivered uint64
 	Committed uint64 // records retired by a commit
 	Full      uint64 // Adds refused with ErrFull
+	// Committed can exceed Delivered: a record dropped for a bad checksum is retired
+	// without ever being handed out, and a quarantined segment retires its whole tail.
+	// Both are counted in the Lost* fields too.
+	//
 	// Unreclaimed counts failed attempts to unlink a fully-committed segment.
 	// A segment that will not unlink stays in the live set and is retried on the
 	// next drop, so this climbing means disk is not being freed.
@@ -483,13 +488,28 @@ func (w *Queue[T]) AddBatch(items []T) (int, error) {
 // a batch used to cost two pwrites per record on exactly the policies chosen for
 // throughput.
 //
-// Every early return either publishes what is staged or discards it, so the store
-// is never left holding a staged tail no leader will settle. Each publish call is
+// Every early return either publishes what is staged or discards it — and the
+// deferred recover above covers the one exit that is not a return, a panic out of
+// the caller's MarshalFunc — so the store is never left holding a staged tail no
+// leader will settle. Each publish call is
 // sequenced BEFORE the return statement that reports its count: reading
 // `published` in the same return that mutates it through a pointer would depend on
 // an evaluation order the Go spec leaves unspecified.
 func (w *Queue[T]) addBatchLocked(items []T) (int, error) {
 	st := w.st
+	// AddBatch is the one entry point that runs the caller's MarshalFunc under the
+	// queue mutex, so a panicking codec unwinds THROUGH the staging loop, past every
+	// publish and discard site. Left staged, that tail is a span no leader will ever
+	// settle — and on the deferred policies there is no leader at all — so every
+	// later quiesce, Close included, would block forever on a store the caller can
+	// still Add to. Discard and re-panic: the caller's panic is theirs to handle,
+	// the store's state is not.
+	defer func() {
+		if r := recover(); r != nil {
+			st.discardStaged()
+			panic(r)
+		}
+	}()
 	// Quiesce first so the batch is the only thing staging — its spans then
 	// discard cleanly on failure.
 	w.waitFlushQuiescedLocked()
@@ -536,8 +556,21 @@ func (w *Queue[T]) addBatchLocked(items []T) (int, error) {
 			perr := w.publishBatchLocked(&published)
 			return published, errors.Join(err, perr)
 		}
+		// SyncEvery bounds the number of unsynced WRITES, and that bound has to hold
+		// inside a batch too: publishing only at the end would make the peak exposure
+		// len(items) rather than N. Publish at each tick boundary instead, which is
+		// where the old per-record loop would have flushed anyway.
+		if st.batched() && st.unsynced+int(st.pendingRecs) >= st.syncEvery {
+			if err := w.publishBatchLocked(&published); err != nil {
+				return published, err
+			}
+		}
 	}
-	return published, w.publishBatchLocked(&published)
+	// Sequenced, not folded into the return: reading `published` in the same return
+	// statement that mutates it through a pointer depends on an evaluation order the
+	// Go spec leaves unspecified — the trap this function's own doc names.
+	perr := w.publishBatchLocked(&published)
+	return published, perr
 }
 
 // publishBatchLocked makes every pending staged record durable without
@@ -801,6 +834,9 @@ func (w *Queue[T]) waitFlushQuiescedLocked() {
 // still holding the mutex, re-checks the barrier, re-enters, and spins on the
 // lock — starving the very waiter it was meant to yield to. A separate channel,
 // closed only when the last quiescer leaves, is what actually hands the lock over.
+// It takes no context: the caller's deadline is re-checked on the loop it returns
+// to, so a parked producer can overshoot by however long the quiesce takes — bounded
+// by the flush it is waiting on, not unbounded.
 func (w *Queue[T]) waitQuiesceReleaseLocked() {
 	if w.quiesceRelease == nil {
 		w.quiesceRelease = make(chan struct{})

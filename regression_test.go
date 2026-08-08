@@ -340,20 +340,50 @@ func TestStrayNumericFileDoesNotBlockOpen(t *testing.T) {
 // fitsInRecord must bound the whole FRAME, not just the payload length. On a
 // 32-bit build avail can exceed maxInt, so bounding only v let the caller's
 // n+int(v)+checksumSize wrap negative and panic reslicing readBuf.
+//
+// Driven through fitsWithin so the 32-bit bound is exercised on ANY architecture:
+// with the real maxInt this assertion is unfalsifiable on 64-bit, because avail is
+// bounded by segmentSize and never approaches 2^63.
 func TestFitsInRecordBoundsTheWholeFrame(t *testing.T) {
-	const bits = strconv.IntSize
-	for _, avail := range []int64{4096, 8 << 20, 1 << 31, 1 << 32, 1 << 40} {
-		for _, v := range []uint64{
-			uint64(1)<<uint(bits-1) - 1, uint64(1) << uint(bits-1),
-			1<<63 - 1, uint64(avail), uint64(avail) - checksumSize,
-		} {
-			for n := 1; n <= 10; n++ {
-				if !fitsInRecord(v, n, avail) {
-					continue
+	for _, word := range []struct {
+		bits   int
+		maxInt uint64
+	}{{32, 1<<31 - 1}, {64, 1<<63 - 1}} {
+		for _, avail := range []int64{4096, 8 << 20, 1<<31 - 1, 1 << 31, 1 << 32, 1 << 40} {
+			for _, v := range []uint64{
+				0, 1, 7,
+				uint64(avail), uint64(avail) - checksumSize, uint64(avail) - checksumSize - 1,
+				word.maxInt - 1, word.maxInt, word.maxInt + 1,
+				1<<31 - 1, 1 << 31, 1 << 32, 1<<63 - 1, 1<<64 - 1,
+			} {
+				for n := 1; n <= 10; n++ {
+					if !fitsWithin(v, n, avail, word.maxInt) {
+						continue
+					}
+					// Accepted, so all three must hold: the frame fits the segment,
+					// the total is representable in the target word, and the payload
+					// length itself is addressable.
+					total := uint64(n) + v + checksumSize
+					if total > uint64(avail) {
+						t.Fatalf("%d-bit: fitsWithin(v=%d,n=%d,avail=%d) accepted a frame of %d",
+							word.bits, v, n, avail, total)
+					}
+					if total > word.maxInt {
+						t.Fatalf("%d-bit: fitsWithin(v=%d,n=%d,avail=%d) accepted total=%d, "+
+							"which wraps negative when the caller narrows it to int",
+							word.bits, v, n, avail, total)
+					}
 				}
-				if total := n + int(v) + checksumSize; total < 0 || int64(total) > avail {
-					t.Fatalf("fitsInRecord(v=%d, n=%d, avail=%d) accepted a frame whose "+
-						"total is %d (int is %d bits)", v, n, avail, total, bits)
+			}
+		}
+	}
+	// And the real guard must agree with the model for this machine's word size.
+	const maxInt = uint64(^uint(0) >> 1)
+	for _, avail := range []int64{4096, 1 << 20} {
+		for v := uint64(0); v < 5000; v += 7 {
+			for n := 1; n <= 3; n++ {
+				if got, want := fitsInRecord(v, n, avail), fitsWithin(v, n, avail, maxInt); got != want {
+					t.Fatalf("fitsInRecord(%d,%d,%d)=%v but fitsWithin says %v", v, n, avail, got, want)
 				}
 			}
 		}
@@ -876,5 +906,279 @@ func TestTornHeaderWithUnknownVersionIsDropped(t *testing.T) {
 	}
 	if s.Corruptions != 1 {
 		t.Fatalf("Corruptions=%d, want 1", s.Corruptions)
+	}
+}
+
+// Stats.Delivered has two arms that are easy to state backwards, and its godoc did
+// state one of them backwards. A record whose COMMIT failed stays counted (the read
+// happened, and TestDrainCommitFailureDoesNotYieldTheItem pins that); a record the
+// CODEC rejected does not, because Reader.read puts it back at the head and
+// rewindHead un-counts the delivery with it.
+func TestDeliveredCountsReadsNotHandovers(t *testing.T) {
+	boom := errors.New("codec says no")
+	reject := true
+	u := func(b []byte) (uint64, error) {
+		if reject {
+			return 0, boom
+		}
+		return unmarshalU64(b)
+	}
+	w, err := New[uint64](t.TempDir(), marshalU64, u, Options{NoSync: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Add(7); err != nil {
+		t.Fatal(err)
+	}
+	r := w.NewReader()
+
+	// A codec rejection leaves the record at the head and must not count.
+	if _, _, err := r.TryTake(); !errors.Is(err, ErrCodec) {
+		t.Fatalf("TryTake: %v, want ErrCodec", err)
+	}
+	if got := w.Stats().Delivered; got != 0 {
+		t.Fatalf("Delivered=%d after a codec rejection, want 0: the record was put back", got)
+	}
+	if got := w.Count(); got != 1 {
+		t.Fatalf("Count=%d, want 1: a codec error must not consume the record", got)
+	}
+	// And a repeat rejection must not accumulate either.
+	if _, _, err := r.TryTake(); !errors.Is(err, ErrCodec) {
+		t.Fatalf("second TryTake: %v", err)
+	}
+	if got := w.Stats().Delivered; got != 0 {
+		t.Fatalf("Delivered=%d after two codec rejections, want 0", got)
+	}
+	// Once the codec accepts it, the read counts.
+	reject = false
+	if v, ok, err := r.TryTake(); !ok || err != nil || v != 7 {
+		t.Fatalf("TryTake after the codec recovers: v=%d ok=%v err=%v", v, ok, err)
+	}
+	if got := w.Stats().Delivered; got != 1 {
+		t.Fatalf("Delivered=%d after a successful read, want 1", got)
+	}
+}
+
+// The quiesce barrier, pinned deterministically rather than by a latency bar. The
+// liveness test above proves the barrier does not deadlock; this one proves it
+// EXISTS — with the park deleted, the Add below completes immediately and this
+// fails, which is what "reproduced by a test that fails without its fix" requires.
+func TestQuiesceBarrierParksProducers(t *testing.T) {
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64,
+		Options{SegmentSize: 1 << 20, MaxSegments: -1}) // per-op: addDurableLocked
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Add(0); err != nil { // warm the active file
+		t.Fatal(err)
+	}
+
+	// Stand in for a goroutine inside waitFlushQuiescedLocked.
+	w.mu.Lock()
+	w.quiesceWant++
+	w.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() { done <- w.Add(1) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Add returned (%v) while a quiesce was pending: producers are not "+
+			"yielding, so Sync/AddBatch/Requeue/Close can be starved by a producer stream", err)
+	case <-time.After(300 * time.Millisecond):
+		// Parked, as it must be.
+	}
+
+	// Release, exactly as waitFlushQuiescedLocked's defer does.
+	w.mu.Lock()
+	w.quiesceWant--
+	if w.quiesceWant == 0 && w.quiesceRelease != nil {
+		close(w.quiesceRelease)
+		w.quiesceRelease = nil
+	}
+	w.mu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Add after the quiesce cleared: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("DEADLOCK: the parked producer never resumed after the quiesce cleared")
+	}
+	if got := w.Count(); got != 2 {
+		t.Fatalf("Count=%d, want 2", got)
+	}
+}
+
+// AddBatch's amortization is the point of the unification, and nothing was guarding
+// it: the correctness tests pass just as well against the old per-record append
+// loop. Observe the staging directly — MarshalFunc runs under the queue mutex inside
+// the staging loop, so it can see pendingBytes accumulating.
+func TestAddBatchStagesOnEveryPolicy(t *testing.T) {
+	for _, opts := range []Options{
+		{SegmentSize: 1 << 20, MaxSegments: -1},                // per-op
+		{NoSync: true, SegmentSize: 1 << 20, MaxSegments: -1},  // deferred
+		{SyncEvery: 64, SegmentSize: 1 << 20, MaxSegments: -1}, // batched
+	} {
+		var w *Queue[uint64]
+		sawStaged := 0
+		m := func(dst []byte, v uint64) ([]byte, error) {
+			if w != nil && w.st.pendingBytes > 0 {
+				sawStaged++
+			}
+			return binary.LittleEndian.AppendUint64(dst, v), nil
+		}
+		var err error
+		w, err = New[uint64](t.TempDir(), m, unmarshalU64, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		items := make([]uint64, 16)
+		for i := range items {
+			items[i] = uint64(i)
+		}
+		if n, aerr := w.AddBatch(items); n != len(items) || aerr != nil {
+			t.Fatalf("%+v: AddBatch n=%d err=%v", opts, n, aerr)
+		}
+		// Items 2..16 must each have observed the previous ones staged but not yet
+		// published. A per-record append loop publishes as it goes and never stages.
+		if sawStaged < len(items)-1 {
+			t.Errorf("%+v: only %d of %d items saw a staged predecessor — AddBatch is "+
+				"not amortizing the header write on this policy", opts, sawStaged, len(items)-1)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// SyncEvery bounds the unsynced WRITES, and that bound has to hold inside a batch:
+// publishing a whole batch as one span would make the peak exposure len(items).
+//
+// The quantity to assert is the PEAK mid-batch, not the state afterwards — the final
+// publish trips the counter and flushes either way, so an end-state assertion here is
+// vacuous (it was, on the first attempt).
+func TestAddBatchRespectsSyncEveryInsideTheBatch(t *testing.T) {
+	const every = 8
+	const items = 100
+	var w *Queue[uint64]
+	peak := 0
+	m := func(dst []byte, v uint64) ([]byte, error) {
+		// Runs under the queue mutex inside the staging loop, so it sees the window
+		// as it grows: records staged but not yet covered by a flush.
+		if w != nil {
+			if n := w.st.unsynced + int(w.st.pendingRecs); n > peak {
+				peak = n
+			}
+		}
+		return binary.LittleEndian.AppendUint64(dst, v), nil
+	}
+	var err error
+	w, err = New[uint64](t.TempDir(), m, unmarshalU64,
+		Options{SyncEvery: every, SegmentSize: 1 << 20, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	batch := make([]uint64, items)
+	for i := range batch {
+		batch[i] = uint64(i)
+	}
+	if n, aerr := w.AddBatch(batch); n != items || aerr != nil {
+		t.Fatalf("AddBatch: n=%d err=%v", n, aerr)
+	}
+	t.Logf("peak unsynced writes during the batch: %d (SyncEvery=%d, batch=%d)", peak, every, items)
+	if peak > every {
+		t.Fatalf("peak unsynced writes reached %d inside a %d-record batch at SyncEvery=%d: "+
+			"the batch never flushed inside itself, so the power-loss window was the whole "+
+			"batch rather than the %d writes Options.SyncEvery promises", peak, items, every, every)
+	}
+}
+
+// The oversized-release rule has to apply on the codec-error exits too, or one huge
+// record the codec rejects pins its buffer for the Reader's lifetime.
+func TestScratchReleasedOnCodecError(t *testing.T) {
+	big := make([]byte, 9000) // larger than the 4096 segment: an oversized record
+	m := func(dst []byte, v uint64) ([]byte, error) { return append(dst, big...), nil }
+	boom := errors.New("nope")
+	u := func(b []byte) (uint64, error) { return 0, boom }
+	w, err := New[uint64](t.TempDir(), m, u, Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Add(1); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		run  func(*Reader[uint64]) error
+	}{
+		{"TryTake", func(r *Reader[uint64]) error { _, _, e := r.TryTake(); return e }},
+		{"TryPeek", func(r *Reader[uint64]) error { _, _, e := r.TryPeek(); return e }},
+	} {
+		r := w.NewReader()
+		if e := tc.run(r); !errors.Is(e, ErrCodec) {
+			t.Fatalf("%s: %v, want ErrCodec", tc.name, e)
+		}
+		if got := int64(cap(r.scratch)); got > w.st.segmentSize {
+			t.Errorf("%s: Reader scratch still %d bytes after a codec rejection of an "+
+				"oversized record (segmentSize=%d): the buffer is pinned for the "+
+				"Reader's lifetime", tc.name, got, w.st.segmentSize)
+		}
+	}
+}
+
+// AddBatch is the one entry point that runs the caller's MarshalFunc under the queue
+// mutex, so a panicking codec unwinds THROUGH the staging loop, past every publish
+// and discard site. Left staged, that tail is a span no leader will ever settle —
+// and on the deferred policies there is no leader at all — so every later quiesce,
+// Close included, blocks forever on a store the caller can still Add to.
+func TestAddBatchPanicDoesNotStrandStagedBytes(t *testing.T) {
+	for _, opts := range []Options{
+		{NoSync: true, SegmentSize: 1 << 20, MaxSegments: -1},
+		{SyncEvery: 8, SegmentSize: 1 << 20, MaxSegments: -1},
+		{SegmentSize: 1 << 20, MaxSegments: -1}, // per-op
+	} {
+		m := func(dst []byte, v uint64) ([]byte, error) {
+			if v == 3 {
+				panic("codec exploded")
+			}
+			return binary.LittleEndian.AppendUint64(dst, v), nil
+		}
+		w, err := New[uint64](t.TempDir(), m, unmarshalU64, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("%+v: the codec panic did not reach the caller", opts)
+				}
+			}()
+			_, _ = w.AddBatch([]uint64{0, 1, 2, 3, 4})
+		}()
+		if st := w.st; st.pendingBytes != 0 || st.inFlight != 0 {
+			t.Errorf("%+v: staged tail stranded after the panic: pendingBytes=%d inFlight=%d",
+				opts, st.pendingBytes, st.inFlight)
+		}
+		// The store must still be usable and, above all, closable.
+		if err := w.Add(99); err != nil {
+			t.Errorf("%+v: Add after the panic: %v", opts, err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- w.Close() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("%+v: Close after the panic: %v", opts, err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatalf("%+v: DEADLOCK — Close never returned after a codec panic left a "+
+				"staged tail; the directory flock is held forever", opts)
+		}
 	}
 }

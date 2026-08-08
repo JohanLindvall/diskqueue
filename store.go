@@ -587,9 +587,13 @@ type flushGroup struct {
 // span plus the pending tail behind it.
 func (s *store) stagedBytes() int64 { return s.inFlight + s.pendingBytes }
 
-// perOp reports the default durability policy: fsync per operation. The staged
-// span machinery exists only for this policy — the deferred policies already
-// amortize their fsyncs and use the plain append path.
+// perOp reports the default durability policy: fsync per operation.
+//
+// It selects the FSYNCS, not the staging: AddBatch stages spans on every policy
+// (one header write per segment crossed is worth having under NoSync and SyncEvery
+// too), and publishBatchLocked consults this only to decide whether the span needs
+// its data and header fsyncs. The per-record group-commit path is still per-op
+// only; the deferred policies route a single Add through the plain append.
 func (s *store) perOp() bool { return !s.noSync && !s.batched() }
 
 // admitRecord applies the byte cap to a record of framed length recLen,
@@ -913,10 +917,13 @@ func (s *store) takeHead() ([]byte, int64, bool, error) {
 		// consumer has acknowledged. Those cases heal on their own, because the
 		// eventual Commit walks across this record like any other — its framing is
 		// intact, only the payload failed its checksum.
-		if head == s.commitOff {
-			if err := s.commitTo(next); err != nil {
-				return nil, 0, false, errors.Join(cerr, err)
-			}
+		if head == s.commitOff && s.ioErr == nil {
+			// Unflushed (see commitDurable) and deliberately unreported: the record
+			// is already booked lost and the cursor has already moved, so ErrCorrupt
+			// alone is the whole truth the caller needs. Joining a write failure on
+			// here would turn one damaged record into a second, unrelated error on a
+			// path whose contract is "damage was dropped, go round again".
+			_ = s.commitDurable(next, false)
 		}
 		return nil, 0, false, cerr
 	}
@@ -1138,7 +1145,18 @@ func (s *store) skipCorruptSegment(off int64) error {
 // stands: the cursor only ever moves forward over records that were really there,
 // and a commit that never reached disk simply replays after a reopen
 // (at-least-once), which is the contract anyway.
-func (s *store) commitTo(off int64) error {
+func (s *store) commitTo(off int64) error { return s.commitDurable(off, true) }
+
+// commitDurable is commitTo with the DURABILITY bookkeeping made optional: with
+// durable false it neither flushes per the sync policy nor spends a SyncEvery tick,
+// so the commit reaches the page cache and no further. Only the corruption retire in
+// takeHead passes false, and it does so for two reasons: an fdatasync per damaged record, under the queue mutex,
+// would stall every producer behind a run of corruption on what is otherwise a pure
+// read; and a failing fsync there would latch ioErr, letting a READ poison a store
+// that reads are documented to keep draining. The header still reaches the page
+// cache, and reclamation is already best-effort — an unflushed commit simply
+// replays, which is the at-least-once contract.
+func (s *store) commitDurable(off int64, durable bool) error {
 	if s.ioErr != nil {
 		return s.ioErr
 	}
@@ -1151,7 +1169,7 @@ func (s *store) commitTo(off int64) error {
 	// Per-op policy flushes each file's header once, not once per record: commits
 	// cross files in order, so flush a file when the commit leaves it, and the
 	// last at the end. A crash before the flush replays the batch (at-least-once).
-	perOp := s.perOp()
+	perOp := durable && s.perOp()
 	var cur *dataFile // file with header changes not yet written out
 	var stop error
 	advanced := false
@@ -1238,7 +1256,7 @@ func (s *store) commitTo(off int64) error {
 	if !advanced {
 		return stop // nothing committed
 	}
-	if s.batched() {
+	if durable && s.batched() {
 		if err := s.recordOp(); err != nil && stop == nil {
 			stop = err
 		}
