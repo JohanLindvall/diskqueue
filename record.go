@@ -58,7 +58,16 @@ func growKeeping(b []byte, n, keep int) []byte {
 // writeBuf and writes it at data offset off with a single WriteAt.
 func (s *store) writeRecord(df *dataFile, off int64, payload []byte) error {
 	L := len(payload)
-	total := int(framedLen(L)) // the one definition of what a record costs
+	framed := framedLen(L)
+	// Belt and braces. admitRecord refuses this before any segment is reserved, which
+	// is where the refusal belongs — here it would already have cost a fallocate of
+	// the record's own size. Kept because narrowing a wrapped value panics in growBuf,
+	// and a panic is the one outcome this package must never produce.
+	if framedTooLarge(framed, maxFramedLen) {
+		return fmt.Errorf("%w: framed length %d exceeds this platform's addressable range",
+			ErrRecordTooLarge, framed)
+	}
+	total := int(framed) // the one definition of what a record costs
 	s.writeBuf = growBuf(s.writeBuf, total)
 	n := binary.PutUvarint(s.writeBuf, uint64(L))
 	copy(s.writeBuf[n:], payload)
@@ -95,10 +104,11 @@ func isShortRead(err error) bool {
 // Records are immutable once published: append only ever writes past the write
 // cursor, and the header that publishes those bytes is written afterwards. So a
 // block, which never extends past the published size it was read at, stays valid
-// for as long as its segment does. That is what makes serving later records out
-// of it sound, and it is why the only invalidation needed is "this segment's
-// published extent could have shrunk, or its file could be gone" — dropCommitted
-// and the quarantine.
+// for as long as its segment does. That is what makes serving later records out of
+// it sound, and it is why the only invalidation needed is "this segment's published
+// extent could shrink, or its file could go away" — see dropBlock for the sites
+// that qualify. The quarantine is NOT one of them: it moves cursors past a segment
+// without changing a byte in it.
 
 // blockHas reports whether the cached block holds n bytes at df's dataOff.
 func (s *store) blockHas(df *dataFile, dataOff int64, n int) bool {
@@ -312,6 +322,16 @@ func fitsWithin(v uint64, n int, avail int64, maxInt uint64) bool {
 // length prefix, the payload, and the checksum trailer. Every admission check,
 // cycle decision and staged-span tally has to agree with what writeRecord actually
 // lays down, so the arithmetic is spelled once.
+// maxFramedLen is the largest framed record this platform can index. A frame past
+// it cannot be sliced, so it has to be refused rather than narrowed.
+const maxFramedLen = int64(^uint(0) >> 1)
+
+// framedTooLarge reports whether a framed length is unusable on a platform whose int
+// holds maxInt. Parameterized for the reason fitsWithin is: on a 64-bit build the
+// real bound is unreachable (it needs a payload within a few bytes of maxint64), so
+// a test could not otherwise pin the 32-bit behaviour at all.
+func framedTooLarge(framed, maxInt int64) bool { return framed > maxInt }
+
 func framedLen(L int) int64 {
 	// Widen before summing, not after: on a 32-bit build the int sum can wrap for a
 	// payload near maxInt, and every admission and cycle decision is made from this.

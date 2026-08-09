@@ -359,7 +359,11 @@ mirrors its own `written`/`committed` counts into its header.
   cursor stood exactly there; with records reserved behind it the cursor may not jump,
   because that would retire work no consumer has acknowledged. Those cases heal on their own,
   since the eventual `Commit` walks across the record like any other — its framing is intact,
-  only the payload failed.
+  only the payload failed. The residue is a Reserve/Commit consumer that never acknowledges
+  past the damage: its outstanding records keep `Count()` above zero with `Empty()` true,
+  exactly as any unacknowledged reserve does. The store holds no per-record reservation
+  state, so it cannot tell that apart from work still in flight, and guessing would retire
+  live records.
 - **A segment counts as lost only if something in it was.** `skipCorruptSegment`
   books `lostSegments` inside the `lost := end - s.headOff; lost > 0` guard, not
   beside it. Reached from the commit path the read cursor is often already past the
@@ -459,9 +463,12 @@ mirrors its own `written`/`committed` counts into its header.
   The per-op path is guarded by `BenchmarkAddBatch` and `BenchmarkAddParallel`, also
   0 allocs/op; measured directly, a solo per-op Add+Take is 0 allocs/op, a per-op
   `AddBatch` is 0, and 8 concurrent producers cost ~0.27 allocs/op — the one
-  `flushGroup` and channel per flush window, which is the design. A *benchmark* cannot
-  fail, though: `TestAddTakeZeroAlloc` is the only assertion and it covers the NoSync
-  path, so the per-op figures above are measurements, not gates. Followers wait on their group's `done` channel and take the
+  `flushGroup` and channel per flush window, which is the design. Know what is
+  actually enforced: `TestAddTakeZeroAlloc` is the only assertion and it covers the
+  NoSync path, and CI's bench gate matches exactly `BenchmarkAddTake`,
+  `AddTakeCommit`, `Read` and `BatchCommit`. `AddBatch` and `AddParallel` are
+  deliberately outside it — their allocation rate is sub-integer, so `allocs/op`
+  truncates to 0 and would gate nothing; `B/op` is the signal there, by hand. Followers wait on their group's `done` channel and take the
   span's verdict; the leader drains spans until nothing is pending, then
   clears `flushing` and wakes the quiesce waiters. After ANY wait that
   released the lock (quiesce, space, follower), re-check `closed` — staging
@@ -488,7 +495,10 @@ mirrors its own `written`/`committed` counts into its header.
   measured (30 Syncs failed to complete in 25s) before the current shape. Both fields are
   zero/nil when nobody quiesces, so the uncontended Add path is one int compare; a
   pathological tight `Sync` loop can hold `quiesceWant` above zero and invert the fairness,
-  which is the deliberate trade.
+  which is the deliberate trade. The producer side is real and belongs in the
+  ledger beside the quiescer wins: an Add now waits behind any concurrent
+  Sync/AddBatch/Requeue/Close, and `AddWait`'s ctx does not cover that wait. Both
+  godocs say so.
 - **Marshal runs outside the lock for Add/AddWait** (pooled `marshalBuf`, so
   codecs run concurrently across producers and a slow codec cannot stall
   consumers); `AddBatch` marshals under the lock through `w.scratch`. Both

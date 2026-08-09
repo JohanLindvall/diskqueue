@@ -1182,3 +1182,188 @@ func TestAddBatchPanicDoesNotStrandStagedBytes(t *testing.T) {
 		}
 	}
 }
+
+// The defect AddBatch's unification fixed was a COST, not a behaviour: the deferred
+// policies ran the plain append loop and paid a 64-byte header write per record. No
+// assertion on records, order, counts or ticks can catch a revert of that, because
+// the old loop produces all of them identically. Count the header writes.
+//
+// The model, which the first version of this test got wrong by choosing the one
+// configuration where both complications vanish: one header write per PUBLISHED SPAN,
+// and a span ends at a segment boundary, at a SyncEvery tick, or at the end of the
+// batch — with a crossing costing a second write for the new segment's own header.
+func TestAddBatchWritesOneHeaderPerSpan(t *testing.T) {
+	build := func(n int) []uint64 {
+		items := make([]uint64, n)
+		for i := range items {
+			items[i] = uint64(i)
+		}
+		return items
+	}
+	measure := func(t *testing.T, opts Options, n int) (writes uint64, crossings int) {
+		t.Helper()
+		w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = w.Close() }()
+		before, filesBefore := w.st.nHeaderWrites, len(w.st.files)
+		if got, aerr := w.AddBatch(build(n)); got != n || aerr != nil {
+			t.Fatalf("%+v: AddBatch n=%d err=%v", opts, got, aerr)
+		}
+		return w.st.nHeaderWrites - before, len(w.st.files) - filesBefore
+	}
+
+	// One span: no crossing, no tick. This is the case that proves the amortization —
+	// the per-record loop would write 200 headers here.
+	t.Run("one span", func(t *testing.T) {
+		for _, opts := range []Options{
+			{NoSync: true, SegmentSize: 1 << 20, MaxSegments: -1},
+			{SyncEvery: 1000, SegmentSize: 1 << 20, MaxSegments: -1},
+			{SegmentSize: 1 << 20, MaxSegments: -1},
+		} {
+			writes, crossings := measure(t, opts, 200)
+			if crossings != 0 {
+				t.Fatalf("%+v: %d crossings; the case is not the one being measured", opts, crossings)
+			}
+			if writes != 1 {
+				t.Errorf("%+v: %d header writes for 200 records in one span, want 1", opts, writes)
+			}
+		}
+	})
+
+	// Segment crossings: one publish per span plus one createFile header per new file.
+	t.Run("crossings", func(t *testing.T) {
+		opts := Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1}
+		writes, crossings := measure(t, opts, 1000)
+		if crossings == 0 {
+			t.Fatal("no segment was crossed; the case is not the one being measured")
+		}
+		want := uint64(2*crossings + 1) // (crossings+1) publishes + crossings fresh headers
+		t.Logf("%d header writes for 1000 records across %d crossings", writes, crossings)
+		if writes != want {
+			t.Errorf("%d header writes for %d crossings, want %d", writes, crossings, want)
+		}
+	})
+
+	// SyncEvery ticks inside one segment: one publish per tick, so the power-loss
+	// window stays bounded by N rather than by the batch length.
+	t.Run("sync ticks", func(t *testing.T) {
+		const every, n = 50, 200
+		opts := Options{SyncEvery: every, SegmentSize: 1 << 20, MaxSegments: -1}
+		writes, crossings := measure(t, opts, n)
+		if crossings != 0 {
+			t.Fatalf("%d crossings; the case is not the one being measured", crossings)
+		}
+		if want := uint64(n / every); writes != want {
+			t.Errorf("%d header writes for %d records at SyncEvery=%d, want %d",
+				writes, n, every, want)
+		}
+	})
+}
+
+// The word-size refusal.
+//
+// Read the coverage honestly: framedTooLarge's table below runs everywhere, but the
+// admitRecord half only executes on a 32-bit build, because on 64-bit maxFramedLen+1
+// is not expressible in an int64 at all. Reverting the hoist out of admitRecord
+// therefore passes on amd64 and FAILS on the test32 CI leg — which is the whole
+// reason that leg exists. Do not conclude from a green amd64 run that this is covered.
+func TestFramedLengthBeyondTheWordSizeIsRefused(t *testing.T) {
+	const maxInt32 = int64(1)<<31 - 1
+	for _, tc := range []struct {
+		framed int64
+		maxInt int64
+		want   bool
+	}{
+		{17, maxInt32, false},
+		{maxInt32 - 1, maxInt32, false},
+		{maxInt32, maxInt32, false},
+		{maxInt32 + 1, maxInt32, true},
+		{1 << 40, maxInt32, true},
+		{1 << 40, maxFramedLen, maxFramedLen < 1<<40},
+	} {
+		if got := framedTooLarge(tc.framed, tc.maxInt); got != tc.want {
+			t.Errorf("framedTooLarge(%d, %d)=%v, want %v", tc.framed, tc.maxInt, got, tc.want)
+		}
+	}
+	// And the refusal must happen before any segment is reserved: admitRecord, not
+	// writeRecord, which sits downstream of the cycle that would fallocate a segment
+	// sized to the record it is about to refuse.
+	w, err := New[uint64](t.TempDir(), marshalU64, unmarshalU64,
+		Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	before := w.Stats().DiskBytes
+	// A frame at the limit is legal and must not reserve anything by itself.
+	if err := w.st.admitRecord(maxFramedLen, false); err != nil {
+		t.Errorf("a frame exactly at the limit was refused: %v", err)
+	}
+	// Past the limit is refused — and force must NOT exempt it, because this is a
+	// platform limit rather than an admission policy. Only expressible where
+	// maxFramedLen is the 32-bit bound; on 64-bit int64 cannot hold maxFramedLen+1,
+	// which is the same reason the guard needs framedTooLarge to be testable at all.
+	// lim is a variable, not the constant: on 64-bit `maxFramedLen+1` is a constant
+	// expression that does not compile at all, so the runtime guard alone cannot save it.
+	lim := maxFramedLen
+	if lim < 1<<40 {
+		for _, force := range []bool{false, true} {
+			if err := w.st.admitRecord(lim+1, force); !errors.Is(err, ErrRecordTooLarge) {
+				t.Errorf("admitRecord(force=%v) = %v, want ErrRecordTooLarge", force, err)
+			}
+		}
+	}
+	if got := w.Stats().DiskBytes; got != before {
+		t.Errorf("DiskBytes moved from %d to %d during admission: the refusal sits "+
+			"downstream of the segment reservation", before, got)
+	}
+}
+
+// A record retired by the corruption quarantine is counted in Committed without ever
+// having been Delivered, so the "compare Delivered against Committed" guidance has a
+// documented exception. Pin it, because the two godocs now promise it.
+func TestQuarantineRetireCountsCommittedNotDelivered(t *testing.T) {
+	dir := t.TempDir()
+	opts := Options{NoSync: true, SegmentSize: 4096, MaxSegments: -1}
+	w, err := New[uint64](dir, marshalU64, unmarshalU64, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Add(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "data.00000001"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0xDE}, headerSize+1); err != nil { // the payload
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w2.Close() }()
+	if _, _, rerr := w2.NewReader().TryTake(); !errors.Is(rerr, ErrCorrupt) {
+		t.Fatalf("TryTake: %v, want ErrCorrupt", rerr)
+	}
+	s := w2.Stats()
+	t.Logf("Delivered=%d Committed=%d LostRecords=%d Backlog=%d",
+		s.Delivered, s.Committed, s.LostRecords, s.Backlog)
+	if s.Delivered != 0 {
+		t.Errorf("Delivered=%d: the damaged record reached no consumer", s.Delivered)
+	}
+	if s.Committed == 0 {
+		t.Errorf("Committed=0: the damaged record was never retired, so it pins the backlog")
+	}
+	if s.Backlog != 0 {
+		t.Errorf("Backlog=%d after the only record was reported lost", s.Backlog)
+	}
+}

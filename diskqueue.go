@@ -40,10 +40,13 @@ var (
 	// ErrInvalidOffset is returned by Commit for an offset beyond the last record.
 	ErrInvalidOffset = errors.New("diskqueue: invalid offset")
 	// ErrRecordTooLarge is returned by Add for a record that can NEVER be
-	// admitted: one whose framed length exceeds Options.MaxBytes, which no amount
-	// of draining changes. It is the permanent refusal, where ErrFull is the
-	// transient one. A record merely larger than SegmentSize is not an error —
-	// it is stored in a segment sized to itself.
+	// admitted, whatever the queue does next. Two things earn it: a framed length
+	// beyond Options.MaxBytes, which no amount of draining changes; and — only on a
+	// 32-bit build, and only for a payload near the addressable maximum — a framed
+	// length this platform cannot index, which would otherwise wrap negative and
+	// panic. It is the permanent refusal, where ErrFull is the transient one. A
+	// record merely larger than SegmentSize is not an error — it is stored in a
+	// segment sized to itself.
 	ErrRecordTooLarge = errors.New("diskqueue: record too large")
 	// ErrCorrupt is returned by a read whose data failed its integrity check: a
 	// record whose stored xxhash64 does not match, a length that overruns its
@@ -200,7 +203,11 @@ type Stats struct {
 	// un-counts the delivery with it, so a permanently-failing UnmarshalFunc does
 	// not inflate this. Compare against Committed to see work taken and not retired.
 	Delivered uint64
-	Committed uint64 // records retired by a commit
+	// Committed counts records retired by a commit. A record retired by the
+	// corruption quarantine is included even though it reached no consumer, so
+	// Committed can exceed Delivered on a damaged queue; those records are in the
+	// Lost* fields too.
+	Committed uint64
 	Full      uint64 // Adds refused with ErrFull
 	// Committed can exceed Delivered: a record dropped for a bad checksum is retired
 	// without ever being handed out, and a quarantined segment retires its whole tail.
@@ -407,6 +414,11 @@ func (w *Queue[T]) putBuf(mb *marshalBuf) {
 // through Count and Stats. Treat an ErrIO as at-least-once ambiguous rather than
 // as a confirmed placement.
 //
+// It can block. Besides waiting for its own flush, an Add yields to any concurrent
+// Sync, AddBatch, Requeue or Close that is quiescing the store — without that, a
+// steady producer stream starves those operations for seconds. The wait is bounded
+// by the flush being quiesced, not by the caller.
+//
 // Serialization happens before the lock, and under the default per-op policy
 // the two fsyncs are SHARED: concurrent Adds that arrive while a flush is in
 // progress ride the next one (group commit), so per-record durability scales
@@ -433,6 +445,11 @@ func (w *Queue[T]) Add(data T) error {
 //
 // Each refused attempt still counts in Stats().Full, so that counter reads as
 // "attempts refused" rather than "items dropped" when producers wait.
+//
+// ctx bounds the ErrFull wait, not the whole call: like Add, this yields to a
+// concurrent quiesce and waits on its own flush, and neither of those consults ctx.
+// A deadline can therefore be overshot by the length of a flush. It is a delay, not
+// a hang — every such wait is released by an operation already in flight.
 func (w *Queue[T]) AddWait(ctx context.Context, data T) error {
 	mb, payload, err := w.marshalValue(data)
 	if err != nil {
@@ -463,7 +480,13 @@ func (w *Queue[T]) AddWait(ctx context.Context, data T) error {
 //
 // It returns how many leading items are in the queue. n < len(items) comes
 // with the error that stopped the batch (ErrFull, a marshal error, an I/O
-// failure); the first n items are placed and durable regardless. A power loss
+// failure); the first n items are placed and durable regardless.
+//
+// Unlike Add and AddWait, which marshal BEFORE taking the lock, AddBatch calls
+// MarshalFunc with the queue mutex held. A codec that panics there is therefore a
+// store-state hazard as well as a caller-visible one; the panic is passed through
+// unchanged, with the staged-but-unpublished tail discarded first so the queue stays
+// usable and closable. A power loss
 // during AddBatch truncates it cleanly to a published prefix — never a torn
 // record, never a phantom.
 func (w *Queue[T]) AddBatch(items []T) (int, error) {

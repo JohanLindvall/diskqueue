@@ -63,6 +63,30 @@ jobs:
       - name: Test (fault-injection build)
         run: go test -race -tags diskqueue_faults ./...
 
+  # The 32-bit leg. It runs on the amd64 runner under GOARCH=386, and it is not
+  # redundant with `cross`: cross only COMPILES every GOOS/GOARCH, so the arithmetic
+  # that differs by word size is never executed anywhere else. fitsInRecord's bound
+  # exists precisely for the case where avail exceeds maxInt, which cannot happen on
+  # a 64-bit int — a corrupt length prefix once panicked here with every CI job
+  # green. No -race: the detector needs cgo, which is off for the cross-compile.
+  test32:
+    name: test (386)
+    runs-on: ubuntu-latest
+    env:
+      GOARCH: '386'
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - name: Vet (386)
+        run: go vet ./...
+      - name: Test (386)
+        run: go test ./...
+      - name: Test (386, fault-injection build)
+        run: go test -tags diskqueue_faults ./...
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -139,6 +163,12 @@ jobs:
       - name: Hot paths must stay at 0 allocs/op
         run: |
           set -uo pipefail
+          # These four are the NoSync/read paths. The per-op staged path
+          # (BenchmarkAddBatch, BenchmarkAddParallel) is deliberately not gated
+          # here: its allocation rate is sub-integer — one flushGroup and channel
+          # per flush window, amortized over the producers that joined it — so
+          # allocs/op truncates to 0 and would gate nothing. Watch B/op there by
+          # hand instead.
           bench='BenchmarkAddTake$|BenchmarkAddTakeCommit$|BenchmarkRead$|BenchmarkBatchCommit$'
           out=$(go test -run='^$' -bench="$bench" -benchtime=1s -benchmem ./...) || { echo "$out"; exit 1; }
           echo "$out"
@@ -161,7 +191,7 @@ jobs:
   # version convention). Patch only: a major bump would require a /vN module path,
   # and minor releases are deliberate, so make those by pushing the tag by hand.
   tag:
-    needs: [test, lint, fuzz, cross, bench]
+    needs: [test, test32, lint, fuzz, cross, bench]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

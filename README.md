@@ -47,8 +47,8 @@ nothing prevents two processes from opening the same directory. Each file
 begins with a 64-byte header — a magic number, a format version, the commit
 cursor (persisted read position), write cursor (data end), written and committed
 record counts, the segment's own capacity, the `SegmentSize` the store was created
-with (a mismatch against these is what decides geometry and truncation — the file's
-length is measured against them rather than being evidence on its own), and an
+with (these two are the authority on geometry; the file's length is evidence
+measured against them rather than evidence on its own), and an
 `xxhash64` over the header itself — followed by records,
 each `uvarint(len) || payload || xxhash64(payload)` (an 8-byte little-endian
 checksum trailer). Because the cursors and counts all live in the header,

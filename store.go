@@ -131,6 +131,20 @@ type store struct {
 	foreignBytes    uint64
 	discardedBytes  uint64
 
+	// nHeaderWrites counts writeHeader calls. It exists so a test can assert the
+	// AMORTIZATION rather than only the observable contract: a per-record append loop
+	// produces the same records, the same order and the same counts as a staged batch,
+	// so nothing else distinguishes them.
+	//
+	// The model it measures, stated exactly, because the obvious guess is wrong: one
+	// header write per PUBLISHED SPAN, and a span ends at a segment boundary, at a
+	// SyncEvery tick, or at the end of the batch. A segment crossing therefore costs
+	// TWO — the publish that closes the outgoing file, plus createFile's own fresh
+	// header for the new one. A 1000-record NoSync batch across five 4 KiB segments
+	// costs 9, not 5; a 200-record batch at SyncEvery=50 in one segment costs 4, not 1.
+	// Not exported — an operator has no use for it.
+	nHeaderWrites uint64
+
 	nAdded     uint64 // records accepted by append
 	nDelivered uint64 // records handed out by takeHead
 	nFull      uint64 // appends refused with ErrFull
@@ -416,6 +430,7 @@ func (s *store) writeHeader(df *dataFile) error {
 	if _, err := df.f.WriteAt(df.hdr, 0); err != nil {
 		return err
 	}
+	s.nHeaderWrites++
 	df.dirty = true
 	return nil
 }
@@ -589,17 +604,30 @@ func (s *store) stagedBytes() int64 { return s.inFlight + s.pendingBytes }
 
 // perOp reports the default durability policy: fsync per operation.
 //
-// It selects the FSYNCS, not the staging: AddBatch stages spans on every policy
-// (one header write per segment crossed is worth having under NoSync and SyncEvery
-// too), and publishBatchLocked consults this only to decide whether the span needs
-// its data and header fsyncs. The per-record group-commit path is still per-op
-// only; the deferred policies route a single Add through the plain append.
+// It selects the FSYNCS, not the staging. The staged span machinery serves single
+// Add/AddWait under this policy and AddBatch under ALL of them — one header write
+// per segment crossed is worth having under NoSync and SyncEvery too — and
+// publishBatchLocked consults this only to decide whether the span needs its data
+// and header fsyncs. The plain append path is reached by a single Add/AddWait on a
+// deferred policy — and by Reader.Requeue on EVERY policy, including this one, since
+// its rotation must be synchronous under one continuous lock hold. That second caller
+// is why append's per-op fsync arms are live code on the default policy even though
+// no Add reaches them.
 func (s *store) perOp() bool { return !s.noSync && !s.batched() }
 
 // admitRecord applies the byte cap to a record of framed length recLen,
 // counting the staged backlog: staged records occupy real disk and memory, so
 // backpressure must see them even though readers cannot yet.
 func (s *store) admitRecord(recLen int64, force bool) error {
+	// A frame this platform cannot index is refused FIRST, before the cycle that would
+	// otherwise reserve a segment sized to it: the check used to live in writeRecord,
+	// downstream of createFile, so a refused record still left ~2 GiB fallocate'd as
+	// the active segment. Not exempted by force — this is a platform limit, not an
+	// admission policy, and no rotation can make an unindexable frame usable.
+	if framedTooLarge(recLen, maxFramedLen) {
+		return fmt.Errorf("%w: framed length %d exceeds this platform's addressable range",
+			ErrRecordTooLarge, recLen)
+	}
 	if !force && s.maxBytes > 0 {
 		if recLen > s.maxBytes {
 			return ErrRecordTooLarge
@@ -914,9 +942,18 @@ func (s *store) takeHead() ([]byte, int64, bool, error) {
 		//
 		// Only when the commit cursor stood exactly here, though. With records
 		// reserved behind it the cursor may not jump: that would retire work no
-		// consumer has acknowledged. Those cases heal on their own, because the
-		// eventual Commit walks across this record like any other — its framing is
-		// intact, only the payload failed its checksum.
+		// consumer has acknowledged. Those cases normally heal on their own, because
+		// the eventual Commit walks across this record like any other — its framing
+		// is intact, only the payload failed its checksum.
+		//
+		// The residue, stated so nobody rediscovers it as a bug: a Reserve/Commit
+		// consumer that NEVER acknowledges past the damage leaves Count() at the
+		// number of records it is still holding, with Empty() true, and pins their
+		// segment for the session. That is the same thing an unacknowledged reserve
+		// does to any record, damaged or not — the store keeps no per-record
+		// reservation state, so it cannot tell "handed out and outstanding" from
+		// "handed out and dropped", and guessing would retire live work. Rewind or a
+		// Commit past the damage clears it.
 		if head == s.commitOff && s.ioErr == nil {
 			// Unflushed (see commitDurable) and deliberately unreported: the record
 			// is already booked lost and the cursor has already moved, so ErrCorrupt
