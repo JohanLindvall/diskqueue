@@ -77,6 +77,16 @@ any Reader returns the same item. A damaged head previews as [ErrCorrupt] with
 nothing dropped and nothing counted; the consume op that eventually steps past
 the damage books it exactly once.
 
+A consumer that wants to know how long each item waited does not need to wrap
+every record in a timestamp envelope of its own: [Options].StampRecords stamps
+the enqueue time into each record's payload as it is serialized, and the Reader
+strips it back off and reports the wait as [Reader.LastAge] — surviving reopens
+(the stamp is payload, as durable as the record) and accumulating across a
+[Reader.Requeue] rotation. The stamp is inside the framed size every byte
+accounting reports, and reopening a store with a different StampRecords than it
+was written with is a caller error, exactly as swapping the codec would be; see
+the option's documentation for what that mistake produces.
+
 # Durability
 
 Every [Queue.Add] writes the record and then, separately, the header that
@@ -189,6 +199,14 @@ the backlog in bytes, which is the budget operators actually reason about; the t
 compose, and whichever binds first returns [ErrFull]. Watch
 [Stats].BacklogBytes against [Stats].MaxBytes — "70% and climbing" is a signal, a
 bare byte count is not.
+
+Under a MaxBytes budget the disk footprint is bounded too: segments are
+preallocated whole and reclaimed whole, so on a healthy queue [Stats].DiskBytes
+never exceeds MaxBytes + 2×SegmentSize + one 64-byte header per segment — up to
+one segment of committed-but-not-yet-reclaimable records plus up to one segment
+of preallocated slack in the active file. Size the volume to that bound rather
+than to MaxBytes alone. Reopening is never a sizing concern: recovery reads one
+header per segment and no records, sub-millisecond even for a deep backlog.
 
 Records never span segments, but that does not make [Options].SegmentSize a
 ceiling on record size: a record too large for the geometry gets a segment sized

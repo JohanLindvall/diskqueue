@@ -2,6 +2,7 @@ package diskqueue
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"sync"
@@ -156,6 +157,31 @@ type Options struct {
 	// idle queue's last writes become durable within the interval instead of
 	// waiting for SyncEvery more operations. Ignored when NoSync is set.
 	SyncInterval time.Duration
+
+	// StampRecords, when set, prepends an 8-byte big-endian unix-nano timestamp
+	// to every record's payload as it is serialized — INSIDE the record, so it is
+	// covered by the record checksum and counted in the framed size that
+	// AddSized, Reader.LastBytes, MaxBytes and the byte gauges all agree on. The
+	// Reader strips it back off before the payload reaches UnmarshalFunc and
+	// exposes it as Reader.LastAge, so a consumer can report how long each item
+	// waited without wrapping every record in a timestamp envelope of its own.
+	//
+	// It changes what the records CONTAIN, not the on-disk format — the stamp
+	// lives inside the codec's bytes, exactly where such an envelope would.
+	// Consistency across reopens is therefore the caller's contract, exactly as
+	// it already is for the codec itself: reopen a store with the same
+	// StampRecords it was written with. Flipping it over an existing backlog is
+	// a caller error — the reader would strip eight payload bytes, or hand the
+	// codec eight bytes of timestamp — and what it produces is codec-level
+	// garbage, surfaced as ErrCodec (a stamped record shorter than its stamp
+	// included; never a panic), with Reader.Skip the way past each record.
+	//
+	// Reader.Requeue preserves the original stamp: it moves the record's raw
+	// payload, stamp and all, so a rotated record keeps its enqueue time and its
+	// age keeps accumulating across rotations rather than resetting — the age
+	// answers "how long has this item been waiting", not "how long since its
+	// last rotation".
+	StampRecords bool
 }
 
 // Stats is a snapshot of a Queue's gauges and lifetime counters, for
@@ -246,6 +272,12 @@ type Queue[T any] struct {
 	marshal   MarshalFunc[T]
 	unmarshal UnmarshalFunc[T]
 
+	// stamp mirrors Options.StampRecords: every record is serialized with an
+	// 8-byte big-endian unix-nano prefix (stampInto) that the Reader strips
+	// back off (Reader.read, TryPeek). Immutable after New, like the codec it
+	// sits inside, so both sides read it without the lock.
+	stamp bool
+
 	mu     sync.Mutex
 	st     *store
 	closed bool
@@ -323,7 +355,7 @@ func New[T any](path string, marshal MarshalFunc[T], unmarshal UnmarshalFunc[T],
 	// Add will accept, not how the store is laid out, so recovery never consults it
 	// and a store written under one cap reopens cleanly under another.
 	st.maxBytes = max(opt.MaxBytes, 0)
-	w := &Queue[T]{marshal: marshal, unmarshal: unmarshal, st: st}
+	w := &Queue[T]{marshal: marshal, unmarshal: unmarshal, stamp: opt.StampRecords, st: st}
 	if opt.SyncInterval > 0 && !opt.NoSync {
 		w.syncStop = make(chan struct{})
 		w.syncDone = make(chan struct{})
@@ -391,7 +423,7 @@ func (w *Queue[T]) marshalValue(data T) (*marshalBuf, []byte, error) {
 	if mb == nil {
 		mb = new(marshalBuf)
 	}
-	b, err := w.marshal(mb.b[:0], data)
+	b, err := w.marshal(w.stampInto(mb.b[:0]), data)
 	if b != nil {
 		mb.b = b // retain grown capacity for reuse, even from a failed marshal
 	}
@@ -400,6 +432,37 @@ func (w *Queue[T]) marshalValue(data T) (*marshalBuf, []byte, error) {
 		return nil, nil, err
 	}
 	return mb, b, nil
+}
+
+// stampLen is the record-time stamp Options.StampRecords lays down: 8 bytes of
+// big-endian unix nanoseconds, prepended inside the payload.
+const stampLen = 8
+
+// errShortStamp is the cause behind the ErrCodec a stamped record shorter than
+// its stamp produces — the residue of flipping StampRecords over an existing
+// backlog, which Options.StampRecords documents as a caller error.
+var errShortStamp = errors.New("diskqueue: stamped record shorter than its timestamp")
+
+// stampInto seeds dst with the record's timestamp when stamping is on; the
+// codec then appends behind it, so the stamp costs no copy and no allocation.
+// It runs where the codec runs — before the lock for Add/AddWait, under it for
+// AddBatch — so the stamp is the record's serialization time: an AddWait that
+// then parks on ErrFull ages from when the producer showed up, which is what a
+// queue-wait gauge should measure.
+func (w *Queue[T]) stampInto(dst []byte) []byte {
+	if !w.stamp {
+		return dst
+	}
+	return binary.BigEndian.AppendUint64(dst, uint64(time.Now().UnixNano()))
+}
+
+// stampAge is the read side of stampInto: the age of the stamp opening b,
+// clamped at 0 — the stamp is wall time (it has to survive a reopen, so no
+// monotonic reading can travel with it), and a clock that stepped backwards
+// between write and read must not report a negative wait. The caller has
+// checked len(b) >= stampLen.
+func stampAge(b []byte) time.Duration {
+	return max(time.Since(time.Unix(0, int64(binary.BigEndian.Uint64(b)))), 0)
 }
 
 // putBuf returns a marshal buffer to the pool, applying the package-wide
@@ -451,10 +514,12 @@ func (w *Queue[T]) Add(data T) error {
 }
 
 // AddSized is Add, also reporting the framed size the record occupies on disk —
-// length prefix, payload and checksum trailer. That is the unit MaxBytes and
-// the Stats byte gauges count, so a producer metering its own throughput agrees
-// with the store's accounting (Reader.LastBytes is the consuming side of the
-// same number). The size is 0 when the add failed.
+// length prefix, payload and checksum trailer, with the Options.StampRecords
+// stamp (when enabled) inside the payload and therefore inside this number.
+// That is the unit MaxBytes and the Stats byte gauges count, so a producer
+// metering its own throughput agrees with the store's accounting
+// (Reader.LastBytes is the consuming side of the same number). The size is 0
+// when the add failed.
 func (w *Queue[T]) AddSized(data T) (int64, error) {
 	mb, payload, err := w.marshalValue(data)
 	if err != nil {
@@ -576,7 +641,7 @@ func (w *Queue[T]) addBatchLocked(items []T) (int, error) {
 	}
 	published := 0
 	for _, it := range items {
-		b, err := w.marshal(w.scratch[:0], it)
+		b, err := w.marshal(w.stampInto(w.scratch[:0]), it)
 		if b != nil {
 			w.scratch = b
 		}

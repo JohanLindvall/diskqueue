@@ -77,7 +77,13 @@ func (s *store) dropRetired() {
 
 // maxIdleReservations is how large an empty ledger may stay before it is released
 // rather than kept for reuse. Sized so an ordinary consumer's steady-state
-// in-flight set is never reallocated.
+// in-flight set is never reallocated. The corollary is worth knowing before
+// tuning a consumer: one whose in-flight set REGULARLY exceeds this and then
+// fully drains releases the ledger on every drain and re-grows it from nothing
+// on the next cycle — an allocation ramp per cycle, the same deliberate trade
+// every oversized-buffer release in this package makes (see trimOver). Keeping
+// the in-flight set at or under 1024, or acknowledging before it fully drains,
+// keeps the ledger warm.
 const maxIdleReservations = 1024
 
 // findReserved bisects the ledger for the entry ending at end. The slice is

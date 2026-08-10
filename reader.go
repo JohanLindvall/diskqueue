@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"time"
 )
 
 // NewReader returns a Reader that consumes from this Queue; all read operations
@@ -23,9 +24,10 @@ func (w *Queue[T]) NewReader() *Reader[T] {
 // Reader is a consuming view over a Queue; create it with Queue.NewReader.
 type Reader[T any] struct {
 	w         *Queue[T]
-	scratch   []byte // record copy, reused across reads
-	err       error  // why the last Drain/Follow stopped; reported by Err
-	lastBytes int64  // framed size of the last consumed record; see LastBytes
+	scratch   []byte        // record copy, reused across reads
+	err       error         // why the last Drain/Follow stopped; reported by Err
+	lastBytes int64         // framed size of the last consumed record; see LastBytes
+	lastAge   time.Duration // queue age of the last consumed record; see LastAge
 }
 
 // Err reports what went wrong during the most recent Drain or Follow: nil when
@@ -70,7 +72,17 @@ func (r *Reader[T]) TryPeek() (T, bool, error) {
 	// otherwise one huge record the codec rejects pins its buffer for the Reader's
 	// lifetime. Safe after the return value is set: see trimScratch.
 	defer r.trimScratch()
-	v, uerr := r.w.unmarshal(r.scratch)
+	body := r.scratch
+	if r.w.stamp {
+		// The stamp is stripped like everywhere else, but only stripped: a peek
+		// previews, so it sets no LastAge — that is a fact about a consuming
+		// read, exactly as LastBytes is.
+		if len(body) < stampLen {
+			return zero, false, fmt.Errorf("%w: %w", ErrCodec, errShortStamp)
+		}
+		body = body[stampLen:]
+	}
+	v, uerr := r.w.unmarshal(body)
 	if uerr != nil {
 		return zero, false, fmt.Errorf("%w: %w", ErrCodec, uerr)
 	}
@@ -232,13 +244,26 @@ func (r *Reader[T]) Ack(offset int64) error {
 }
 
 // LastBytes reports the framed on-disk size — length prefix, payload and
-// checksum trailer — of the record the most recent successful consuming read on
+// checksum trailer, the Options.StampRecords stamp (when enabled) included in
+// the payload — of the record the most recent successful consuming read on
 // this Reader returned. It is the unit MaxBytes and the Stats byte gauges
 // count, so a caller metering its own throughput agrees with the store's
 // accounting (AddSized is the producing side of the same number). Meaningful
 // only after such a read; a Reader is single-goroutine by contract, so there is
 // no concurrent overwrite to race.
 func (r *Reader[T]) LastBytes() int64 { return r.lastBytes }
+
+// LastAge reports how long the record the most recent successful consuming
+// read on this Reader returned had waited in the queue: time.Since the stamp
+// Options.StampRecords laid down when the record was serialized, measured at
+// the read. It is 0 when StampRecords is off — there is no stamp to age — and
+// clamped at 0 against a wall clock that stepped backwards between the write
+// and the read (the stamp is wall time; it has to survive a reopen, so no
+// monotonic reading can travel with it). A record Requeue rotated keeps its
+// original stamp, so its age keeps accumulating rather than resetting. Like
+// LastBytes, meaningful only after such a read, on a Reader that is
+// single-goroutine by contract.
+func (r *Reader[T]) LastAge() time.Duration { return r.lastAge }
 
 // AckBatch acknowledges several reservations under one lock acquisition, with
 // one ledger drain and at most one commit for the whole batch — the batched
@@ -464,9 +489,25 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 	}()
 	// The framed extent, from the boundary takeHead just established — not from
 	// start, which a quarantine en route may have moved past (see trackReserve).
+	// The stamp counts: it is part of the payload, so LastBytes stays the exact
+	// unit MaxBytes and AddSized report.
 	r.lastBytes = r.w.st.lastFrameEnd - r.w.st.lastFrameAt
 	defer r.trimScratch() // on the codec exit too; see TryPeek
-	v, err := r.w.unmarshal(r.scratch)
+	body := r.scratch
+	if r.w.stamp {
+		if len(body) < stampLen {
+			// A stamped record shorter than its stamp is what flipping
+			// StampRecords over an existing backlog produces: codec-level
+			// garbage, handled exactly like a record the codec rejects — left at
+			// the head (the deferred rewind), reported as ErrCodec, stepped past
+			// with Skip. Never a quarantine (the bytes on disk are undamaged)
+			// and never a panic.
+			return zero, 0, false, fmt.Errorf("%w: %w", ErrCodec, errShortStamp)
+		}
+		r.lastAge = stampAge(body)
+		body = body[stampLen:]
+	}
+	v, err := r.w.unmarshal(body)
 	if err != nil {
 		// Wrap it so a codec error can never impersonate a library sentinel. A
 		// UnmarshalFunc is free to return anything, including something that wraps
@@ -524,6 +565,11 @@ func (r *Reader[T]) trimScratch() {
 // on the SHARED head rather than on a record this Reader is holding, so with
 // several cooperating Readers it moves whatever is at the cursor when it runs —
 // call it from one consumer, or coordinate.
+//
+// Under Options.StampRecords the rotated record keeps its ORIGINAL stamp — the
+// raw payload is moved, stamp inside it — so its LastAge keeps accumulating
+// across rotations rather than resetting: the age answers "how long has this
+// item been waiting", and a rotation is not an answer to that.
 func (r *Reader[T]) Requeue() (bool, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()

@@ -209,7 +209,8 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | --- | --- |
 | `TryPeek() (T, bool, error)` | Look at the front item without consuming it: no cursor moves, and the next read (by any Reader) returns the same item. A damaged head previews as `ErrCorrupt` with nothing dropped or counted. |
 | `TryReserve() (T, bool, int64, error)` | Non-blocking read; returns the item and its offset. |
-| `LastBytes() int64` | Framed on-disk size of the record the last successful consuming read returned — the unit `MaxBytes` and the byte gauges count (`AddSized` is the producing side of the same number). |
+| `LastBytes() int64` | Framed on-disk size of the record the last successful consuming read returned — the unit `MaxBytes` and the byte gauges count (`AddSized` is the producing side of the same number; the `StampRecords` stamp, when enabled, is part of it). |
+| `LastAge() time.Duration` | How long the record the last successful consuming read returned had waited in the queue — measured from the stamp `Options.StampRecords` lays down, so it survives a reopen and a `Requeue` keeps it accumulating. Defined as 0 when `StampRecords` is off. |
 | `TryTake() (T, bool, error)` | Non-blocking read + commit. |
 | `Reserve(ctx) (T, bool, int64, error)` | Block until an item is available, then read it. |
 | `Take(ctx) (T, bool, error)` | Block until an item is available, then read + commit. |
@@ -399,6 +400,7 @@ diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
 	SyncInterval: 0,    // >0 = background flush every interval (backstop for SyncEvery)
 	SegmentSize:  0,    // 0 = 8 MiB default; floored and rounded up to 4 KiB
 	MaxOpenFiles: 0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 3
+	StampRecords: false, // true = stamp each record's enqueue time into its payload; read back as Reader.LastAge
 })
 ```
 
@@ -410,6 +412,25 @@ segment cap. `MaxBytes` bounds the **uncommitted backlog in bytes**, which is wh
 an outage budget is actually sized in; `Stats().BacklogBytes / Stats().MaxBytes` is
 the utilisation ratio to alert on. Whichever binds first returns `ErrFull`, and the
 queue is left untouched, so the caller chooses: block, drop, or shed load upstream.
+
+Volume sizing under a `MaxBytes` budget (`MaxSegments` unbounded) has an exact
+bound, not just "headroom": segments are preallocated whole and reclaimed whole,
+so on a healthy queue
+
+```
+Stats().DiskBytes  ≤  MaxBytes + 2 × SegmentSize + 64 bytes per segment
+```
+
+— up to one segment of already-committed records not yet reclaimable (a file
+unlinks only once **every** record in it is committed) and up to one segment of
+preallocated slack in the active file, plus each segment's 64-byte header. At the
+default 8 MiB geometry a 512 MiB budget measures 520 MiB on disk (1.6 %
+overhead). Two prints against the bound: `Stats().Unreclaimed` climbing means
+files that will not unlink are accumulating outside it, and a consumer that
+reserves without acknowledging pins segments inside `MaxBytes` without freeing
+them. Reopening a backlog of any depth is not a sizing concern either way:
+recovery reads one 64-byte header per segment and no records — sub-millisecond
+for a 512 MiB / 65-segment backlog.
 
 A record larger than `MaxBytes` can never be accepted on an empty queue either, so
 it is refused with `ErrRecordTooLarge` — permanent, where `ErrFull` is transient
@@ -438,6 +459,20 @@ sized to exactly itself, marked as such in that segment's header so a reopen can
 tell it apart from a store built at a different `SegmentSize`. Such a segment holds
 that one record and nothing else, and `Stats().DiskBytes` reports the real
 footprint rather than `segments × SegmentSize`.
+
+`StampRecords` moves the "when was this enqueued" envelope into the store: each
+record is serialized with an 8-byte big-endian unix-nano stamp prepended
+**inside** its payload — checksummed, framed and counted like any other payload
+byte, so `AddSized`, `Reader.LastBytes`, `MaxBytes` and the byte gauges all keep
+agreeing on one unit. The `Reader` strips the stamp back off before the payload
+reaches `UnmarshalFunc` and reports the wait as `Reader.LastAge`; `Requeue`
+moves the raw payload, stamp included, so a rotated record's age keeps
+accumulating instead of resetting. The stamp changes what records *contain*,
+not the on-disk format, so consistency across reopens is the caller's contract
+exactly as the codec already is: reopen a store with the same `StampRecords` it
+was written with. Flipping it over an existing backlog mis-frames every record
+— codec-level garbage, surfaced as `ErrCodec` (a stamped record shorter than
+its stamp included, never a panic) with `Skip` the way past each one.
 
 ## License
 
