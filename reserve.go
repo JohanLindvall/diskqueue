@@ -140,11 +140,39 @@ func (s *store) ackTo(end int64) (bool, error) {
 		return false, nil
 	}
 	s.reserved[i].acked = true
+	return true, s.commitAckedRun()
+}
+
+// commitAckedRun advances the durable cursor across the contiguous acknowledged
+// run at the ledger's head, if any, and reconciles the ledger with however far
+// the commit actually got. A run still blocked behind an unacknowledged
+// reservation commits nothing and is not an error. Shared by ackTo, AckBatch and
+// retireFrame.
+func (s *store) commitAckedRun() error {
 	target := s.ackedRunEnd()
 	if target <= s.commitOff {
-		return true, nil // acknowledged, but a gap ahead of it still blocks the cursor
+		return nil // acknowledged, but a gap ahead still blocks the cursor
 	}
 	err := s.commitTo(target)
 	s.dropRetired() // keep the ledger in step with however far the commit actually got
-	return true, err
+	return err
+}
+
+// retireFrame retires the record spanning [start, end) — one a consume op just
+// took off the head — WITHOUT a consumer to acknowledge it: the record enters
+// the ledger already acknowledged, so the durable cursor advances only across
+// the contiguous acknowledged run and can never retire a reservation another
+// consumer still holds. With nothing outstanding before it the record commits
+// immediately; behind an outstanding reservation the retirement waits for that
+// ack, and a crash meanwhile replays the record — the same at-least-once answer
+// every other unflushed commit gives. Skip and Requeue retire their head this
+// way; a prefix commitTo here would silently retire other consumers' in-flight
+// records (the exact hazard the ledger exists to prevent).
+//
+// Appending keeps the ledger sorted: the frame was the read head, so its end is
+// past every outstanding reservation's.
+func (s *store) retireFrame(start, end int64) error {
+	s.dropRetired()
+	s.reserved = append(s.reserved, reservation{start: start, end: end, acked: true})
+	return s.commitAckedRun()
 }

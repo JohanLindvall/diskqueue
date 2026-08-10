@@ -438,6 +438,29 @@ func (w *Queue[T]) Add(data T) error {
 	return w.addBytesLocked(payload)
 }
 
+// AddSized is Add, also reporting the framed size the record occupies on disk —
+// length prefix, payload and checksum trailer. That is the unit MaxBytes and
+// the Stats byte gauges count, so a producer metering its own throughput agrees
+// with the store's accounting (Reader.LastBytes is the consuming side of the
+// same number). The size is 0 when the add failed.
+func (w *Queue[T]) AddSized(data T) (int64, error) {
+	mb, payload, err := w.marshalValue(data)
+	if err != nil {
+		return 0, err
+	}
+	defer w.putBuf(mb)
+	n := framedLen(len(payload))
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return 0, ErrClosed
+	}
+	if err := w.addBytesLocked(payload); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // AddWait is Add with backpressure: where Add answers ErrFull, AddWait blocks
 // until a commit frees capacity (or ctx is done) and then retries. Every other
 // error — ErrRecordTooLarge included, which no amount of draining changes —

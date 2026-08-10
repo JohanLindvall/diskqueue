@@ -460,3 +460,151 @@ func TestLedgerBoundedWithoutAck(t *testing.T) {
 		t.Fatalf("ledger holds %d entries after 2000 reserve+commit cycles; it must stay bounded by the outstanding reservations", n)
 	}
 }
+
+// TestSkipRetiresOnlyHead is the ledger side of Skip: skipping the head while
+// earlier records are reserved-but-unacknowledged must not retire them — the old
+// prefix commit did, silently, and they were gone after a crash. The skip
+// becomes durable only once the reservations ahead of it acknowledge.
+func TestSkipRetiresOnlyHead(t *testing.T) {
+	w, dir := openAckQueue(t, ackOpts())
+	addN(t, w, 3) // A, B, C; C will be skipped while A and B are in flight
+	r := w.NewReader()
+	reserveN(t, r, 2) // A and B in flight, never acknowledged this session
+
+	ok, err := r.Skip()
+	if err != nil || !ok {
+		t.Fatalf("Skip: ok=%v err=%v", ok, err)
+	}
+	if got := w.Count(); got != 3 {
+		t.Fatalf("Count = %d, want 3: a deferred skip retires nothing yet", got)
+	}
+
+	// Simulate a crash before the in-flight records acknowledge: all three must
+	// replay — the skip was consumed this session but never durably committed.
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	w2, err := New[uint64](dir, marshalU64, unmarshalU64, ackOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w2.Close() }()
+	if got := w2.Count(); got != 3 {
+		t.Fatalf("Count after reopen = %d, want 3: reserved records and the un-durable skip all replay", got)
+	}
+
+	// This time acknowledge the in-flight records after the skip: the whole run
+	// — both acks and the skipped record — retires together.
+	r2 := w2.NewReader()
+	offs := reserveN(t, r2, 2)
+	if ok, err := r2.Skip(); err != nil || !ok {
+		t.Fatalf("Skip: ok=%v err=%v", ok, err)
+	}
+	for _, off := range offs {
+		if err := r2.Ack(off); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := w2.Count(); got != 0 {
+		t.Fatalf("Count = %d, want 0: the acks complete the run and the skip retires with it", got)
+	}
+}
+
+// TestRequeueBehindReservation: the head rotation's retire goes through the
+// ledger too, so a competing consumer's in-flight record survives a Requeue and
+// the rotated original retires once that record acknowledges.
+func TestRequeueBehindReservation(t *testing.T) {
+	w, _ := openAckQueue(t, ackOpts())
+	addN(t, w, 2) // A (reserved), B (rotated)
+	r := w.NewReader()
+	offs := reserveN(t, r, 1)
+
+	ok, err := r.Requeue()
+	if err != nil || !ok {
+		t.Fatalf("Requeue: ok=%v err=%v", ok, err)
+	}
+	// A in flight + B's original (not yet retired) + B's tail copy.
+	if got := w.Count(); got != 3 {
+		t.Fatalf("Count = %d, want 3 before the ack", got)
+	}
+	if err := r.Ack(offs[0]); err != nil {
+		t.Fatal(err)
+	}
+	// A and the rotated original retire together; the tail copy remains.
+	if got := w.Count(); got != 1 {
+		t.Fatalf("Count = %d, want 1 after the ack", got)
+	}
+}
+
+// TestAckBatch: one call, one commit, same per-offset contract as Ack.
+func TestAckBatch(t *testing.T) {
+	w, _ := openAckQueue(t, ackOpts())
+	addN(t, w, 4)
+	r := w.NewReader()
+	offs := reserveN(t, r, 4)
+
+	// Out-of-order and with a duplicate: idempotent, order-free, all retired.
+	if err := r.AckBatch(offs[2], offs[0], offs[1], offs[0], offs[3]); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Count(); got != 0 {
+		t.Fatalf("Count = %d, want 0", got)
+	}
+
+	// A bogus offset reports ErrInvalidOffset but must not hold the valid
+	// acknowledgements hostage.
+	addN(t, w, 2)
+	offs = reserveN(t, r, 2)
+	err := r.AckBatch(offs[0], 1<<40, offs[1])
+	if !errors.Is(err, ErrInvalidOffset) {
+		t.Fatalf("AckBatch with a bogus offset = %v, want ErrInvalidOffset", err)
+	}
+	if got := w.Count(); got != 0 {
+		t.Fatalf("Count = %d, want 0: valid offsets in the batch still retire", got)
+	}
+
+	// A batch blocked behind a gap acknowledges but commits nothing yet.
+	addN(t, w, 3)
+	offs = reserveN(t, r, 3)
+	if err := r.AckBatch(offs[1], offs[2]); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Count(); got != 3 {
+		t.Fatalf("Count = %d, want 3: the run is blocked behind the unacked head", got)
+	}
+	if err := r.AckBatch(offs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Count(); got != 0 {
+		t.Fatalf("Count = %d, want 0 once the gap closes", got)
+	}
+}
+
+// TestAddSizedAndLastBytesAgree: the producer- and consumer-side sizes are the
+// same number, and it is the unit the byte gauges count.
+func TestAddSizedAndLastBytesAgree(t *testing.T) {
+	w, _ := openAckQueue(t, ackOpts())
+	before := w.Stats().BacklogBytes
+	n, err := w.AddSized(42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n <= 0 {
+		t.Fatalf("AddSized = %d, want > 0", n)
+	}
+	if got := w.Stats().BacklogBytes - before; got != n {
+		t.Fatalf("BacklogBytes grew by %d, AddSized said %d", got, n)
+	}
+
+	r := w.NewReader()
+	v, ok, off, err := r.TryReserve()
+	if err != nil || !ok || v != 42 {
+		t.Fatalf("TryReserve: v=%d ok=%v err=%v", v, ok, err)
+	}
+	if got := r.LastBytes(); got != n {
+		t.Fatalf("LastBytes = %d, AddSized said %d", got, n)
+	}
+	if err := r.Ack(off); err != nil {
+		t.Fatal(err)
+	}
+}

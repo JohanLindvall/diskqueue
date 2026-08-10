@@ -22,9 +22,10 @@ func (w *Queue[T]) NewReader() *Reader[T] {
 
 // Reader is a consuming view over a Queue; create it with Queue.NewReader.
 type Reader[T any] struct {
-	w       *Queue[T]
-	scratch []byte // record copy, reused across reads
-	err     error  // why the last Drain/Follow stopped; reported by Err
+	w         *Queue[T]
+	scratch   []byte // record copy, reused across reads
+	err       error  // why the last Drain/Follow stopped; reported by Err
+	lastBytes int64  // framed size of the last consumed record; see LastBytes
 }
 
 // Err reports what went wrong during the most recent Drain or Follow: nil when
@@ -230,8 +231,57 @@ func (r *Reader[T]) Ack(offset int64) error {
 	return err
 }
 
+// LastBytes reports the framed on-disk size — length prefix, payload and
+// checksum trailer — of the record the most recent successful consuming read on
+// this Reader returned. It is the unit MaxBytes and the Stats byte gauges
+// count, so a caller metering its own throughput agrees with the store's
+// accounting (AddSized is the producing side of the same number). Meaningful
+// only after such a read; a Reader is single-goroutine by contract, so there is
+// no concurrent overwrite to race.
+func (r *Reader[T]) LastBytes() int64 { return r.lastBytes }
+
+// AckBatch acknowledges several reservations under one lock acquisition, with
+// one ledger drain and at most one commit for the whole batch — the batched
+// form of Ack, for a consumer retiring a batch of records it processed
+// together. Per offset it keeps Ack's contract: already-retired offsets are
+// accepted and do nothing, and an offset past the read cursor or naming no
+// outstanding reservation makes AckBatch return ErrInvalidOffset — after every
+// resolvable offset in the batch has still been acknowledged and the completed
+// run committed, so one bad offset does not hold good acknowledgements hostage.
+func (r *Reader[T]) AckBatch(offsets ...int64) error {
+	r.w.mu.Lock()
+	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	if r.w.closed {
+		return ErrClosed
+	}
+	st := r.w.st
+	st.dropRetired()
+	head := st.headOffset()
+	invalid := false
+	for _, off := range offsets {
+		switch {
+		case off > head:
+			invalid = true // nothing past the read cursor was ever handed out
+		case off <= st.commitOff:
+			// already retired, here or by another consume path: idempotent
+		default:
+			if i, ok := st.findReserved(off); ok {
+				st.reserved[i].acked = true
+			} else {
+				invalid = true
+			}
+		}
+	}
+	err := st.commitAckedRun()
+	if err == nil && invalid {
+		err = ErrInvalidOffset
+	}
+	return err
+}
+
 // Skip consumes the record at the head of the queue without decoding it, and
-// commits it; ok is false when the queue is empty.
+// retires it; ok is false when the queue is empty.
 //
 // It is the deliberate way past a record UnmarshalFunc rejects. Because a decode
 // error leaves the record in place — so a codec bug can never silently eat data —
@@ -242,6 +292,14 @@ func (r *Reader[T]) Ack(offset int64) error {
 // may be a record another Reader would have handled — so call it from one
 // consumer, or coordinate. It is the one consume operation that destroys a record
 // without reading it, and the loss is not counted as corruption.
+//
+// The retirement is per-record, through the reservation ledger: skipping never
+// retires a reservation another consumer still holds (a plain commit here would,
+// silently — the exact hazard Ack exists to prevent). A skip behind an
+// outstanding reservation therefore becomes durable only once that reservation
+// is acknowledged; until then a crash — or a Rewind — replays the skipped
+// record, and the consumer that could not process it skips it again. That is
+// the standard at-least-once answer, and it is idempotent.
 //
 // Like every consume op, Skip can also surface a pending corruption report:
 // ok=false with ErrCorrupt means the queue collected a loss (and may have
@@ -254,11 +312,12 @@ func (r *Reader[T]) Skip() (bool, error) {
 	if r.w.closed {
 		return false, ErrClosed
 	}
-	_, off, ok, err := r.w.st.takeHead()
+	st := r.w.st
+	_, _, ok, err := st.takeHead()
 	if err != nil || !ok {
 		return false, err
 	}
-	return true, r.w.st.commitTo(off)
+	return true, st.retireFrame(st.lastFrameAt, st.lastFrameEnd)
 }
 
 // Drain iterates the items present when iteration begins, oldest first,
@@ -403,6 +462,9 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 			r.w.st.rewindHead(start)
 		}
 	}()
+	// The framed extent, from the boundary takeHead just established — not from
+	// start, which a quarantine en route may have moved past (see trackReserve).
+	r.lastBytes = r.w.st.lastFrameEnd - r.w.st.lastFrameAt
 	defer r.trimScratch() // on the codec exit too; see TryPeek
 	v, err := r.w.unmarshal(r.scratch)
 	if err != nil {
@@ -437,12 +499,16 @@ func (r *Reader[T]) trimScratch() {
 // stalled queue. Watch for it with Stats(): Delivered climbing while Committed
 // stays flat on a non-empty backlog is a head record nobody can retire.
 //
-// The record is re-appended and only then committed at the head, in that order,
-// because the reverse would lose it outright if the append failed. That ordering
-// has a consequence: if the append succeeds and the commit does not, the record
-// exists twice — once at the tail and once still at the head — which is what
-// at-least-once already permits. A failed append moves nothing and leaves the
-// record where it was.
+// The record is re-appended and only then retired at the head, in that order,
+// because the reverse would lose it outright if the append failed. The
+// retirement goes through the reservation ledger (see Skip), so it never
+// retires a reservation another consumer still holds; behind an outstanding
+// reservation it becomes durable only once that reservation is acknowledged.
+// Both orderings have the same consequence: if the append succeeds and the
+// retirement is not yet durable — a failed commit, or one waiting behind a
+// reservation at a crash — the record exists twice, once at the tail and once
+// still at the head, which is what at-least-once already permits. A failed
+// append moves nothing and leaves the record where it was.
 //
 // The re-append is EXEMPT from MaxBytes and MaxSegments. The rotation is
 // backlog-neutral — the tail copy is followed immediately by the commit that
@@ -474,10 +540,13 @@ func (r *Reader[T]) Requeue() (bool, error) {
 		return false, ErrClosed
 	}
 	start := r.w.st.headOffset()
-	payload, off, ok, err := r.w.st.takeHead()
+	payload, _, ok, err := r.w.st.takeHead()
 	if err != nil || !ok {
 		return false, err
 	}
+	// Capture the head's frame now: the append below can reclaim segments
+	// (dropCommitted invalidates the store's frame cache) before the retire.
+	fstart, fend := r.w.st.lastFrameAt, r.w.st.lastFrameEnd
 	// Copy out of the store's shared read buffer before appending: the append path
 	// owns writeBuf, not readBuf, but every other consume op copies under the lock
 	// for exactly this reason and a single-caller exception is how that stops being
@@ -489,7 +558,7 @@ func (r *Reader[T]) Requeue() (bool, error) {
 		return false, err
 	}
 	r.w.signal() // a waiter blocked on an empty queue can have this one
-	cerr := r.w.st.commitTo(off)
+	cerr := r.w.st.retireFrame(fstart, fend)
 	r.trimScratch() // the copy served its purpose; don't pin an oversized one
 	return true, cerr
 }

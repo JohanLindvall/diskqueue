@@ -225,7 +225,11 @@ without ever losing it; see Ack for what that costs.
 
 [Reader.Skip] acts on the shared head rather than on a record the calling Reader
 holds, so with cooperating readers it may discard one another reader would have
-handled.
+handled. Its retire is per-record, through the same ledger as [Reader.Ack]: a
+skip never retires a reservation another consumer still holds, and behind an
+outstanding reservation it becomes durable only once that reservation
+acknowledges (until then a crash replays the skipped record). [Reader.Requeue]
+retires the rotated original the same way.
 
 The blocking methods honour their context.
 

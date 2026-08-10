@@ -190,6 +190,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | --- | --- |
 | `New[T](path, marshal, unmarshal, ...Options)` | Open/create a Queue at `path` (segment cap via `Options.MaxSegments`, default 32). |
 | `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments` or `MaxBytes` (transient), `ErrRecordTooLarge` if it can never fit under `MaxBytes` (permanent). A record too big for one segment gets a segment of its own. Serialization runs before the lock, and under the default policy concurrent `Add`s share their fsyncs (group commit) while each record stays individually durable. |
+| `AddSized(v T) (int64, error)` | `Add`, also reporting the framed size the record occupies on disk — the unit `MaxBytes` and the byte gauges count (`Reader.LastBytes` is the consuming side of the same number). |
 | `AddWait(ctx, v T) error` | `Add` with backpressure: blocks while the queue is full, until a commit frees capacity or `ctx` is done. `ErrRecordTooLarge` still returns immediately. |
 | `AddBatch(items []T) (int, error)` | Append items in order with the per-record cost amortized over the whole batch: one header write per segment crossed on every policy, plus (under per-op durability) one data fsync and one header fsync. Returns how many leading items were placed — on error the first `n` are in and durable, the rest are not. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
@@ -208,12 +209,14 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | --- | --- |
 | `TryPeek() (T, bool, error)` | Look at the front item without consuming it: no cursor moves, and the next read (by any Reader) returns the same item. A damaged head previews as `ErrCorrupt` with nothing dropped or counted. |
 | `TryReserve() (T, bool, int64, error)` | Non-blocking read; returns the item and its offset. |
+| `LastBytes() int64` | Framed on-disk size of the record the last successful consuming read returned — the unit `MaxBytes` and the byte gauges count (`AddSized` is the producing side of the same number). |
 | `TryTake() (T, bool, error)` | Non-blocking read + commit. |
 | `Reserve(ctx) (T, bool, int64, error)` | Block until an item is available, then read it. |
 | `Take(ctx) (T, bool, error)` | Block until an item is available, then read + commit. |
 | `Ack(offset int64) error` | Mark the **single** entry at `offset` consumed. Safe to call in any order, so this is the acknowledgement for several cooperating workers. The retire reaches disk only across a contiguous run of acknowledged records, so an unacknowledged record delays (never loses) the reclamation of everything behind it. |
+| `AckBatch(offsets ...int64) error` | `Ack` for a batch: one lock acquisition and at most one commit for the whole run. Per offset it keeps `Ack`'s contract (idempotent; unknown offsets report `ErrInvalidOffset` after the valid ones are still acknowledged). |
 | `Commit(offset int64) error` | Mark the entry at `offset` **and all before it** consumed; reclaim space. Cheap for retiring a batch one goroutine reserved itself — but with several workers it retires their in-flight records too, so prefer `Ack` there. |
-| `Skip() (bool, error)` | Consume and commit the head record without decoding it — discards it. |
+| `Skip() (bool, error)` | Consume and retire the head record without decoding it — discards it. The retire is per-record (through the reservation ledger), so it never takes a competing worker's reserved record with it; behind an outstanding reservation it becomes durable once that reservation acknowledges. |
 | `Requeue() (bool, error)` | Move the head record to the **back** without decoding it. The non-destructive way past a poison record: it costs a reordering instead of data loss or a stalled head. |
 | `Drain(ctx) iter.Seq[T]` | Drain items present at call time (commits each). |
 | `Follow(ctx) iter.Seq[T]` | Drain existing then future items until `ctx` is cancelled (commits each). |
