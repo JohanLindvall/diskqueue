@@ -1130,6 +1130,15 @@ func (w *Queue[T]) Sync() error { return w.syncOffLock() }
 // and stay counted: the unsynced gauges subtract the pre-flush snapshot rather
 // than resetting, which is what keeps them honest under concurrent producers.
 //
+// The dirty set is listed under the lock but pinned and opened a chunk at a
+// time (flushChunkSize, one below MaxOpenFiles), because a pinned file is
+// exactly the one evictOpen may not close: pinning the whole set at once — as
+// this did — took MaxOpenFiles out of force for the duration of the flush and,
+// since nothing re-evicts on the way out, after it as well. Under NoSync that
+// is unbounded, nothing being flushed until an explicit Sync, so every segment
+// written since the last one is dirty: a descriptor per segment, and EMFILE
+// once the backlog is deep enough.
+//
 // syncMu is held for the whole span. That serializes concurrent Syncs — two
 // interleaved pin/clear cycles could otherwise each clear flags the other's
 // writes re-dirtied — and it is the barrier Close takes to wait out in-flight
@@ -1159,55 +1168,25 @@ func (w *Queue[T]) syncOffLock() error {
 	if st.ioErr != nil {
 		return st.ioErr
 	}
-	// Pin every dirty file and capture its handle and write seq. A dirty file
-	// whose handle was evicted is reopened here (dirty means "has unsynced
-	// bytes", not "is open"); a reopen that fails is NOT latched — the data is
-	// still dirty and the next flush retries it, flushFile's own contract — but
-	// it is reported, and it keeps the gauges standing.
-	type target struct {
-		df  *dataFile
-		f   *os.File
-		seq uint64
-		err error
-	}
-	var targets []target
-	var errs error
+	// List the dirty set now, so the flush covers exactly what was exposed when it
+	// was called and a producer running alongside it cannot extend the work
+	// indefinitely. Nothing is pinned or opened here — flushChunk does both, for
+	// one chunk at a time.
+	var dirty []*dataFile
 	for _, df := range st.files {
-		if !df.dirty {
-			continue
+		if df.dirty {
+			dirty = append(dirty, df)
 		}
-		if err := st.ensureOpen(df); err != nil {
-			errs = errors.Join(errs, err)
-			continue
-		}
-		df.pins++
-		targets = append(targets, target{df: df, f: df.f, seq: df.writeSeq})
 	}
 	snapOps, snapBytes, snapEpoch := st.unsynced, st.unsyncedBytes, st.flushEpoch
-	w.mu.Unlock()
-
-	for i := range targets {
-		if err := faultPoint("sync.file"); err != nil {
-			targets[i].err = err
-			continue
+	var errs error
+	for len(dirty) > 0 {
+		n := len(dirty)
+		if size := st.flushChunkSize(); size > 0 && n > size {
+			n = size
 		}
-		targets[i].err = datasync(targets[i].f) // keep going; flush what can be flushed
-	}
-
-	w.mu.Lock()
-	for i := range targets {
-		tg := &targets[i]
-		tg.df.pins--
-		switch {
-		case tg.err != nil:
-			// An fsync failure latches, exactly as the in-lock flush did: the
-			// pages may already be dropped, and a retry would report success over
-			// data that is gone. The file's dirty flag deliberately stays set —
-			// over-reporting exposure, never under-reporting it.
-			errs = errors.Join(errs, st.failIO(tg.err))
-		case tg.df.writeSeq == tg.seq:
-			tg.df.dirty = false
-		}
+		errs = errors.Join(errs, w.flushChunk(dirty[:n]))
+		dirty = dirty[n:]
 	}
 	if errs != nil {
 		return errs
@@ -1229,6 +1208,84 @@ func (w *Queue[T]) syncOffLock() error {
 		st.unsyncedBytes = max(st.unsyncedBytes-snapBytes, 0)
 	}
 	return nil
+}
+
+// flushChunk pins one chunk of syncOffLock's dirty set, fdatasyncs it with the
+// queue mutex RELEASED, and unpins it again. Called with w.mu held, returns
+// with it held; only syncOffLock calls it.
+//
+// Pinning is per chunk rather than over the whole set because a pinned file is
+// precisely the one evictOpen may not close: holding the set pinned would keep
+// every handle already open when the flush started open for its duration, and
+// nOpen would settle at a chunk above the cap instead of under it.
+//
+// A dirty file whose handle was evicted is reopened here (dirty means "has
+// unsynced bytes", not "is open"); a reopen that fails is NOT latched — the
+// data is still dirty and the next flush retries it, flushFile's own contract —
+// but it is reported, and it keeps the gauges standing.
+func (w *Queue[T]) flushChunk(chunk []*dataFile) error {
+	st := w.st
+	type target struct {
+		df  *dataFile
+		f   *os.File
+		seq uint64
+		err error
+	}
+	targets := make([]target, 0, len(chunk))
+	var errs error
+	for _, df := range chunk {
+		if !st.live(df) {
+			// Reclaimed while an earlier chunk was in flight. Its unsynced bytes
+			// went with the file, so there is nothing left to make durable —
+			// skipped rather than reopened, which would only fail with ENOENT and
+			// fail the Sync with it.
+			continue
+		}
+		if !df.dirty {
+			// Flushed under the lock while an earlier chunk was in flight — a
+			// SyncEvery boundary, a dirty eviction, a flush leader. Nothing left
+			// to do for it, and its bytes are covered either way.
+			continue
+		}
+		if err := st.ensureOpen(df); err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		df.pins++
+		targets = append(targets, target{df: df, f: df.f, seq: df.writeSeq})
+	}
+
+	w.mu.Unlock()
+	func() {
+		// Re-acquire through a defer, so a panic in the window below unwinds with
+		// the mutex held and stays a panic. Returning from it unlocked would meet
+		// syncOffLock's deferred Unlock as "unlock of unlocked mutex" — a FATAL
+		// error, not a recoverable one, and it would bury the original panic.
+		defer w.mu.Lock()
+		for i := range targets {
+			if err := faultPoint("sync.file"); err != nil {
+				targets[i].err = err
+				continue
+			}
+			targets[i].err = datasync(targets[i].f) // keep going; flush what can be flushed
+		}
+	}()
+
+	for i := range targets {
+		tg := &targets[i]
+		tg.df.pins--
+		switch {
+		case tg.err != nil:
+			// An fsync failure latches, exactly as the in-lock flush did: the
+			// pages may already be dropped, and a retry would report success over
+			// data that is gone. The file's dirty flag deliberately stays set —
+			// over-reporting exposure, never under-reporting it.
+			errs = errors.Join(errs, st.failIO(tg.err))
+		case tg.df.writeSeq == tg.seq:
+			tg.df.dirty = false
+		}
+	}
+	return errs
 }
 
 // Close flushes and closes the Queue. Further use returns ErrClosed.

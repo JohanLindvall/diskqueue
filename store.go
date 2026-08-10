@@ -332,6 +332,33 @@ func (s *store) evictOpen(keep *dataFile) {
 	}
 }
 
+// live reports whether df is still one of the store's segments — for a caller
+// holding a pointer it collected under an earlier acquisition of the lock, like
+// the chunked off-lock flush. Reclamation only ever removes a leading PREFIX of
+// s.files (see dropCommitted), and segment bases only ever increase, so a file
+// has been unlinked exactly when its base sits below the live range: no
+// per-file "dropped" flag to keep in step with every removal path. A file
+// dropCommitted could not unlink stays in s.files, which only makes this answer
+// conservatively "live".
+func (s *store) live(df *dataFile) bool {
+	return len(s.files) > 0 && df.base >= s.files[0].base
+}
+
+// flushChunkSize is how many files an off-lock flush (Queue.syncOffLock) may
+// hold open at once; 0 means no limit, matching an unbounded maxOpenFiles.
+//
+// One below the cap, because the chunk's files are pinned and the active file
+// is never evictable: leaving that one slot free is what keeps nOpen at or
+// under maxOpenFiles for the whole flush rather than one over it whenever the
+// active file is not itself in the chunk. openStore floors a nonzero
+// maxOpenFiles at 3, so a chunk always holds at least two files.
+func (s *store) flushChunkSize() int {
+	if s.maxOpenFiles <= 0 {
+		return 0
+	}
+	return max(s.maxOpenFiles-1, 1)
+}
+
 // batched reports whether the sync policy defers fsync to a periodic flush
 // rather than syncing after every write/commit.
 func (s *store) batched() bool { return !s.noSync && s.syncEvery > 1 }

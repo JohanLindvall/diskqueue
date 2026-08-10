@@ -166,6 +166,93 @@ func TestCloseWaitsForInFlightSyncPins(t *testing.T) {
 	}
 }
 
+// parkAtSyncFileCrossing is parkAtSyncFile aimed at a chosen crossing rather
+// than the first: the flush parks at its nth "sync.file" (1-based) and every
+// other crossing passes straight through, so a test can observe the flush deep
+// into a chunked run instead of at its very start.
+func parkAtSyncFileCrossing(t *testing.T, n int) (entered, release chan struct{}) {
+	t.Helper()
+	entered, release = make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	crossings := 0
+	faultHook = func(name string) error {
+		if name != "sync.file" {
+			return nil
+		}
+		mu.Lock()
+		crossings++
+		parkHere := crossings == n
+		mu.Unlock()
+		if parkHere {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	t.Cleanup(func() { faultHook = nil })
+	return entered, release
+}
+
+// TestSyncKeepsOpenFilesUnderCapMidFlush is the peak that
+// TestSyncKeepsOpenFilesUnderCap can only measure after the fact: MaxOpenFiles
+// has to hold WHILE the flush runs, not just once it has finished. A pinned
+// file is exactly the one evictOpen may not close, so a flush that pinned its
+// whole dirty set held a descriptor per dirty segment for its whole span —
+// unbounded under NoSync, where nothing is flushed until an explicit Sync.
+// Parking deep into the run is what makes the distinction: at that point every
+// earlier chunk's handle must already have been released.
+func TestSyncKeepsOpenFilesUnderCapMidFlush(t *testing.T) {
+	const openCap = 3
+	m, u := bytesCodec()
+	w, err := New[[]byte](t.TempDir(), m, u, Options{
+		NoSync: true, SegmentSize: 4096, MaxSegments: -1, MaxOpenFiles: openCap,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = w.Close() }()
+	payload := make([]byte, 1024)
+	for i := 0; i < 48; i++ { // 16 dirty segments against a cap of 3
+		if err := w.Add(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.mu.Lock()
+	dirty := 0
+	for _, df := range w.st.files {
+		if df.dirty {
+			dirty++
+		}
+	}
+	w.mu.Unlock()
+	if dirty <= 2*openCap {
+		t.Fatalf("only %d dirty segments against a cap of %d: too few to tell a chunked flush from an all-at-once one", dirty, openCap)
+	}
+
+	// Two thirds of the way in, so several chunks have come and gone.
+	entered, release := parkAtSyncFileCrossing(t, 2*dirty/3)
+	syncErr := make(chan error, 1)
+	go func() { syncErr <- w.Sync() }()
+	<-entered
+
+	// The flush is parked mid-fdatasync with the queue mutex released, holding
+	// the handles of the chunk in flight. That is the peak.
+	w.mu.Lock()
+	open := w.st.nOpen
+	w.mu.Unlock()
+	if open > openCap {
+		t.Errorf("%d segment handles open mid-flush over %d dirty segments, cap is %d", open, dirty, openCap)
+	}
+
+	close(release)
+	if err := <-syncErr; err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if got := w.Stats().UnsyncedBytes; got != 0 {
+		t.Errorf("UnsyncedBytes=%d after Sync, want 0", got)
+	}
+}
+
 // TestOffLockSyncFailureLatches: moving the fdatasync off the lock must not
 // soften its verdict. A failure there latches ErrIO exactly as the in-lock
 // flush's did, the dirty state stays standing (exposure keeps over-reporting),

@@ -552,6 +552,27 @@ mirrors its own `written`/`committed` counts into its header.
   xxhash on read. `sync()`/`Close` always flush; an optional `SyncInterval`
   goroutine (`syncLoop`, stopped by `Close` via `syncStop`/`syncDone`) flushes on a
   timer as a wall-clock backstop.
+- **`Sync`'s fdatasyncs run off the queue mutex, one bounded chunk at a time.**
+  `syncOffLock` lists the dirty set under the lock, then hands it to `flushChunk`
+  in slices of `flushChunkSize()` — `maxOpenFiles-1`, one below the cap because the
+  active file is never evictable. Each chunk pins its files (`dataFile.pins`: a
+  pinned file is one `evictOpen` may not close and `dropCommitted` may not unlink),
+  fdatasyncs them with the lock released, then unpins. **Pin per chunk, never over
+  the whole set**: a pin is exactly what stops eviction, so pinning everything made
+  `MaxOpenFiles` unenforceable for the flush's duration and — nothing re-evicts on
+  the way out — after it too. Under `NoSync` that was unbounded (nothing is flushed
+  until an explicit `Sync`, so every segment written since the last one is dirty):
+  one descriptor per segment, EMFILE at scale. The cost of per-chunk pinning is
+  that a file can be reclaimed between chunks, so `flushChunk` skips one `st.live`
+  no longer finds — reclamation only ever removes a leading prefix, so "base below
+  `files[0]`" answers that with no per-file flag to keep in step. Two more rules
+  hold the shape: a file's `dirty` clears only if its `writeSeq` is unchanged (bytes
+  staged mid-flush stay counted), and the off-lock window re-takes `w.mu` through a
+  **`defer`** — returning from it unlocked would meet the caller's deferred `Unlock`
+  as `fatal error: sync: unlock of unlocked mutex`, which no `recover` can catch and
+  which would bury the original panic. `syncMu` serializes whole flushes and is
+  Close's barrier for in-flight pins; it is always taken **before** `w.mu`, and
+  `Close` takes it only after stopping the syncer (whose tick holds it too).
 - **Data-before-header durability.** The per-op `append` does **two** fsyncs:
   `WriteAt` the record, `fsync` (record bytes durable), then `writeHeader` +
   `fsync` (the write cursor that publishes them durable). Persisting the header
