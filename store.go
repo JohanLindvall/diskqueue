@@ -103,6 +103,13 @@ type store struct {
 	headOff   int64 // global offset of the next record to read (in memory only)
 	commitOff int64 // global offset of the next record to commit (persisted)
 
+	// reserved is the ledger of records Reserve handed out that no commit has
+	// retired, in read order — what lets Ack acknowledge out of order without
+	// retiring a record another worker still holds. In memory only, like headOff:
+	// an acknowledgement stranded behind a gap by a crash just replays. See
+	// reserve.go.
+	reserved []reservation
+
 	nWritten   int64 // total records appended
 	nCommitted int64 // total records committed
 
@@ -998,6 +1005,11 @@ func (s *store) rewindHead(off int64) {
 func (s *store) rewindToCommit() int64 {
 	n := s.headOff - s.commitOff
 	s.headOff = s.commitOff
+	// Every reservation described a record that is now unread again, so the ledger
+	// describes nothing: the offsets it holds are exactly the ones Rewind's godoc
+	// says become invalid. Keeping them would let a pre-Rewind Ack retire a record
+	// that has since been redelivered to somebody else.
+	s.reserved = nil
 	return n
 }
 

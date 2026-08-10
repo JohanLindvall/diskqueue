@@ -90,6 +90,7 @@ func (r *Reader[T]) TryReserve() (T, bool, int64, error) {
 	if err != nil || !ok {
 		return zero, false, 0, err
 	}
+	r.w.st.trackReserve() // so Ack can retire this record without retiring its neighbours
 	return v, true, off, nil
 }
 
@@ -129,6 +130,7 @@ func (r *Reader[T]) Reserve(ctx context.Context) (T, bool, int64, error) {
 			return zero, false, 0, err
 		}
 		if ok {
+			r.w.st.trackReserve() // so Ack can retire this record without retiring its neighbours
 			return v, true, off, nil
 		}
 		if err := r.w.waitLocked(ctx); err != nil {
@@ -184,6 +186,48 @@ func (r *Reader[T]) Commit(offset int64) error {
 		return ErrInvalidOffset
 	}
 	return r.w.st.commitTo(offset)
+}
+
+// Ack retires the single record at offset, which Reserve or TryReserve returned.
+// It is the acknowledgement to use when several workers consume the same queue,
+// because it is safe to call in any order — unlike Commit, which retires every
+// record before the offset as well and therefore retires whatever the other
+// workers are still holding.
+//
+// The durable commit cursor still moves in one direction over a contiguous run,
+// because that is what the on-disk format records. So an Ack takes effect on disk
+// only once every record ahead of it has been acknowledged too: acknowledge the
+// third of three reserved records and nothing is retired yet; acknowledge the
+// first and second and all three retire together. The consequence worth planning
+// for is that one slow worker holds the whole run behind it — the records are
+// acknowledged, but their space is not reclaimed and they replay after a crash.
+// Stats().InFlightBytes is what that looks like from outside.
+//
+// Acking is idempotent in both directions: an offset already retired, whether by
+// this Ack, a Commit, a Skip or a Requeue, is accepted and does nothing. An
+// offset past the shared read cursor, or one that names no outstanding
+// reservation, returns ErrInvalidOffset — including every offset handed out
+// before a Rewind, which returns them all to the queue.
+//
+// Mixing Ack with Commit on one queue is allowed and needs no care: a Commit
+// simply retires the reservations it passes, and they leave the ledger.
+func (r *Reader[T]) Ack(offset int64) error {
+	r.w.mu.Lock()
+	defer r.w.mu.Unlock()
+	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	if r.w.closed {
+		return ErrClosed
+	}
+	// The same bound Commit states, and for the same reason: nothing past the read
+	// cursor has been handed to anyone, so no offset there can be acknowledged.
+	if offset > r.w.st.headOffset() {
+		return ErrInvalidOffset
+	}
+	found, err := r.w.st.ackTo(offset)
+	if !found {
+		return ErrInvalidOffset
+	}
+	return err
 }
 
 // Skip consumes the record at the head of the queue without decoding it, and

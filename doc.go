@@ -51,9 +51,12 @@ gone. Use these when the work is cheap to lose or is itself idempotent and
 externally recorded.
 
 At-least-once, two calls. [Reader.Reserve] / [Reader.TryReserve] hand back an
-item and its offset without committing; [Reader.Commit] retires it once the work
-is durably done. A crash in between replays the item. This is the right default
-for a work queue, and it is what makes the package usable as a write-ahead log.
+item and its offset without committing; [Reader.Ack] retires that one item once
+the work is durably done, and [Reader.Commit] retires it along with everything
+before it. A crash in between replays the item. This is the right default for a
+work queue, and it is what makes the package usable as a write-ahead log. Ack is
+the one to reach for when more than one worker consumes the queue — see
+Concurrency below.
 
 Iteration. [Reader.Drain] yields the items present when iteration begins;
 [Reader.Follow] continues indefinitely, waiting for new ones until the context is
@@ -207,10 +210,18 @@ consuming goroutine with [Queue.NewReader].
 
 Readers share one read/commit cursor and cooperate: each item is delivered to
 exactly one of them. Take, TryTake, Drain and Follow commit under the lock as
-they read and are safe for concurrent cooperating readers. Reserve/Commit is the
-only deferred path, and its commits must be issued in offset order — with several
-readers reserving concurrently, one reader's commit retires another's in-flight
-record. Use a single consumer for that pattern, or coordinate.
+they read and are safe for concurrent cooperating readers.
+
+Reserve is the only deferred path, and it has two acknowledgements, because the
+choice between them is what makes several workers safe. [Reader.Commit] retires
+an offset and everything before it, which makes a batch retire cheap — reserve N,
+commit the last offset once — but with workers finishing in whatever order their
+work allows, one worker's commit retires another's in-flight record. Use it from
+a single consumer, or when one goroutine acknowledges a batch it reserved itself.
+[Reader.Ack] retires one record and is safe to call in any order, which is what
+competing workers want. It still reaches disk only across a contiguous run of
+acknowledged records, so a slow worker delays the retire of everything behind it
+without ever losing it; see Ack for what that costs.
 
 [Reader.Skip] acts on the shared head rather than on a record the calling Reader
 holds, so with cooperating readers it may discard one another reader would have

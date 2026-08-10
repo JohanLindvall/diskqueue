@@ -28,8 +28,11 @@ store using plain `pread`/`pwrite`/`fsync` (no mmap).
   Empty/Count/Size, Stats/Rewind/Sync/Err/Close, NewReader) on top of `store`,
   including the group-commit leader/follower machinery (`addDurableLocked`,
   `leadFlushLocked`, the quiesce/space signals).
-- [reader.go](reader.go) — `Reader[T]`: all consume ops (TryPeek/Reserve/Take/Commit/
+- [reader.go](reader.go) — `Reader[T]`: all consume ops (TryPeek/Reserve/Take/Ack/Commit/
   Drain/Follow/Err); copies each record into its own scratch buffer.
+- [reserve.go](reserve.go) — the reservation ledger behind `Reader.Ack`: the outstanding
+  `Reserve`d records in read order, and the contiguous-run drain that decides how far the
+  commit cursor may advance. In-memory session state only; nothing here reaches disk.
 - [prealloc_linux.go](prealloc_linux.go) / [prealloc_other.go](prealloc_other.go) — `preallocate`:
   `syscall.Fallocate` (stdlib, Linux) with an `ftruncate` fallback everywhere else and on
   filesystems that answer ENOTSUP/ENOSYS/EINVAL.
@@ -162,6 +165,22 @@ mirrors its own `written`/`committed` counts into its header.
   `v <= maxInt` is not enough and `n+int(v)+checksumSize` wrapped anyway (reproduced on
   `GOARCH=386` with a segment above 2 GiB). `commitTo` additionally
   refuses any decoded `next` that is not strictly forward and within `writeOff`.
+- **Two acknowledgements, and the difference is the API, not a mode.** `Commit` is a
+  prefix operation — offset and everything before it — which is what makes a batch retire
+  one call, and also what makes it wrong for competing workers: whoever commits first
+  retires the others' in-flight records, and the loss is silent. `Ack` retires one record.
+  It cannot be built out of `Commit` and `Commit` cannot be redefined into it: from one
+  offset the store cannot tell "I finished this one" from "I finished through here", so
+  both verbs have to exist. `Ack` still moves the same single durable cursor — the on-disk
+  format has no per-record acknowledgement — so it advances only across a contiguous run of
+  acknowledged reservations, and the ledger that decides this lives in [reserve.go](reserve.go).
+  Two consequences to keep: an acknowledgement stranded behind a gap is deliberately **not**
+  durable (it replays, which at-least-once already permits), and a slow worker holds
+  reclamation for everything behind it — `Stats().InFlightBytes` is where that shows.
+  The ledger is reconciled *from* `commitOff` on every ack rather than by hooking each path
+  that moves the cursor; the one exception is `rewindToCommit`, which must clear it, because
+  a rewind un-reads records without moving `commitOff` and the stale entries would otherwise
+  duplicate the offsets the next reservation hands out.
 - **The read cursor may never lag the commit cursor.** `commitTo` drags `headOff` up
   to `commitOff` before `dropCommitted`; otherwise a `Commit` past the read cursor
   reclaims the file `headOff` is standing in and every later read addresses a
@@ -579,6 +598,11 @@ mirrors its own `written`/`committed` counts into its header.
 
 - `Take`/`Drain`/`Follow` advance `headOff` and commit; `Reserve` advances
   `headOff` without committing (so `Empty()` can be true while `Count() > 0`).
+- `Ack` rejects an offset that names no outstanding reservation, where `Commit` accepts a
+  non-boundary offset and stops at the last record ending at or before it. That asymmetry is
+  deliberate: "up to here" has a sensible nearest reading, "this one" does not, so a
+  mis-specified `Ack` is a caller bug worth reporting rather than a silent near-miss. An
+  offset the cursor has already passed is still accepted — that is idempotence, not a guess.
 - `Reader.Requeue` moves the head record to the tail: it appends *first* and
   commits the head *second*, because the reverse loses the record outright if the
   append fails. The consequence is that a failed commit after a successful append

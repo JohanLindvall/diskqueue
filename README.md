@@ -136,19 +136,25 @@ func main() {
 
 ### Reserve / Commit (at-least-once with explicit acknowledgement)
 
-When you need to process an item before acknowledging it, use `Reserve`/`Commit`
-instead of `Take`:
+When you need to process an item before acknowledging it, use `Reserve` instead
+of `Take`, and acknowledge with `Ack`:
 
 ```go
 r := w.NewReader()
 v, ok, offset, err := r.Reserve(ctx)
 if ok {
 	if err := process(v); err == nil {
-		r.Commit(offset) // acknowledge; everything up to offset is reclaimed
+		r.Ack(offset) // acknowledge just this item
 	}
-	// If you don't commit, the item replays after a restart.
+	// If you don't acknowledge, the item replays after a restart.
 }
 ```
+
+`Ack` retires one record and is safe to call in any order, so several workers can
+run that loop against the same queue. `Commit(offset)` retires the offset *and
+everything before it*, which is the cheaper way to retire a batch one goroutine
+reserved itself — but with several workers it retires whatever the others are
+still holding, so reach for it only when a single consumer owns the cursor.
 
 ### Iterating (consuming)
 
@@ -205,7 +211,8 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `TryTake() (T, bool, error)` | Non-blocking read + commit. |
 | `Reserve(ctx) (T, bool, int64, error)` | Block until an item is available, then read it. |
 | `Take(ctx) (T, bool, error)` | Block until an item is available, then read + commit. |
-| `Commit(offset int64) error` | Mark the entry at `offset` and all before it consumed; reclaim space. |
+| `Ack(offset int64) error` | Mark the **single** entry at `offset` consumed. Safe to call in any order, so this is the acknowledgement for several cooperating workers. The retire reaches disk only across a contiguous run of acknowledged records, so an unacknowledged record delays (never loses) the reclamation of everything behind it. |
+| `Commit(offset int64) error` | Mark the entry at `offset` **and all before it** consumed; reclaim space. Cheap for retiring a batch one goroutine reserved itself — but with several workers it retires their in-flight records too, so prefer `Ack` there. |
 | `Skip() (bool, error)` | Consume and commit the head record without decoding it — discards it. |
 | `Requeue() (bool, error)` | Move the head record to the **back** without decoding it. The non-destructive way past a poison record: it costs a reordering instead of data loss or a stalled head. |
 | `Drain(ctx) iter.Seq[T]` | Drain items present at call time (commits each). |
@@ -366,11 +373,15 @@ and the queue is left in a state you can reason about.
   read/commit cursor and cooperate to consume the stream (each item delivered
   once). `Take`/`TryTake` and the `Drain`/`Follow` iterators read and commit
   atomically under the lock, in cursor order, so they are safe for *concurrent*
-  cooperating readers. `Reserve`/`Commit` is the only deferred path: it advances
-  the shared prefix cursor *after* an unlocked processing window, so its commits
-  must be issued in offset order (use a single consumer, or coordinate the
-  commits) — otherwise one consumer committing out of order reclaims another's
-  in-flight record. The blocking `Reserve`/`Take` and the `Follow` iterator wait
+  cooperating readers. `Reserve` is the only deferred path, and it has two
+  acknowledgements. `Commit` advances the shared prefix cursor *after* an unlocked
+  processing window, retiring the offset **and everything before it** — cheap for a
+  batch retire, but with several workers one consumer committing out of order
+  reclaims another's in-flight record, so use it from a single consumer. `Ack`
+  retires **one** record and is safe in any order, which is what competing workers
+  want; it reaches disk only across a contiguous run of acknowledged records, so a
+  slow worker delays (never loses) the retire of everything behind it. The blocking
+  `Reserve`/`Take` and the `Follow` iterator wait
   for new data and honour their context; `Drain`/`Follow` release the lock between
   yields, so other methods may be called from inside the iteration.
 
