@@ -120,7 +120,14 @@ type store struct {
 	// cleared only by a flush that covered every file, so a partial failure keeps
 	// over-reporting rather than under-reporting the exposure.
 	unsyncedBytes int64
-	unreclaimed   uint64 // failed attempts to unlink a fully-committed segment
+	// flushEpoch counts the flushes that ZEROED the pair above (flushBatch's
+	// success arm). The off-lock flush subtracts its pre-flush snapshot from the
+	// counters only when the epoch is unchanged: a SyncEvery-boundary flush that
+	// interleaved has already zeroed them, and subtracting the stale snapshot
+	// from what accumulated since would book fresh, genuinely-unsynced bytes as
+	// durable — the under-report the whole gauge is biased against.
+	flushEpoch  uint64
+	unreclaimed uint64 // failed attempts to unlink a fully-committed segment
 
 	// Loss accounting. Corruption is never allowed to wedge the queue, so the
 	// only way a consumer learns what a bad byte cost is through these: each
@@ -301,10 +308,12 @@ func (s *store) evictOpen(keep *dataFile) {
 	active := s.active()
 	for s.nOpen > s.maxOpenFiles {
 		// Walk from the least-recently-used end toward the most-recently-used,
-		// skipping the active and just-opened files (which are never evicted).
+		// skipping the active and just-opened files (which are never evicted) and
+		// any file an off-lock flush has pinned — closing that handle would yank
+		// it out from under the fdatasync in flight against it.
 		var victim *dataFile
 		for df := s.lruLRU; df != nil; df = df.lruPrev {
-			if df != active && df != keep {
+			if df != active && df != keep && df.pins == 0 {
 				victim = df
 				break
 			}
@@ -345,6 +354,20 @@ func (s *store) recordOps(n int) error {
 // power loss between flushes is caught by the record checksum. The counter is
 // only cleared when every file really flushed, so a failure retries on the next
 // operation instead of booking the batch as durable.
+//
+// It runs UNDER the queue mutex, and the SyncEvery-boundary call from recordOps
+// stays there DELIBERATELY — do not route it through the off-lock machinery
+// Queue.syncOffLock uses. SyncEvery's contract is a bound: never more than N
+// operations unsynced, enforced by the operation that crosses the boundary
+// paying the flush before it returns. Detaching that flush from its operation
+// lets producers keep writing past the boundary for the duration of the
+// fdatasyncs, so the very window the option exists to bound would silently
+// widen under load — and the caller who chose SyncEvery chose to pay an
+// amortized fsync on the Nth operation. A caller who cannot afford any in-lock
+// fsync runs SyncEvery effectively unbounded and paces durability with
+// SyncInterval alone (Lumberjack's configuration), and that wall-clock path —
+// where the flush belongs to no operation — is exactly the one syncOffLock
+// takes off the lock.
 func (s *store) flushBatch() error {
 	var errs error
 	for _, df := range s.files {
@@ -354,6 +377,7 @@ func (s *store) flushBatch() error {
 		return errs
 	}
 	s.unsynced, s.unsyncedBytes = 0, 0
+	s.flushEpoch++
 	return nil
 }
 
@@ -439,6 +463,7 @@ func (s *store) writeHeader(df *dataFile) error {
 	}
 	s.nHeaderWrites++
 	df.dirty = true
+	df.writeSeq++
 	return nil
 }
 
@@ -817,6 +842,14 @@ func (s *store) dropCommitted(keep *dataFile) {
 		df := s.files[i]
 		if df == keep || df.base+df.size > s.commitOff {
 			break
+		}
+		if df.pins > 0 {
+			// An off-lock flush holds this handle; leave the file for the next
+			// reclamation pass rather than closing and unlinking it underneath the
+			// fdatasync. Its records are committed, so it is never re-delivered —
+			// exactly the un-unlinkable-file survive/retry shape, minus the counter.
+			survive = append(survive, df)
+			continue
 		}
 		if df.f != nil {
 			_ = df.f.Close() // read-only from here on; nothing left to lose
@@ -1395,6 +1428,11 @@ func (s *store) stats() Stats {
 // sync makes every unsynced segment durable. Once a flush has failed the store is
 // poisoned and sync keeps saying so: re-running fsync would report success over
 // pages the kernel already dropped.
+//
+// This is the store-level, in-lock flush. Queue.Sync no longer routes through it
+// — its fdatasyncs run off the queue mutex via syncOffLock — but the latch-then-
+// flush composition here is still the semantic contract that path implements,
+// and the store-level tests exercise it directly.
 func (s *store) sync() error {
 	if s.ioErr != nil {
 		return s.ioErr
@@ -1427,6 +1465,10 @@ func (s *store) syncDir() error {
 // close flushes and releases everything, including the directory handle and with
 // it the advisory lock. It always closes every handle, even when a flush fails,
 // and reports the first error (a latched durability failure included).
+//
+// No file can be pinned here: the only pinner is Queue.syncOffLock, whose whole
+// span holds syncMu, and Queue.Close acquires syncMu before calling this — so
+// every off-lock fdatasync has finished before any handle is closed.
 func (s *store) close() error {
 	first := s.ioErr
 	for _, df := range s.files {

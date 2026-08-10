@@ -197,7 +197,7 @@ processing (at-least-once), use `Reserve`/`Commit`.
 | `Empty() bool` | Whether anything is available to read. |
 | `Count() int` | Number of items added but not yet committed. |
 | `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
-| `Sync() error` | `fsync` the files to stable storage. |
+| `Sync() error` | `fsync` the files to stable storage. The per-file fdatasyncs run off the queue's lock (the files pinned against eviction/reclamation instead), so a large flush — the `SyncInterval` backstop included — does not stall concurrent producers and consumers; records written during the flush stay in `UnsyncedBytes` for the next one. Concurrent Syncs serialize. |
 | `Stats() Stats` | Gauges and lifetime counters, including every loss path. `UnsyncedBytes` is what a power loss would cost right now; `BacklogBytes`/`MaxBytes` is the utilisation to alert on. See **Recovery**. |
 | `Rewind() (int64, error)` | Return every delivered-but-uncommitted record to the queue. The nack for `Reserve`. Watch `Stats().InFlightBytes` to know when it is needed. |
 | `Err() error` | The latched durability failure, or nil. See **Failure handling**. |

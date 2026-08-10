@@ -105,7 +105,16 @@ How often that fsync happens is the main throughput knob:
   - [Options].NoSync never syncs. Data still survives a process crash through the
     page cache, but not a power loss.
 
-[Queue.Sync] flushes on demand and [Queue.Close] always flushes.
+[Queue.Sync] flushes on demand and [Queue.Close] always flushes. A flush's
+per-file fdatasyncs run WITHOUT the queue's lock held — pinned against eviction
+and reclamation instead — so the SyncInterval backstop over a deep unsynced
+backlog does not stall every concurrent Add and read for the duration of the
+disk write-back. Records written while a flush is in flight are simply not
+covered by it: they stay counted in [Stats].UnsyncedBytes and are taken by the
+next one. Concurrent Syncs serialize, and Close waits for an in-flight flush
+before the file handles go away. The SyncEvery boundary is the exception and
+stays under the lock on purpose: it is a bound on unsynced operations, enforced
+by the operation that crosses it paying the flush before returning.
 
 A failed fsync is not retriable and is not treated as one. Linux reports a
 writeback error exactly once and then drops the dirty pages, so a second fsync

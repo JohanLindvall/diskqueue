@@ -76,6 +76,7 @@ func (s *store) writeRecord(df *dataFile, off int64, payload []byte) error {
 		return err
 	}
 	df.dirty = true
+	df.writeSeq++
 	return nil
 }
 

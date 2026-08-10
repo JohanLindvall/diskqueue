@@ -3,6 +3,7 @@ package diskqueue
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 	"time"
 )
@@ -286,6 +287,17 @@ type Queue[T any] struct {
 	// both nil when it is not running.
 	syncStop chan struct{}
 	syncDone chan struct{}
+
+	// syncMu serializes whole off-lock flushes (syncOffLock): it is held for the
+	// full pin → fdatasync → clear span, so two concurrent Syncs can never
+	// interleave their pin/clear cycles. A plain mutex rather than an in-progress
+	// flag + wait loop on purpose — the mutex IS that machinery, with the parking
+	// and the wakeup supplied by the runtime, and it doubles as Close's barrier:
+	// acquiring it is how Close waits for every in-flight pin to drain before the
+	// store's handles go away. Lock order: syncMu is always taken BEFORE w.mu and
+	// never under it, so a holder blocked on w.mu can always be released by the
+	// flush leader that holds it.
+	syncMu sync.Mutex
 }
 
 // New opens (creating if necessary) a Queue under the directory path. The segment
@@ -1036,7 +1048,34 @@ func (w *Queue[T]) Rewind() (int64, error) {
 }
 
 // Sync flushes buffered writes to stable storage.
-func (w *Queue[T]) Sync() error {
+//
+// The per-file fdatasyncs run WITHOUT the queue mutex held, so a large flush —
+// the SyncInterval backstop over a deep unsynced backlog, say — does not stall
+// every concurrent Add and read for the duration of the disk write-back.
+// Everything Sync promises still holds: on a nil return, every byte written
+// before the call is durable (bytes written DURING it may or may not be, and
+// stay reported in Stats().UnsyncedBytes either way).
+func (w *Queue[T]) Sync() error { return w.syncOffLock() }
+
+// syncOffLock is the off-lock flush behind Sync and the SyncInterval backstop.
+// Dirty files are pinned under the lock (a pinned file is never closed by
+// eviction or reclamation — see dataFile.pins), the fdatasyncs run without it,
+// and each file's dirty flag is cleared on the way back only if its writeSeq is
+// unchanged, so bytes staged while the flush was in flight stay marked dirty
+// and stay counted: the unsynced gauges subtract the pre-flush snapshot rather
+// than resetting, which is what keeps them honest under concurrent producers.
+//
+// syncMu is held for the whole span. That serializes concurrent Syncs — two
+// interleaved pin/clear cycles could otherwise each clear flags the other's
+// writes re-dirtied — and it is the barrier Close takes to wait out in-flight
+// pins. Holding it also means the STORE cannot close underneath the flush
+// (Close acquires syncMu before st.close()), so the tail below never needs to
+// distinguish a closed queue: the closed flag only refuses NEW operations,
+// while this one was admitted while the queue was open and its handles are
+// guaranteed to outlive it.
+func (w *Queue[T]) syncOffLock() error {
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -1048,7 +1087,83 @@ func (w *Queue[T]) Sync() error {
 	if w.closed {
 		return ErrClosed
 	}
-	return w.st.sync()
+	st := w.st
+	// The latch check sits AFTER the quiesce, where st.sync's used to: a leader
+	// that failed while the quiesce had the lock released must be reported, not
+	// flushed over.
+	if st.ioErr != nil {
+		return st.ioErr
+	}
+	// Pin every dirty file and capture its handle and write seq. A dirty file
+	// whose handle was evicted is reopened here (dirty means "has unsynced
+	// bytes", not "is open"); a reopen that fails is NOT latched — the data is
+	// still dirty and the next flush retries it, flushFile's own contract — but
+	// it is reported, and it keeps the gauges standing.
+	type target struct {
+		df  *dataFile
+		f   *os.File
+		seq uint64
+		err error
+	}
+	var targets []target
+	var errs error
+	for _, df := range st.files {
+		if !df.dirty {
+			continue
+		}
+		if err := st.ensureOpen(df); err != nil {
+			errs = errors.Join(errs, err)
+			continue
+		}
+		df.pins++
+		targets = append(targets, target{df: df, f: df.f, seq: df.writeSeq})
+	}
+	snapOps, snapBytes, snapEpoch := st.unsynced, st.unsyncedBytes, st.flushEpoch
+	w.mu.Unlock()
+
+	for i := range targets {
+		if err := faultPoint("sync.file"); err != nil {
+			targets[i].err = err
+			continue
+		}
+		targets[i].err = datasync(targets[i].f) // keep going; flush what can be flushed
+	}
+
+	w.mu.Lock()
+	for i := range targets {
+		tg := &targets[i]
+		tg.df.pins--
+		switch {
+		case tg.err != nil:
+			// An fsync failure latches, exactly as the in-lock flush did: the
+			// pages may already be dropped, and a retry would report success over
+			// data that is gone. The file's dirty flag deliberately stays set —
+			// over-reporting exposure, never under-reporting it.
+			errs = errors.Join(errs, st.failIO(tg.err))
+		case tg.df.writeSeq == tg.seq:
+			tg.df.dirty = false
+		}
+	}
+	if errs != nil {
+		return errs
+	}
+	if st.ioErr != nil {
+		// Latched by an interleaved in-lock flush — a SyncEvery boundary, a dirty
+		// eviction — while the fdatasyncs here were in flight. Some file's
+		// writeback failed, so this Sync may not answer "durable" just because
+		// its own targets succeeded; the gauges stay standing with the latch.
+		return st.ioErr
+	}
+	// Every file that was dirty at the snapshot flushed clean; what producers
+	// wrote during the fdatasyncs remains dirty, seq-guarded above, and remains
+	// counted here — unless an interleaved flushBatch already zeroed the gauges
+	// (the epoch moved), in which case they now describe only what accumulated
+	// since it and the stale snapshot must not be subtracted from that.
+	if st.flushEpoch == snapEpoch {
+		st.unsynced = max(st.unsynced-snapOps, 0)
+		st.unsyncedBytes = max(st.unsyncedBytes-snapBytes, 0)
+	}
+	return nil
 }
 
 // Close flushes and closes the Queue. Further use returns ErrClosed.
@@ -1074,6 +1189,17 @@ func (w *Queue[T]) Close() error {
 		<-w.syncDone
 	}
 
+	// Wait out any in-flight Sync before the handles go away: its fdatasyncs run
+	// off the queue mutex against pinned files, and st.close() below closes every
+	// one of them. Acquiring syncMu IS that wait — syncOffLock holds it for its
+	// whole span — and holding it across the close parks any Sync arriving now
+	// until the store is closed, where it observes the closed flag and returns
+	// ErrClosed without touching a handle. Ordered AFTER the syncer stop above:
+	// the syncer's own flush holds syncMu too, so taking it first would deadlock
+	// the <-syncDone against a tick that can never finish.
+	w.syncMu.Lock()
+	defer w.syncMu.Unlock()
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	// A flush leader may still be between fsyncs (closed only stops NEW
@@ -1094,13 +1220,11 @@ func (w *Queue[T]) syncLoop(d time.Duration) {
 		case <-w.syncStop:
 			return
 		case <-t.C:
-			w.mu.Lock()
-			if !w.closed {
-				// Nowhere to return it to, but a failed fsync latches inside the
-				// store, so the next Add/Sync/Close — or Err — reports it.
-				_ = w.st.sync()
-			}
-			w.mu.Unlock()
+			// Nowhere to return it to, but a failed fsync latches inside the
+			// store, so the next Add/Sync/Close — or Err — reports it. The
+			// off-lock flush checks closed itself, and Close waits for this
+			// tick's flush (via syncMu) before it stops the loop.
+			_ = w.syncOffLock()
 		}
 	}
 }

@@ -70,6 +70,21 @@ type dataFile struct {
 	// need it and skip a file that was merely read since its last flush.
 	dirty bool
 
+	// writeSeq counts writes into this file — record bytes and header images both;
+	// it moves in lockstep with every `dirty = true`. It exists for the off-lock
+	// flush (Queue.syncOffLock), which snapshots it under the lock, fdatasyncs
+	// without it, and clears dirty afterwards only when the seq is unchanged — so
+	// bytes staged while the fdatasync was in flight stay marked dirty rather than
+	// being booked as durable by a flush that never saw them.
+	//
+	// pins counts off-lock flushes currently holding this file's handle. A pinned
+	// file is never closed out from under the fdatasync: evictOpen passes over it
+	// and dropCommitted leaves it for the next reclamation pass (the same
+	// survive/retry machinery an un-unlinkable file uses). Queue.Close waits for
+	// every pin to drain (via syncMu) before store.close touches the handles.
+	writeSeq uint64
+	pins     int
+
 	// truncated marks a segment whose file was found shorter than the write cursor
 	// its header publishes: the bytes past the cut are gone. size is clamped to
 	// what survived, so the published cursor must be rewritten before anything
