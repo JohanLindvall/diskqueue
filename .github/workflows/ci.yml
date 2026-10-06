@@ -96,7 +96,11 @@ jobs:
           go-version: stable # lint on current Go, not the go.mod floor
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12.2
+          # Must be a release that supports the Go `stable` resolves to. An older
+          # one cannot type-check the newer standard library and fails inside Go's
+          # own sources (v2.12.2 under Go 1.27: "unknown field rfd in struct
+          # literal of type splicePipe"), so bump this when a new Go minor ships.
+          version: v2.14.0
       # The README tells license scanners that every source file carries an SPDX
       # identifier, and a new file without one would make that quietly false.
       - name: SPDX identifier on every Go file
