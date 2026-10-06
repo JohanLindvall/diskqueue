@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 /*
 Package diskqueue implements a generic, durable, FIFO disk-backed queue — a
 persistent work queue that doubles as a write-ahead log.

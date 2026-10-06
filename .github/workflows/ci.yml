@@ -97,6 +97,17 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
+      # The README tells license scanners that every source file carries an SPDX
+      # identifier, and a new file without one would make that quietly false.
+      - name: SPDX identifier on every Go file
+        run: |
+          set -uo pipefail
+          missing=$(git ls-files '*.go' | xargs grep -Lx '// SPDX-License-Identifier: MIT')
+          if [ -n "$missing" ]; then
+            for f in $missing; do echo "::error file=$f::missing '// SPDX-License-Identifier: MIT'"; done
+            exit 1
+          fi
+          echo "OK: $(git ls-files '*.go' | wc -l) Go files, all with an SPDX identifier"
 
   # A durability primitive is exactly the kind of code where the interesting inputs
   # are the ones nobody thought to write a test for, so every push gets a short

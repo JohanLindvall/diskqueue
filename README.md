@@ -1,9 +1,48 @@
 # diskqueue
 
+[![CI](https://github.com/JohanLindvall/diskqueue/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/JohanLindvall/diskqueue/actions/workflows/ci.yml?query=branch%3Amain)
+[![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/diskqueue.svg)](https://pkg.go.dev/github.com/JohanLindvall/diskqueue)
+[![Version](https://img.shields.io/github/v/tag/JohanLindvall/diskqueue?sort=semver&label=version)](https://pkg.go.dev/github.com/JohanLindvall/diskqueue?tab=versions)
+[![License](https://img.shields.io/github/license/JohanLindvall/diskqueue)](LICENSE)
+
 A generic, durable, FIFO **disk-backed queue** for Go — a persistent work queue
-that doubles as a write-ahead log — backed by its own small file store using
-plain `pread`/`pwrite`/`fsync` (its only dependency is `cespare/xxhash/v2` for
-per-record checksums).
+that doubles as a write-ahead log.
+
+- **Durable when `Add` returns.** By default the record, and then the header that
+  publishes it, are fsync'd before `Add` returns, so an acknowledged item survives
+  power loss, not just a crash.
+- **Damage is dropped and counted, never delivered.** Every record carries an
+  `xxhash64` checksum; one that fails it is reported once as `ErrCorrupt`, counted in
+  `Stats()`, and never handed to your code as data or left blocking the queue.
+- **Restarts read headers, not the backlog.** Reopening a healthy queue reads one
+  64-byte header per segment and no records, however deep the backlog.
+- **Zero allocations on the hot path**, gated in CI. Its own small file store on
+  plain `pread`/`pwrite`/`fsync` — no mmap, no cgo — and one dependency,
+  `cespare/xxhash/v2`.
+
+```go
+q, err := diskqueue.New[string]("/var/lib/myapp/queue",
+	func(dst []byte, s string) ([]byte, error) { return append(dst, s...), nil }, // marshal
+	func(b []byte) (string, error) { return string(b), nil })                     // unmarshal
+if err != nil {
+	return err
+}
+defer q.Close()
+
+if err := q.Add("hello"); err != nil { // on disk and fsync'd once it returns
+	return err
+}
+
+r := q.NewReader()
+v, ok, offset, err := r.Reserve(ctx) // blocks until an item arrives
+if err == nil && ok && handle(v) == nil {
+	err = r.Ack(offset) // an item never acknowledged is delivered again after a restart
+}
+```
+
+▶ **[Run it in the Go Playground](https://go.dev/play/p/IerWmkg2R-x)**: write three
+records, flip one byte of the first on disk, reopen, and watch the queue drop and
+count exactly that record and deliver the other two. Nothing to install.
 
 Items are appended at the back with `Add` and consumed from the front through a
 `Reader`: a consumer either **takes** an item (read + commit in one step) or
@@ -474,6 +513,24 @@ was written with. Flipping it over an existing backlog mis-frames every record
 — codec-level garbage, surfaced as `ErrCodec` (a stamped record shorter than
 its stamp included, never a panic) with `Skip` the way past each one.
 
+## Star history
+
+How `diskqueue` is being found, next to the Go persistent queues it is most often
+weighed against:
+
+[![Star history of diskqueue and other Go persistent queues](https://api.star-history.com/svg?repos=JohanLindvall/diskqueue,nsqio/go-diskqueue,joncrlsn/dque,beeker1121/goque,grandecola/bigqueue&type=Date)](https://www.star-history.com/#JohanLindvall/diskqueue&nsqio/go-diskqueue&joncrlsn/dque&beeker1121/goque&grandecola/bigqueue&Date)
+
+## Security
+
+Please report vulnerabilities privately, not in a public issue — see
+[SECURITY.md](SECURITY.md) for how, and for what counts.
+
+## Citing
+
+[CITATION.cff](CITATION.cff) makes GitHub's **Cite this repository** button give
+the citation in APA or BibTeX.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE). Every source file carries an
+`SPDX-License-Identifier: MIT` line, so license scanners need no guesswork.

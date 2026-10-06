@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // UNCOVERED: nothing. forceCommitAll is at 100% of its coverage blocks — the
 // already-fully-committed skip, the publishFullCommit failure, the abandoned-count
 // bump and the global squaring are all executed and asserted below.

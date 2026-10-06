@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // UNCOVERED: none. All nine target blocks in commitTo are now executed and
 // asserted; `go test -covermode=set` reports a non-zero count for each of
 // store.go 833.22 (clamp past the tail), 845.16 (cursor in no live segment),

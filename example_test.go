@@ -1,12 +1,16 @@
+// SPDX-License-Identifier: MIT
+
 package diskqueue_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/JohanLindvall/diskqueue"
 )
@@ -62,6 +66,80 @@ func Example() {
 	// 1
 	// 2
 	// 3
+}
+
+// Damage on disk is dropped and counted, never delivered as data and never left
+// blocking the queue: flip one byte of a record in its segment file, as a bad
+// sector would, and a reopened queue reports exactly that record lost and hands
+// over the rest. The README's Go Playground link runs this program, so a change
+// here wants a fresh share there.
+func Example_recovery() {
+	dir := tempDir()
+	text := func(dst []byte, s string) ([]byte, error) { return append(dst, s...), nil }
+	untext := func(b []byte) (string, error) { return string(b), nil }
+
+	q, err := diskqueue.New[string](dir, text, untext)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, s := range []string{"alpha", "bravo", "charlie"} {
+		if err := q.Add(s); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := q.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	// Find "alpha" in the segment file and flip one of its bytes.
+	segs, err := filepath.Glob(filepath.Join(dir, "data.*"))
+	if err != nil || len(segs) != 1 {
+		log.Fatal("expected one segment: ", segs, err)
+	}
+	b, err := os.ReadFile(segs[0])
+	if err != nil {
+		log.Fatal(err)
+	}
+	i := bytes.Index(b, []byte("alpha"))
+	if i < 0 {
+		log.Fatal("record not found on disk")
+	}
+	f, err := os.OpenFile(segs[0], os.O_RDWR, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{b[i] ^ 0xff}, int64(i)); err != nil {
+		log.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		log.Fatal(err)
+	}
+
+	q, err = diskqueue.New[string](dir, text, untext)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer func() { _ = q.Close() }()
+	r := q.NewReader()
+	for {
+		v, ok, err := r.TryTake()
+		switch {
+		case errors.Is(err, diskqueue.ErrCorrupt):
+			fmt.Println("dropped:", err)
+			continue
+		case err != nil:
+			log.Fatal(err)
+		case !ok:
+			fmt.Println("lost records:", q.Stats().LostRecords, "- still queued:", q.Count())
+			return
+		}
+		fmt.Println(v)
+	}
+	// Output:
+	// dropped: diskqueue: corrupt: record checksum
+	// bravo
+	// charlie
+	// lost records: 1 - still queued: 0
 }
 
 // Reserve/Commit is the at-least-once path: the record is not retired until you

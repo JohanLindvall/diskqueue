@@ -1,0 +1,31 @@
+# GitHub reads this file to offer "Cite this repository" (APA and BibTeX).
+#
+# There is deliberately no `version` or `date-released`: CI tags every green build
+# of main, so any version written here would be stale by the next push. A citation
+# without one points at the repository, which is the stable thing to cite.
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: diskqueue
+abstract: >-
+  A generic, durable, FIFO disk-backed queue for Go: a persistent work queue that
+  doubles as a write-ahead log. Records are fsync'd before Add returns, every
+  record and segment header carries an xxhash64 checksum, damage is dropped and
+  counted rather than delivered, and reopening reads one 64-byte header per
+  segment instead of the backlog.
+authors:
+  - family-names: Lindvall
+    given-names: Johan
+repository-code: "https://github.com/JohanLindvall/diskqueue"
+url: "https://pkg.go.dev/github.com/JohanLindvall/diskqueue"
+license: MIT
+keywords:
+  - go
+  - golang
+  - persistent queue
+  - disk-backed queue
+  - write-ahead log
+  - durability
+  - fsync
+  - crash recovery
+  - data integrity

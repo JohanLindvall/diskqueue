@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package diskqueue
 
 // The reservation ledger: what makes Reader.Ack safe to call out of order.

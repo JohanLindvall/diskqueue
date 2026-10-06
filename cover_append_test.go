@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package diskqueue
 
 // UNCOVERED: three of the seven targeted blocks cannot be reached from a test

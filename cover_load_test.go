@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // UNCOVERED: the `return err` arms of `writeHeader` and `flushFile` inside load's
 // header write-back loop (the one that republishes what recovery concluded) are not
 // reached by this file, and cannot be reached without adding a seam to non-test code.

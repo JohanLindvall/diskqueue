@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package diskqueue
 
 // The quarantine paths: skipCorruptSegment and the force-commit under it.

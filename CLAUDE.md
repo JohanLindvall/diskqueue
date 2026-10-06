@@ -677,3 +677,11 @@ mirrors its own `written`/`committed` counts into its header.
 - The fault-injection helpers in `robust_test.go` work by swapping `df.f` behind the
   store's back, and rely on `ensureOpen` *not* reopening a file whose `f` is
   non-nil. If that ever changes, those tests silently stop injecting anything.
+- Every `.go` file opens with `// SPDX-License-Identifier: MIT` and a blank line
+  (above any `//go:build`, so neither the build constraint nor the package doc
+  absorbs it). The README promises that to license scanners, and CI's lint job
+  fails a file that lacks it.
+- The README's Go Playground link is a share of `Example_recovery`'s program, not
+  a pointer to it: change that example and the link keeps running the old code
+  until it is re-shared (POST the program to `https://go.dev/_/share`, which
+  returns the new id).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //go:build !diskqueue_faults
 
 package diskqueue
