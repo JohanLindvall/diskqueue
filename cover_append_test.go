@@ -139,13 +139,9 @@ func appendRootErr(err error) error {
 // TestAppendActiveSegmentOpenFailureIsRetriable covers append's ensureOpen arm:
 // the active segment's handle is gone and the file cannot be opened again.
 //
-// The arm exists because the classification matters. An open failure is class
-// (2) in CLAUDE.md's three-way split — retriable, store untouched, nothing
-// deleted — so it must come back as itself, must NOT latch ErrIO (which would
-// make a chmod blip permanent), and must NOT be laundered into ErrCorrupt (which
-// is the only class licensed to drop data). And because it happens before the
-// record is written, the invariant "a failure before the advance leaves the
-// store untouched" applies in its strongest form: not one counter moves.
+// An open failure is retriable: return the underlying error without latching
+// ErrIO or classifying it as ErrCorrupt. The record has not been written, so the
+// store and its counters must remain unchanged.
 func TestAppendActiveSegmentOpenFailureIsRetriable(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file permissions")

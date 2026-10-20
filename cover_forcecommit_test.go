@@ -23,9 +23,9 @@ import (
 // Coverage for forceCommitAll's failure arms, skipCorruptSegment's propagation of
 // them, and Reader.next's hard-error exit.
 //
-// forceCommitAll exists to square the counters when the cursor addresses no live
-// segment, and CLAUDE.md binds it to the same rule as the per-segment quarantine:
-// the in-memory advance is applied only once the header carrying it is durable.
+// forceCommitAll reconciles counters when the cursor addresses no live segment.
+// As with per-segment quarantine, it applies the in-memory advance only once
+// the header carrying it is durable.
 // Every test here is about a failure *between* those two things — the case where
 // getting it wrong leaves the store believing it retired records the next open
 // replays. That state is invisible in process; only a reopen catches it, which is
@@ -254,9 +254,7 @@ func TestForceCommitAllVanishedSegment(t *testing.T) {
 //
 // An open that fails for a reason that is not "the file is gone" — EACCES here —
 // is retriable: the segment is presumed intact, nothing may be deleted, nothing
-// may be counted as lost, and the error is returned as itself. CLAUDE.md records
-// that laundering this class into corruption is how an audit once found a chmod
-// blip unlinking a healthy segment.
+// may be counted as lost, and the error is returned as itself.
 func TestForceCommitAllRetriableOpenFailure(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: mode 000 does not deny access")

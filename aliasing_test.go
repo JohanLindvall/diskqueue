@@ -106,14 +106,9 @@ func TestConcurrentReadersRace(t *testing.T) {
 	wg.Wait()
 }
 
-// TestValueSurvivesSegmentReclamation pins "immediate close is safe" as
-// behaviour. Taking the last record of a segment commits it, which reclaims and
-// unlinks that segment inside the same call — the value handed back must still be
-// intact afterwards.
-//
-// It holds for a different reason than CLAUDE.md used to give (the bytes were
-// never the file's to begin with), but it is the property callers depend on, so
-// it is worth a test that does not care why.
+// TestValueSurvivesSegmentReclamation verifies that taking the last record of a
+// segment can reclaim and unlink that segment without changing the returned
+// value. Reader-owned bytes remain valid until that Reader's next read.
 func TestValueSurvivesSegmentReclamation(t *testing.T) {
 	m, u := bytesCodec()
 	dir := t.TempDir()

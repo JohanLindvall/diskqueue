@@ -13,18 +13,10 @@ import (
 
 // Run with: go test -tags diskqueue_faults ./...
 //
-// These are the tests that cannot be written any other way. The durability
-// argument for the per-record policy rests entirely on append issuing its two
-// fsyncs in a particular order relative to the header write, and on what each
-// arm does when its fsync fails. No descriptor trick produces "this fsync fails
-// while the write before it succeeded", so the injection points in append are
-// the only way to reach them.
-//
-// CLAUDE.md used to claim the recovery-fault tests pinned this. They do not:
-// those forge on-disk residue and check what a reopen makes of it, which is a
-// different property. Nothing observed the ordering itself, and removing one
-// fsync makes the suite noticeably faster — an attractive-looking change for a
-// future contributor to make.
+// Fault hooks verify that append syncs record data before writing and syncing
+// its header, and that each failure leaves the expected publication state.
+// Recovery-fault tests complement these ordering checks by constructing on-disk
+// states and verifying the result of reopening them.
 
 // injectAt fails exactly once at the named point, and records the order in which
 // every point was reached.

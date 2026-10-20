@@ -93,7 +93,7 @@ fix. Do not add tests just to restate implementation details.
 | [recovery.go](recovery.go) | Opening and recovering existing queues |
 | [example_test.go](example_test.go), [examples/](examples/README.md) | Executable API examples and standalone programs |
 | [doc.go](doc.go), [docs/guide.md](docs/guide.md) | Package documentation and detailed user guidance |
-| [CLAUDE.md](CLAUDE.md) | Detailed storage invariants and implementation notes |
+| [AGENTS.md](AGENTS.md) | Repository guidance and storage invariants |
 
 Keep these properties intact when changing storage code:
 
