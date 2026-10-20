@@ -138,12 +138,15 @@ jobs:
           name: fuzz-crashers
           path: testdata/fuzz/
 
-  # Every GOOS must keep compiling. Preallocation, the directory lock and the
-  # directory fsync are all POSIX-specific, so each has a build-tagged pair with a
+  # The library must keep compiling for every GOOS. Preallocation, directory
+  # locking, and directory fsync each have a build-tagged pair with a
   # no-op or fallback stub for the platforms that lack it — and a stub that stopped
   # compiling would not fail any test on Linux. Only a compile sweep catches it, and
   # it walks `go tool dist list` rather than a hand-picked subset so a newly added
   # port is covered without anyone remembering to add it here.
+  # Build the root library package explicitly. Including the example commands
+  # requires external linking on some Android/iOS targets even for pure Go.
+  # The native test matrix builds and runs the examples.
   cross:
     runs-on: ubuntu-latest
     steps:
@@ -151,13 +154,13 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-      - name: Build every GOOS/GOARCH
+      - name: Build library for every GOOS/GOARCH
         run: |
           set -uo pipefail
           fail=0 n=0
           while read -r target; do
             n=$((n + 1))
-            if ! out=$(CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build ./... 2>&1); then
+            if ! out=$(CGO_ENABLED=0 GOOS="${target%/*}" GOARCH="${target#*/}" go build . 2>&1); then
               echo "::error::build failed for $target: $(echo "$out" | head -3)"
               fail=$((fail + 1))
             fi
