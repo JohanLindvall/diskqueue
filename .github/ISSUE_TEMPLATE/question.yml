@@ -1,0 +1,22 @@
+name: Usage question
+description: Get help using or configuring diskqueue.
+labels: [question]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The [examples](https://github.com/JohanLindvall/diskqueue/tree/main/examples)
+        and [user guide](https://github.com/JohanLindvall/diskqueue/blob/main/docs/guide.md)
+        may help. Questions about unclear documentation are welcome too.
+  - type: textarea
+    id: question
+    attributes:
+      label: How can we help?
+      description: Describe your goal, what you tried, and where you got stuck.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Relevant code and environment
+      description: Include your diskqueue version, queue options, and a small code sample if relevant. Remove secrets.

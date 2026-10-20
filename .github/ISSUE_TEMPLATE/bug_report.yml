@@ -1,0 +1,47 @@
+name: Bug report
+description: Report unexpected behavior with a small reproducer.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Search existing issues first if possible.
+        For security vulnerabilities, please use [private reporting](https://github.com/JohanLindvall/diskqueue/security/advisories/new).
+        Use synthetic data: queue files and logs can contain application secrets.
+  - type: input
+    id: version
+    attributes:
+      label: diskqueue version
+      description: Run `go list -m github.com/JohanLindvall/diskqueue` in your application, or give the commit.
+      placeholder: Module version or commit hash
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include `go version`, OS/architecture, and filesystem or volume type if known.
+      placeholder: Go version, Linux/macOS/Windows, amd64/arm64, ext4/APFS/NFS/container volume…
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: What did you expect, and what happened instead? Include exact errors and whether this follows a restart.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproducer
+      description: A small Go program or step-by-step instructions. Include queue options and codecs.
+      render: go
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Additional diagnostics
+      description: Optional logs, stack trace, or `q.Stats()` output with sensitive data removed.
+      render: text

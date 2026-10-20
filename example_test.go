@@ -142,7 +142,7 @@ func Example_recovery() {
 	// lost records: 1 - still queued: 0
 }
 
-// Reserve/Commit is the at-least-once path: the record is not retired until you
+// Reserve/Ack is the at-least-once path: the record is not retired until you
 // say so, so a crash between the two replays it.
 func ExampleReader_Reserve() {
 	q, err := diskqueue.New[uint64](tempDir(), marshal, unmarshal)
@@ -160,7 +160,7 @@ func ExampleReader_Reserve() {
 		log.Fatal(err)
 	}
 	// ... process v; only acknowledge once it is safely handled.
-	if err := r.Commit(offset); err != nil {
+	if err := r.Ack(offset); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println(v, q.Count())
@@ -186,6 +186,9 @@ func ExampleReader_TryTake_corruption() {
 	for {
 		v, ok, err := rd.TryTake()
 		switch {
+		case errors.Is(err, diskqueue.ErrCodec):
+			// A codec error leaves the head in place, even if it wraps ErrCorrupt.
+			log.Fatal(err)
 		case errors.Is(err, diskqueue.ErrCorrupt):
 			// Already dropped and stepped past; count it and go round again.
 			lost++

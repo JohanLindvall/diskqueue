@@ -5,532 +5,226 @@
 [![Version](https://img.shields.io/github/v/tag/JohanLindvall/diskqueue?sort=semver&label=version)](https://pkg.go.dev/github.com/JohanLindvall/diskqueue?tab=versions)
 [![License](https://img.shields.io/github/license/JohanLindvall/diskqueue)](LICENSE)
 
-A generic, durable, FIFO **disk-backed queue** for Go — a persistent work queue
-that doubles as a write-ahead log.
+**A durable, generic FIFO queue for Go, backed by local disk.**
 
-- **Durable when `Add` returns.** By default the record, and then the header that
-  publishes it, are fsync'd before `Add` returns, so an acknowledged item survives
-  power loss, not just a crash.
-- **Damage is dropped and counted, never delivered.** Every record carries an
-  `xxhash64` checksum; one that fails it is reported once as `ErrCorrupt`, counted in
-  `Stats()`, and never handed to your code as data or left blocking the queue.
-- **Restarts read headers, not the backlog.** Reopening a healthy queue reads one
-  64-byte header per segment and no records, however deep the backlog.
-- **Zero allocations on the hot path**, gated in CI. Its own small file store on
-  plain `pread`/`pwrite`/`fsync` — no mmap, no cgo — and one dependency,
-  `cespare/xxhash/v2`.
+Keep background jobs, events, or outgoing requests across application restarts.
+Embed the queue in your Go process, choose your own serialization, and
+acknowledge work after it succeeds. No separate server to operate.
 
-```go
-q, err := diskqueue.New[string]("/var/lib/myapp/queue",
-	func(dst []byte, s string) ([]byte, error) { return append(dst, s...), nil }, // marshal
-	func(b []byte) (string, error) { return string(b), nil })                     // unmarshal
-if err != nil {
-	return err
-}
-defer q.Close()
+[Quick start](#usage) · [Examples](examples/README.md) · [User guide](docs/guide.md) ·
+[API reference](https://pkg.go.dev/github.com/JohanLindvall/diskqueue) ·
+[Contributing](CONTRIBUTING.md)
 
-if err := q.Add("hello"); err != nil { // on disk and fsync'd once it returns
-	return err
-}
+## Why diskqueue?
 
-r := q.NewReader()
-v, ok, offset, err := r.Reserve(ctx) // blocks until an item arrives
-if err == nil && ok && handle(v) == nil {
-	err = r.Ack(offset) // an item never acknowledged is delivered again after a restart
-}
-```
+- **Durable by default.** `Add` flushes the record and then its header before
+  returning. Concurrent producers share flushes through group commit.
+- **Explicit acknowledgement.** `Reserve` + `Ack` lets workers finish processing
+  before retiring an item. Uncommitted work replays after reopening.
+- **Observable recovery.** Checksums catch accidental damage. Corrupt data is
+  skipped and reported through `ErrCorrupt` and loss counters in `Stats()`.
+- **Bounded buffering.** Set a backlog byte budget, limit segment files, and use
+  `AddWait(ctx, value)` to wait for capacity.
+- **Small dependency footprint.** Pure Go, no mmap or cgo, and one dependency:
+  `cespare/xxhash/v2`. Healthy restarts read segment headers, not every record.
 
-▶ **[Run it in the Go Playground](https://go.dev/play/p/IerWmkg2R-x)**: write three
-records, flip one byte of the first on disk, reopen, and watch the queue drop and
-count exactly that record and deliver the other two. Nothing to install.
-
-Items are appended at the back with `Add` and consumed from the front through a
-`Reader`: a consumer either **takes** an item (read + commit in one step) or
-**reserves** an item together with its offset and later **commits** that offset.
-Committing advances a persisted read cursor; whole data files are reclaimed once
-every record in them has been committed.
-
-The package is designed for high throughput and minimal per-operation heap
-allocation:
-
-- Serialization reuses a pooled buffer and runs **before** the queue's lock is taken,
-  so `Add` performs **no heap allocation** once warm (given a `MarshalFunc` that appends
-  into the supplied buffer) and concurrent producers marshal concurrently. A `MarshalFunc`
-  must therefore be safe for concurrent use; `AddBatch` marshals under the lock instead.
-- A `Reader` copies each record once into its own reusable scratch buffer before
-  handing it to `UnmarshalFunc` — **no per-read allocation** once warm, and the
-  value never aliases the store's reused read buffer.
-
-```
-BenchmarkAddTake-16    4.3 µs/op    0 B/op    0 allocs/op   (NoSync; add + take + commit)
-```
-
-## Storage layout
-
-The log lives in a directory of numbered files `data.00000001`, `data.00000002`,
-… each `SegmentSize` bytes, at most `MaxSegments` of them at once. Segments are
-**preallocated** — `fallocate(2)` on Linux, `ftruncate` elsewhere — so a full
-filesystem is reported when a segment is created, while the store is still clean,
-instead of arriving as an `ENOSPC` in the middle of a record; the footprint is
-what `MaxSegments × SegmentSize` says it is, plus any oversized records' segments
-(`Stats().DiskBytes` reports the real number). That guarantee needs real
-`fallocate`: on non-Linux platforms, and on Linux over NFS, 9p, some FUSE and
-overlay mounts, it falls back to `ftruncate`, which reserves nothing — there
-`ENOSPC` still arrives during an `Add` (which then leaves the queue unchanged),
-and `Stats().DiskBytes` reports apparent size over a sparse file. The directory itself is held open
-for the lifetime of the queue and carries an advisory `flock`, so a second
-`New` on the same directory fails with `ErrLocked` rather than silently
-interleaving writes into the same segments — on platforms whose standard library
-has flock; on Windows, Solaris, AIX, plan9 and js the lock is a no-op and
-nothing prevents two processes from opening the same directory. Each file
-begins with a 64-byte header — a magic number, a format version, the commit
-cursor (persisted read position), write cursor (data end), written and committed
-record counts, the segment's own capacity, the `SegmentSize` the store was created
-with (these two are the authority on geometry; the file's length is evidence
-measured against them rather than evidence on its own), and an
-`xxhash64` over the header itself — followed by records,
-each `uvarint(len) || payload || xxhash64(payload)` (an 8-byte little-endian
-checksum trailer). Because the cursors and counts all live in the header,
-reopening reads no records at all; the header checksum is verified on open (a
-segment that fails it is dropped and counted — see **Recovery**), and each
-record's checksum is verified on read. Records are written with `pwrite` and read back with
-`pread` into reused buffers; each file's handle is opened on demand and the
-least-recently-used handles are closed once `MaxOpenFiles` are open, so a deep
-backlog does not hold an open descriptor per retained file. A file is dropped once
-all its records are committed: on the next write that cycles to a new file, and
-also at the end of a commit — so a consume-only or producer-stopped workload
-frees disk without waiting for another write.
+A good fit for local work queues, buffering during a downstream outage, and
+replaying unacknowledged events. Each directory has one owning queue instance;
+multiple goroutines can produce and consume through it. For replication,
+network clients, or independent subscriber histories, use a broker or log
+service with those features.
 
 ## Install
+
+Requires **Go 1.23 or newer**. From an existing Go module:
 
 ```sh
 go get github.com/JohanLindvall/diskqueue
 ```
 
-Requires Go 1.23+ (uses `iter.Seq`).
+Starting from an empty directory? Run `go mod init example.com/queue-demo` first.
+The project is pre-1.0; review changes before upgrading and keep the module
+version pinned in your application's `go.mod`.
 
 ## Usage
+
+Save this as `main.go` and run `go run .`. It writes an item, reads it, acknowledges
+it, and exits. The temporary directory is removed on exit; use a persistent
+application data directory when you want the queue to survive restarts.
 
 ```go
 package main
 
 import (
-	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 
 	"github.com/JohanLindvall/diskqueue"
 )
 
-// A zero-allocation codec: marshal appends into the provided buffer, unmarshal
-// reads directly from the (zero-copy) slice.
-func marshal(dst []byte, v uint64) ([]byte, error) {
-	return binary.LittleEndian.AppendUint64(dst, v), nil
-}
-
-func unmarshal(data []byte) (uint64, error) {
-	if len(data) != 8 {
-		return 0, errors.New("bad length")
-	}
-	return binary.LittleEndian.Uint64(data), nil
-}
-
 func main() {
-	// Keep at most 8 segment files on disk (default is 32).
-	w, err := diskqueue.New[uint64]("/tmp/myqueue", marshal, unmarshal, diskqueue.Options{MaxSegments: 8})
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() (err error) {
+	dir, err := os.MkdirTemp("", "diskqueue-basic-")
 	if err != nil {
-		panic(err)
+		return err
 	}
-	defer w.Close()
+	defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
 
-	// Producer.
-	for i := uint64(0); i < 10; i++ {
-		if err := w.Add(i); err != nil {
-			panic(err)
-		}
+	q, err := diskqueue.New[string](dir,
+		func(dst []byte, s string) ([]byte, error) { return append(dst, s...), nil },
+		func(data []byte) (string, error) { return string(data), nil },
+	)
+	if err != nil {
+		return err
 	}
+	defer func() { err = errors.Join(err, q.Close()) }()
 
-	// Consumer: reads go through a Reader (one per consuming goroutine).
-	r := w.NewReader()
-	for {
-		v, ok, err := r.TryTake() // read + commit in one step
-		if err != nil {
-			panic(err)
-		}
-		if !ok {
-			break
-		}
-		fmt.Println(v)
+	if err := q.Add("hello, diskqueue"); err != nil {
+		return err
 	}
 
-	// Or block until an item arrives.
-	ctx := context.Background()
-	v, ok, err := r.Take(ctx)
-	_ = v
-	_ = ok
-	_ = err
+	r := q.NewReader()
+	value, ok, offset, err := r.TryReserve()
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("expected the item we just added")
+	}
+	fmt.Println(value) // Do your work before acknowledging.
+	return r.Ack(offset)
 }
 ```
 
-### Reserve / Commit (at-least-once with explicit acknowledgement)
+Output: `hello, diskqueue`
 
-When you need to process an item before acknowledging it, use `Reserve` instead
-of `Take`, and acknowledge with `Ack`:
+The same program lives in [examples/basic](examples/basic/main.go). To see
+unfinished JSON work survive a close and reopen, run
+[`go run ./examples/replay`](examples/replay/main.go) from a checkout.
+For an interactive corruption demo,
+[try the Go Playground](https://go.dev/play/p/IerWmkg2R-x).
 
-```go
-r := w.NewReader()
-v, ok, offset, err := r.Reserve(ctx)
-if ok {
-	if err := process(v); err == nil {
-		r.Ack(offset) // acknowledge just this item
-	}
-	// If you don't acknowledge, the item replays after a restart.
-}
-```
+### Choose how to consume
 
-`Ack` retires one record and is safe to call in any order, so several workers can
-run that loop against the same queue. `Commit(offset)` retires the offset *and
-everything before it*, which is the cheaper way to retire a batch one goroutine
-reserved itself — but with several workers it retires whatever the others are
-still holding, so reach for it only when a single consumer owns the cursor.
+| Need | Use | When is the item committed? |
+| --- | --- | --- |
+| Process, then acknowledge | `Reserve(ctx)` + `Ack(offset)` | After your handler succeeds and you acknowledge |
+| Check for work without waiting | `TryReserve()` + `Ack(offset)` | After your handler succeeds and you acknowledge |
+| Consume in one call | `Take(ctx)` or `TryTake()` | Before the call returns successfully |
+| Iterate over available or arriving items | `Drain(ctx)` or `Follow(ctx)` | Before the loop body runs; check `Reader.Err()` afterward |
 
-### Iterating (consuming)
+Give each consuming goroutine its own `Reader`. Readers share a single stream;
+they divide work rather than each receiving a copy. Use `Ack` with multiple
+workers: `Commit` also retires earlier records that another worker may still
+be processing.
 
-Both iterators **consume**: each item is committed as it is read (before your
-loop body runs), exactly like `Take`, drawing from the same cursor as
-`Reserve`/`Take`, so an item is never delivered twice.
+Make handlers **idempotent**. A crash after processing but before a durable
+acknowledgement can replay the item. There is no automatic retry timer for a
+failed handler: unacknowledged reservations replay after reopening or a
+coordinated `Rewind` once workers have stopped. Acknowledgements behind an
+unfinished reservation become durable when the contiguous prefix is complete.
+See [delivery semantics](docs/guide.md#semantics).
 
-```go
-r := w.NewReader()
+## Configuration
 
-// Drain: drains the items present right now, oldest to newest, then ends.
-for v := range r.Drain(ctx) {
-	process(v) // already committed before this runs
-}
-
-// Follow: drains existing items, then blocks and yields new ones as they
-// arrive, committing each as it is read, until ctx is cancelled.
-for v := range r.Follow(ctx) {
-	process(v)
-}
-```
-
-Because the commit happens at read time, an item that fails (or a loop that
-stops early via `break` or ctx cancellation) is **not** replayed — `Drain`/`Follow`
-are at-most-once, like `Take`. If you need to acknowledge only after successful
-processing (at-least-once), use `Reserve`/`Commit`.
-
-## API
-
-`Queue[T]` — produce and manage the log:
-
-| Method | Description |
-| --- | --- |
-| `New[T](path, marshal, unmarshal, ...Options)` | Open/create a Queue at `path` (segment cap via `Options.MaxSegments`, default 32). |
-| `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments` or `MaxBytes` (transient), `ErrRecordTooLarge` if it can never fit under `MaxBytes` (permanent). A record too big for one segment gets a segment of its own. Serialization runs before the lock, and under the default policy concurrent `Add`s share their fsyncs (group commit) while each record stays individually durable. |
-| `AddSized(v T) (int64, error)` | `Add`, also reporting the framed size the record occupies on disk — the unit `MaxBytes` and the byte gauges count (`Reader.LastBytes` is the consuming side of the same number). |
-| `AddWait(ctx, v T) error` | `Add` with backpressure: blocks while the queue is full, until a commit frees capacity or `ctx` is done. `ErrRecordTooLarge` still returns immediately. |
-| `AddBatch(items []T) (int, error)` | Append items in order with the per-record cost amortized over the whole batch: one header write per segment crossed on every policy, plus (under per-op durability) one data fsync and one header fsync. Returns how many leading items were placed — on error the first `n` are in and durable, the rest are not. |
-| `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
-| `Empty() bool` | Whether anything is available to read. |
-| `Count() int` | Number of items added but not yet committed. |
-| `Size() int64` | Bytes of uncommitted records (roughly what's retained on disk). |
-| `Sync() error` | `fsync` the files to stable storage. The per-file fdatasyncs run off the queue's lock (the files pinned against eviction/reclamation instead), so a large flush — the `SyncInterval` backstop included — does not stall concurrent producers and consumers; records written during the flush stay in `UnsyncedBytes` for the next one. Concurrent Syncs serialize. |
-| `Stats() Stats` | Gauges and lifetime counters, including every loss path. `UnsyncedBytes` is what a power loss would cost right now; `BacklogBytes`/`MaxBytes` is the utilisation to alert on. See **Recovery**. |
-| `Rewind() (int64, error)` | Return every delivered-but-uncommitted record to the queue. The nack for `Reserve`. Watch `Stats().InFlightBytes` to know when it is needed. |
-| `Err() error` | The latched durability failure, or nil. See **Failure handling**. |
-| `Close() error` | Flush and close (releases the directory lock). |
-
-`Reader[T]` — consume items (created via `NewReader`):
-
-| Method | Description |
-| --- | --- |
-| `TryPeek() (T, bool, error)` | Look at the front item without consuming it: no cursor moves, and the next read (by any Reader) returns the same item. A damaged head previews as `ErrCorrupt` with nothing dropped or counted. |
-| `TryReserve() (T, bool, int64, error)` | Non-blocking read; returns the item and its offset. |
-| `LastBytes() int64` | Framed on-disk size of the record the last successful consuming read returned — the unit `MaxBytes` and the byte gauges count (`AddSized` is the producing side of the same number; the `StampRecords` stamp, when enabled, is part of it). |
-| `LastAge() time.Duration` | How long the record the last successful consuming read returned had waited in the queue — measured from the stamp `Options.StampRecords` lays down, so it survives a reopen and a `Requeue` keeps it accumulating. Defined as 0 when `StampRecords` is off. |
-| `TryTake() (T, bool, error)` | Non-blocking read + commit. |
-| `Reserve(ctx) (T, bool, int64, error)` | Block until an item is available, then read it. |
-| `Take(ctx) (T, bool, error)` | Block until an item is available, then read + commit. |
-| `Ack(offset int64) error` | Mark the **single** entry at `offset` consumed. Safe to call in any order, so this is the acknowledgement for several cooperating workers. The retire reaches disk only across a contiguous run of acknowledged records, so an unacknowledged record delays (never loses) the reclamation of everything behind it. |
-| `AckBatch(offsets ...int64) error` | `Ack` for a batch: one lock acquisition and at most one commit for the whole run. Per offset it keeps `Ack`'s contract (idempotent; unknown offsets report `ErrInvalidOffset` after the valid ones are still acknowledged). |
-| `Commit(offset int64) error` | Mark the entry at `offset` **and all before it** consumed; reclaim space. Cheap for retiring a batch one goroutine reserved itself — but with several workers it retires their in-flight records too, so prefer `Ack` there. |
-| `Skip() (bool, error)` | Consume and retire the head record without decoding it — discards it. The retire is per-record (through the reservation ledger), so it never takes a competing worker's reserved record with it; behind an outstanding reservation it becomes durable once that reservation acknowledges. |
-| `Requeue() (bool, error)` | Move the head record to the **back** without decoding it. The non-destructive way past a poison record: it costs a reordering instead of data loss or a stalled head. |
-| `Drain(ctx) iter.Seq[T]` | Drain items present at call time (commits each). |
-| `Follow(ctx) iter.Seq[T]` | Drain existing then future items until `ctx` is cancelled (commits each). |
-| `Err() error` | Why the last `Drain`/`Follow` stopped; nil if it simply ran out. |
-
-## Semantics
-
-- **Offsets.** `Reserve`/`TryReserve` return a monotonically increasing offset.
-  Pass it to `Commit` to acknowledge that record and everything before it. `Take`
-  commits implicitly.
-- **`Options.MaxSegments` bounds the number of segment files** kept on disk at
-  once, so the footprint is about `MaxSegments × SegmentSize`. When the active
-  segment fills and that many segments are already live, `Add` returns `ErrFull`
-  until a whole segment is committed and reclaimed. A record too large for the
-  geometry is not refused — it gets a segment sized to itself; `ErrRecordTooLarge`
-  is reserved for a record that exceeds `Options.MaxBytes`, which no draining can
-  ever admit. The default (a zero value) is 32; a negative value means unbounded.
-- **At-least-once.** The read cursor is reset to the persisted commit cursor on
-  open, so after a restart any items added but not committed are replayed. Use
-  `Reserve`/`Commit` for explicit acknowledgement.
-- **Durability.** Writes go into the page cache via `pwrite` and survive a
-  process crash. By default each write and commit is `fsync`'d for
-  power-loss durability; set `NoSync` to skip the per-operation fsync, or
-  `SyncEvery: N` to batch one fsync over N operations (optionally with a
-  `SyncInterval` wall-clock backstop). `Sync` flushes on demand and `Close`
-  always flushes — including under `NoSync`, which means "no fsync per
-  operation", not "never". Segment creation and removal are additionally made
-  durable with a directory `fsync`; that is a POSIX notion, so it is skipped on
-  Windows, plan9 and js/wasm, and on Unix filesystems that do not implement it —
-  a power loss there can lose a freshly cycled segment's directory entry.
-- **Integrity.** Every record and every file header stores an `xxhash64`, verified
-  on read and on open. A segment that has *lost* bytes is corruption too, not a
-  geometry mismatch: since segments are preallocated to a known length, a file of
-  the wrong size is read as `ErrSegmentSizeMismatch` only when its own header
-  agrees it is complete. See **Recovery** for what a failed check costs.
-- **Reclamation.** Disk is freed a whole file at a time, once every record in it
-  is committed. It happens on the write that cycles to a new file *and* at the end
-  of a commit, so a consumer draining a backlog with the producer stopped still
-  frees disk — you do not need another `Add` to get the space back. A file that
-  will not unlink stays counted (`Stats().Unreclaimed`), so `MaxSegments` keeps
-  describing what is really on disk, and the next reclamation retries it.
-
-## Recovery
-
-Recovery is not an option to switch on — it is the behaviour. Two rules run
-through all of it:
-
-**Corruption degrades to reported loss, never to corrupt output and never to a
-wedged queue.** Damaged data is dropped and counted, not handed onward as
-plausible-looking records, and there is no failure mode where the consumer waits
-forever on bytes that will never parse. A queue that answers `ErrCorrupt` to
-every read until someone edits the directory by hand is not more careful than one
-that drops the record — it is just unavailable as well as damaged.
-
-**Every loss path is observable.** Each event surfaces as exactly one
-`ErrCorrupt` from a read, and `Stats()` carries the magnitude the error cannot:
-`LostRecords`, `LostSegments`, `LostBytes` (a lower bound), `DiscardedBytes` and
-`ForeignSegments`. `increase(LostBytes) > 0` means corruption destroyed data.
-
-| Damage | Cost |
-| --- | --- |
-| Crash mid-`Add` (torn record at the tail) | nothing: the header never published it, and the `Add` never returned |
-| Crash between `Add` and the header fsync | the record is invisible on reopen — a clean truncation, not an error |
-| One flipped byte in a record **payload** | **one record**: its length still framed it, so exactly that record is dropped |
-| One flipped byte in a record **length** | **up to one segment**: the frame boundaries behind it are gone with it |
-| Header rewrite torn by a power cut (magic/version intact, checksum bad) | the segment is **rebuilt** at open from a checksum-verified walk of its records — nothing verified is lost; the commit position is the one casualty, so that segment and everything after it replays, and one event is reported |
-| Damaged segment header (magic gone, or a header shorter than 64 bytes) | that segment is dropped at open — wherever it sits — and counted; the rest stay readable |
-| Segment truncated by the filesystem | the records still present survive; the cut tail is counted in `DiscardedBytes` |
-| Segment file deleted underneath a running queue | the segment is abandoned, one `ErrCorrupt`, the queue keeps making progress |
-| Unfinished segment create (zero-length, or reserved and still all zeros) | removed silently — it never held a record, so it is not a loss event |
-| Unknown format version | segment dropped silently, counted in `ForeignSegments` — a format change is not data loss |
-| Segment that cannot be *read* (`EACCES`, `EMFILE`, `EIO`) | **not** damage: the open fails and nothing is deleted, because "I could not look" is not evidence |
-
-"One bad byte costs one record" is true of payloads, not of length prefixes. A
-damaged length is always *detected* — the checksum it points at no longer
-matches — but it cannot be *repaired*: damaged upward it overruns the segment,
-damaged downward it desynchronizes the walk into the middle of a payload, and
-either way the record boundaries from that point on are gone. The rest of that
-segment is abandoned, so one bad byte there can cost up to `SegmentSize`.
-
-Reading is where losses are reported, so a consumer that never reads never learns
-of them; `Stats()` is readable at any time, including after
-`Close`.
+The zero-value `Options` uses an 8 MiB segment size, up to 32 segment files,
+and syncs every write and commit. Start with these defaults; tune after measuring.
 
 ```go
-for {
-    v, ok, err := r.TryTake()
-    switch {
-    case errors.Is(err, ErrCorrupt):
-        // Damage was dropped and the queue advanced. Count it and go round again.
-        log.Warn("diskqueue read", "err", err, "lost", w.Stats().LostBytes)
-    case err != nil:
-        return err
-    case !ok:
-        return nil
-    default:
-        process(v)
-    }
-}
-```
-
-`Drain` and `Follow` cannot carry an error per item, so they do not stop on
-corruption — the damage is already dropped and the queue has moved on, and
-stopping would strand every record behind it. They keep iterating and record the
-first event in `Reader.Err()`.
-
-## Failure handling
-
-An I/O error never panics and never wedges the queue — it comes back as an error,
-and the queue is left in a state you can reason about.
-
-- **A write that fails did not happen.** `Add` returning `ErrFull`,
-  `ErrRecordTooLarge` or a failed `pwrite` leaves the queue byte-for-byte as it
-  was: the item is not in it, and retrying is well defined. A segment that cannot
-  be created is unlinked again, so a failed `Add` leaves no stub behind.
-- **A failed `fsync` poisons the queue.** Linux reports a writeback error *once*
-  and then discards the dirty pages, so a second `fsync` can return success over
-  data that is already gone. Rather than claim a durability it cannot deliver, the
-  queue latches the first such failure: `Add`, `Commit` and `Sync` all return an
-  error wrapping `ErrIO` from then on (the original errno is wrapped too, so
-  `errors.Is(err, syscall.ENOSPC)` still works), and `Queue.Err()` reports it
-  without performing an operation. **Reads keep working**, so a consumer can drain
-  what is there; to write again, `Close` and reopen — whatever was durable is
-  still on disk and uncommitted records replay.
-- **Commits report failure.** `Take`/`TryTake` return the item *and* a non-nil
-  error when the read succeeded but its commit did not reach disk: the item is
-  yours to process, and it will be delivered again after a reopen. `Commit`
-  returns the same error directly.
-- **Iterators report through `Err()`.** An `iter.Seq` cannot carry an error, so
-  `Drain`/`Follow` stop and record it: check `r.Err()` after the loop. Nil means
-  the iteration ended because the queue was drained, the context was cancelled, or
-  the queue was closed.
-- **A record that could not be delivered stays put.** If `UnmarshalFunc` returns
-  an error the read cursor is rewound, exactly as for a corrupt record, so a
-  transient decode failure cannot silently consume an item. A record the codec
-  will *never* accept is therefore offered again on every read — call `Skip` to
-  step over it deliberately.
-- **`Commit` is bounded by the read cursor.** An offset past what has been read
-  returns `ErrInvalidOffset` instead of reclaiming (and deleting) records nobody
-  has seen.
-- **Recovery never destroys what it could not read.** A segment is dropped only
-  when it is *readable and damaged*. One that merely could not be opened —
-  `EACCES`, `EMFILE`, a device error — fails the open instead, so a transient
-  permission blip cannot unlink good data. A segment that has *disappeared* is
-  corruption, and is abandoned like any other.
-- **One writer per directory.** `New` takes an advisory `flock` on the queue
-  directory (Unix; a no-op where the standard library has no `flock`). A second
-  open of the same directory fails with `ErrLocked`.
-- **Value lifetime.** A `Reader` copies each record into its own reusable scratch
-  buffer before calling `UnmarshalFunc`, so the value (and anything in `T` that
-  aliases it) never aliases the store's reused read buffer. It is valid until
-  the next read on that same `Reader`; copy it inside `UnmarshalFunc` if you need
-  it to outlive that. The copy reuses the buffer, so it allocates nothing once
-  warm.
-- **Concurrency.** A `Queue` is safe for concurrent use. A single `Reader` is *not*
-  — use one `Reader` per consuming goroutine. Multiple Readers share the one
-  read/commit cursor and cooperate to consume the stream (each item delivered
-  once). `Take`/`TryTake` and the `Drain`/`Follow` iterators read and commit
-  atomically under the lock, in cursor order, so they are safe for *concurrent*
-  cooperating readers. `Reserve` is the only deferred path, and it has two
-  acknowledgements. `Commit` advances the shared prefix cursor *after* an unlocked
-  processing window, retiring the offset **and everything before it** — cheap for a
-  batch retire, but with several workers one consumer committing out of order
-  reclaims another's in-flight record, so use it from a single consumer. `Ack`
-  retires **one** record and is safe in any order, which is what competing workers
-  want; it reaches disk only across a contiguous run of acknowledged records, so a
-  slow worker delays (never loses) the retire of everything behind it. The blocking
-  `Reserve`/`Take` and the `Follow` iterator wait
-  for new data and honour their context; `Drain`/`Follow` release the lock between
-  yields, so other methods may be called from inside the iteration.
-
-## Options
-
-```go
-diskqueue.New[T](path, marshal, unmarshal, diskqueue.Options{
-	MaxSegments:  0,    // 0 = 32 default; N>0 = cap live files (ErrFull); <0 = unbounded
-	MaxBytes:     0,    // 0 = no byte cap; N>0 = cap the uncommitted backlog in bytes (ErrFull)
-	NoSync:       true, // skip fsync per write/commit (faster, no power-loss durability)
-	SyncEvery:    0,    // 0/1 = fsync every op; N>1 = batch the fsync over N ops
-	SyncInterval: 0,    // >0 = background flush every interval (backstop for SyncEvery)
-	SegmentSize:  0,    // 0 = 8 MiB default; floored and rounded up to 4 KiB
-	MaxOpenFiles: 0,    // 0 = keep every touched segment open; N = cap open files (LRU), min 3
-	StampRecords: false, // true = stamp each record's enqueue time into its payload; read back as Reader.LastAge
+q, err := diskqueue.New[string](path, marshal, unmarshal, diskqueue.Options{
+    MaxBytes:    64 << 20, // 64 MiB of uncommitted records
+    MaxSegments: 32,       // cap segment files independently
 })
 ```
 
-The two caps compose and answer different questions. `MaxSegments` bounds the
-**file count**, so the footprint that follows from it is `MaxSegments ×
-SegmentSize` — a ceiling on disk rather than a budget on the backlog, and a queue
-holding one record per segment can be nowhere near its byte cap while at its
-segment cap. `MaxBytes` bounds the **uncommitted backlog in bytes**, which is what
-an outage budget is actually sized in; `Stats().BacklogBytes / Stats().MaxBytes` is
-the utilisation ratio to alert on. Whichever binds first returns `ErrFull`, and the
-queue is left untouched, so the caller chooses: block, drop, or shed load upstream.
+`MaxBytes` limits backlog bytes, not total disk use: allow room for segment
+headers and preallocated slack. `Add` returns `ErrFull` at capacity;
+`AddWait(ctx, value)` waits for room. An item larger than the byte budget returns
+`ErrRecordTooLarge` immediately. See [sizing and options](docs/guide.md#options).
 
-Volume sizing under a `MaxBytes` budget (`MaxSegments` unbounded) has an exact
-bound, not just "headroom": segments are preallocated whole and reclaimed whole,
-so on a healthy queue
+`NoSync` and `SyncEvery > 1` trade power-loss durability for throughput.
+`SyncInterval` adds a flush timer to `SyncEvery`; `Sync` and `Close` flush on
+demand. Always handle `Close` errors. Filesystem and platform support affect
+durability and directory locking; see [storage layout](docs/guide.md#storage-layout).
 
+## Performance
+
+The reusable-buffer paths have benchmarks that CI checks for **0 allocs/op**.
+Your codec and sync policy affect allocations: the string and JSON examples
+allocate, and the default group-commit path has per-flush bookkeeping.
+
+Run the benchmarks on your own storage:
+
+```sh
+# Unsynced add/read/commit path: throughput and allocation cost.
+go test -run='^$' -bench='^BenchmarkAddTake$' -benchmem .
+
+# Durable writes, batching, and concurrent producers.
+go test -run='^$' -bench='^Benchmark(AddDurable|AddBatch|AddParallel)$' -benchmem .
 ```
-Stats().DiskBytes  ≤  MaxBytes + 2 × SegmentSize + 64 bytes per segment
+
+Report the Go version, CPU, filesystem, storage device, record size, and sync
+policy with results. Unsynced throughput does not describe durable write latency.
+
+## Documentation
+
+<!-- Keep older README section links useful after moving the detailed reference. -->
+<a id="api"></a>
+<a id="semantics"></a>
+<a id="recovery"></a>
+<a id="failure-handling"></a>
+<a id="options"></a>
+<a id="storage-layout"></a>
+<a id="reserve--commit-at-least-once-with-explicit-acknowledgement"></a>
+<a id="iterating-consuming"></a>
+
+| Looking for | Read |
+| --- | --- |
+| Complete programs you can run | [Examples](examples/README.md) |
+| Queue and reader methods | [API overview](docs/guide.md#api) and [Go reference](https://pkg.go.dev/github.com/JohanLindvall/diskqueue) |
+| Acknowledgement, retries, concurrency, and value lifetime | [Semantics](docs/guide.md#semantics) and [failure handling](docs/guide.md#failure-handling) |
+| Capacity, durability, and timestamps | [Options](docs/guide.md#options) |
+| Corruption, recovery, and loss metrics | [Recovery](docs/guide.md#recovery) |
+| Segment format and platform limitations | [Storage layout](docs/guide.md#storage-layout) |
+| Design tradeoffs against other disk buffers | [Comparison](comparison.md) |
+
+## Help and contributing
+
+[Ask a question](https://github.com/JohanLindvall/diskqueue/issues/new?template=question.yml),
+[report a bug](https://github.com/JohanLindvall/diskqueue/issues/new?template=bug_report.yml),
+or [suggest an improvement](https://github.com/JohanLindvall/diskqueue/issues/new?template=feature_request.yml).
+Small documentation fixes, reproducible bug reports, examples, and benchmark
+results are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks,
+and a map of the code, and follow our [code of conduct](CODE_OF_CONDUCT.md).
+
+```sh
+git clone https://github.com/JohanLindvall/diskqueue.git
+cd diskqueue
+make help       # available development commands
+make check      # formatting, vet, pinned lint, race/fault tests, and examples
 ```
 
-— up to one segment of already-committed records not yet reclaimable (a file
-unlinks only once **every** record in it is committed) and up to one segment of
-preallocated slack in the active file, plus each segment's 64-byte header. At the
-default 8 MiB geometry a 512 MiB budget measures 520 MiB on disk (1.6 %
-overhead). Two prints against the bound: `Stats().Unreclaimed` climbing means
-files that will not unlink are accumulating outside it, and a consumer that
-reserves without acknowledging pins segments inside `MaxBytes` without freeing
-them. Reopening a backlog of any depth is not a sizing concern either way:
-recovery reads one 64-byte header per segment and no records — sub-millisecond
-for a 512 MiB / 65-segment backlog.
-
-A record larger than `MaxBytes` can never be accepted on an empty queue either, so
-it is refused with `ErrRecordTooLarge` — permanent, where `ErrFull` is transient
-and clears as the consumer drains.
-
-`SyncEvery` trades a bounded power-loss window for throughput: with `SyncEvery: N`
-the fsync cost is amortized over N writes/commits, so up to the last N unsynced
-operations can be lost on power loss (they still survive a process crash, and a
-torn tail is caught by the per-record checksum). `Close` and `Sync` always flush.
-`Stats().UnsyncedBytes` reports that window as a number — zero under the default
-per-op policy, climbing under `NoSync` or `SyncEvery > 1` until a flush. If it
-keeps climbing, the `SyncInterval` backstop is not keeping up.
-The speed-up is large — on a laptop NVMe, durable `Add` goes from ~1.6 ms/op at
-`SyncEvery: 1` to ~9 µs at `SyncEvery: 100` and ~1.1 µs at `SyncEvery: 1000`.
-
-`SegmentSize` is fixed when the store is created, floored at 4 KiB and rounded up
-to a multiple of 4 KiB (a fixed constant, not the host's page size — otherwise a
-store created on a 4 KiB-page machine would not reopen on a 64 KiB-page one).
-Reopening an existing store with a different (post-rounding) `SegmentSize` is
-rejected with `ErrSegmentSizeMismatch` rather than truncating the files and
-discarding committed records.
-
-It is not, however, a ceiling on record size. Records never span segments — that is
-the invariant — but a record too large for the configured geometry gets a segment
-sized to exactly itself, marked as such in that segment's header so a reopen can
-tell it apart from a store built at a different `SegmentSize`. Such a segment holds
-that one record and nothing else, and `Stats().DiskBytes` reports the real
-footprint rather than `segments × SegmentSize`.
-
-`StampRecords` moves the "when was this enqueued" envelope into the store: each
-record is serialized with an 8-byte big-endian unix-nano stamp prepended
-**inside** its payload — checksummed, framed and counted like any other payload
-byte, so `AddSized`, `Reader.LastBytes`, `MaxBytes` and the byte gauges all keep
-agreeing on one unit. The `Reader` strips the stamp back off before the payload
-reaches `UnmarshalFunc` and reports the wait as `Reader.LastAge`; `Requeue`
-moves the raw payload, stamp included, so a rotated record's age keeps
-accumulating instead of resetting. The stamp changes what records *contain*,
-not the on-disk format, so consistency across reopens is the caller's contract
-exactly as the codec already is: reopen a store with the same `StampRecords` it
-was written with. Flipping it over an existing backlog mis-frames every record
-— codec-level garbage, surfaced as `ErrCodec` (a stamped record shorter than
-its stamp included, never a panic) with `Skip` the way past each one.
-
-## Star history
-
-How `diskqueue` is being found, next to the Go persistent queues it is most often
-weighed against:
-
-[![Star history of diskqueue and other Go persistent queues](https://api.star-history.com/svg?repos=JohanLindvall/diskqueue,nsqio/go-diskqueue,joncrlsn/dque,beeker1121/goque,grandecola/bigqueue&type=Date)](https://www.star-history.com/#JohanLindvall/diskqueue&nsqio/go-diskqueue&joncrlsn/dque&beeker1121/goque&grandecola/bigqueue&Date)
+If diskqueue is useful to you, a star helps others discover it. Sharing a
+concrete use case or a reproducible benchmark helps people decide whether it
+fits their application.
 
 ## Security
 
-Please report vulnerabilities privately, not in a public issue — see
-[SECURITY.md](SECURITY.md) for how, and for what counts.
+Report vulnerabilities privately using [SECURITY.md](SECURITY.md).
+Use the issue tracker for ordinary bugs and durability problems.
 
 ## Citing
 
-[CITATION.cff](CITATION.cff) makes GitHub's **Cite this repository** button give
-the citation in APA or BibTeX.
+[CITATION.cff](CITATION.cff) provides GitHub's **Cite this repository** metadata.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Every source file carries an
-`SPDX-License-Identifier: MIT` line, so license scanners need no guesswork.
+[MIT](LICENSE). Every Go source file carries an `SPDX-License-Identifier: MIT`
+identifier.

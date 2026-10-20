@@ -6,7 +6,8 @@ Guidance for working in this repository.
 
 `github.com/JohanLindvall/diskqueue` — a generic, durable FIFO disk-backed queue
 (a persistent work queue that doubles as a write-ahead log) for Go. The public API
-and behaviour are documented in [README.md](README.md); read it first. Its only
+and behaviour are documented in [README.md](README.md) and the
+[user guide](docs/guide.md); read them first. Its only
 dependency is `cespare/xxhash/v2` (per-record checksums); it ships its own file
 store using plain `pread`/`pwrite`/`fsync` (no mmap).
 

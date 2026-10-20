@@ -62,6 +62,8 @@ jobs:
         run: go vet -tags diskqueue_faults ./...
       - name: Test (fault-injection build)
         run: go test -race -tags diskqueue_faults ./...
+      - name: Run user examples
+        run: make examples
 
   # The 32-bit leg. It runs on the amd64 runner under GOARCH=386, and it is not
   # redundant with `cross`: cross only COMPILES every GOOS/GOARCH, so the arithmetic
@@ -94,12 +96,15 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable # lint on current Go, not the go.mod floor
+      - name: Check formatting
+        run: make fmt-check
       - uses: golangci/golangci-lint-action@v9
         with:
           # Must be a release that supports the Go `stable` resolves to. An older
           # one cannot type-check the newer standard library and fails inside Go's
           # own sources (v2.12.2 under Go 1.27: "unknown field rfd in struct
           # literal of type splicePipe"), so bump this when a new Go minor ships.
+          # Keep in sync with GOLANGCI_LINT_VERSION in Makefile.
           version: v2.14.0
       # The README tells license scanners that every source file carries an SPDX
       # identifier, and a new file without one would make that quietly false.

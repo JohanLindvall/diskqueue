@@ -24,7 +24,7 @@ type MarshalFunc[T any] func(dst []byte, v T) ([]byte, error)
 // UnmarshalFunc decodes a value from data, a Reader-owned buffer valid only until
 // that Reader's next read; copy out of it if you need it longer.
 //
-// Like MarshalFunc it runs under the Queue's lock and must not call back into
+// It runs under the Queue's lock and must not call back into
 // the queue. Returning an error leaves the record at the head of the queue rather
 // than consuming it, so the same record is offered again; use Reader.Skip to step
 // over one the codec will never accept.
@@ -41,7 +41,8 @@ var (
 	// backlog would exceed Options.MaxBytes. It is the TRANSIENT refusal — it
 	// clears as the consumer commits — where ErrRecordTooLarge is permanent.
 	ErrFull = errors.New("diskqueue: full")
-	// ErrInvalidOffset is returned by Commit for an offset beyond the last record.
+	// ErrInvalidOffset is returned by Commit for an offset beyond the read cursor,
+	// or by Ack/AckBatch for an offset that names no outstanding reservation.
 	ErrInvalidOffset = errors.New("diskqueue: invalid offset")
 	// ErrRecordTooLarge is returned by Add for a record that can NEVER be
 	// admitted, whatever the queue does next. Two things earn it: a framed length

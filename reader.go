@@ -92,7 +92,8 @@ func (r *Reader[T]) TryPeek() (T, bool, error) {
 }
 
 // TryReserve returns the front item and its offset without committing; ok is
-// false when empty. Pass the offset to Commit (or call Take) to consume it.
+// false when empty. Pass the offset to Ack after processing. Commit also retires
+// every earlier record, so use it only when one consumer owns the cursor.
 func (r *Reader[T]) TryReserve() (T, bool, int64, error) {
 	var zero T
 	r.w.mu.Lock()
