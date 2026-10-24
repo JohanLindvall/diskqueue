@@ -113,7 +113,7 @@ processing (at-least-once), use `Reserve`/`Ack`.
 | `Add(v T) error` | Append an item. Returns `ErrFull` at `MaxSegments` or `MaxBytes` (transient), `ErrRecordTooLarge` if it can never fit under `MaxBytes` (permanent). A record too big for one segment gets a segment of its own. Serialization runs before the lock, and under the default policy concurrent `Add`s share their fsyncs (group commit) while each record stays individually durable. |
 | `AddSized(v T) (int64, error)` | `Add`, also reporting the framed size the record occupies on disk — the unit `MaxBytes` and the byte gauges count (`Reader.LastBytes` is the consuming side of the same number). |
 | `AddWait(ctx, v T) error` | `Add` with backpressure: blocks while the queue is full, until a commit frees capacity or `ctx` is done. `ErrRecordTooLarge` still returns immediately. |
-| `AddBatch(items []T) (int, error)` | Append items in order with the per-record cost amortized over the whole batch: one header write per segment crossed on every policy, plus (under per-op durability) one data fsync and one header fsync. Returns how many leading items were placed — on error the first `n` are in and durable, the rest are not. |
+| `AddBatch(items []T) (int, error)` | Append items in order with header writes and syncs shared across each published span. Returns how many leading items were published. Durability follows the selected policy; a final header-sync failure returns `ErrIO` with the published count and uncertain durability. |
 | `NewReader() *Reader[T]` | Create a Reader to consume items (one per consuming goroutine). |
 | `Empty() bool` | Whether anything is available to read. |
 | `Count() int` | Number of items added but not yet committed. |
@@ -225,6 +225,17 @@ Reading is where losses are reported, so a consumer that never reads never learn
 of them; `Stats()` is readable at any time, including after
 `Close`.
 
+Damage is retired through the acknowledgement ledger when earlier reservations
+are outstanding, including reservations in the damaged segment itself. An `Ack`
+that closes the gap retires the reported damage without reporting it again and
+without retiring records appended afterward.
+
+Recovery must flush corrected cursors and counts before opening succeeds, even
+under `NoSync`. A required repair that cannot be written fails the open so it can
+be retried. For a torn header, later commit headers are reset before the salvaged
+header is replaced; an interrupted repair therefore preserves the replay decision even
+when no records survived in the salvaged segment.
+
 ```go
 for {
     v, ok, err := r.TryTake()
@@ -259,6 +270,8 @@ and the queue is left in a state you can reason about.
   `ErrRecordTooLarge` or a failed `pwrite` leaves the queue byte-for-byte as it
   was: the item is not in it, and retrying is well defined. A segment that cannot
   be created is unlinked again, so a failed `Add` leaves no stub behind.
+  A partial header overwrite is restored to the preceding published image; if
+  that restoration fails, the queue latches `ErrIO` and placement is uncertain.
 - **A failed `fsync` poisons the queue.** Linux reports a writeback error *once*
   and then discards the dirty pages, so a second `fsync` can return success over
   data that is already gone. Rather than claim a durability it cannot deliver, the
@@ -270,8 +283,9 @@ and the queue is left in a state you can reason about.
   still on disk and uncommitted records replay.
 - **Commits report failure.** `Take`/`TryTake` return the item *and* a non-nil
   error when the read succeeded but its commit did not reach disk: the item is
-  yours to process, and it will be delivered again after a reopen. `Commit`
-  returns the same error directly.
+  yours to process and may replay after a reopen. A failed header write leaves
+  the affected segment's retirement unchanged and can be retried; a failed final
+  sync leaves durability uncertain. `Commit` returns the same error directly.
 - **Iterators report through `Err()`.** An `iter.Seq` cannot carry an error, so
   `Drain`/`Follow` stop and record it: check `r.Err()` after the loop. Nil means
   the iteration ended because the queue was drained, the context was cancelled, or
@@ -366,7 +380,8 @@ and clears as the consumer drains.
 `SyncEvery` trades a bounded power-loss window for throughput: with `SyncEvery: N`
 the fsync cost is amortized over N writes/commits, so up to the last N unsynced
 operations can be lost on power loss (they still survive a process crash, and a
-torn tail is caught by the per-record checksum). `Close` and `Sync` always flush.
+torn tail is caught by the per-record checksum). `Close` and `Sync` always flush,
+including segment directory entries on supported platforms, even under `NoSync`.
 `Stats().UnsyncedBytes` reports that window as a number — zero under the default
 per-op policy, climbing under `NoSync` or `SyncEvery > 1` until a flush. If it
 keeps climbing, the `SyncInterval` backstop is not keeping up.

@@ -83,9 +83,10 @@ var (
 	// another — already holds the directory's advisory lock.
 	ErrLocked = errors.New("diskqueue: directory already in use")
 	// ErrIO wraps a durability failure that the queue cannot recover from in
-	// place: an fsync that failed. The kernel reports such an error once and then
-	// drops the dirty pages, so a later fsync may well succeed with the data
-	// already gone — rather than report a durability it does not have, the queue
+	// place: a failed sync or an unrepairable partial header write. The kernel can
+	// report a writeback error once and then drop the dirty pages, so a later
+	// fsync may succeed with the data already gone. Rather than report a durability
+	// it does not have, the queue
 	// latches the failure and every subsequent Add, commit and Sync returns it
 	// (wrapping the original errno). Close it and reopen to continue.
 	ErrIO = errors.New("diskqueue: durability failure")
@@ -262,11 +263,8 @@ type Stats struct {
 	// read — this is the number an operator alerts on, and the Lost* fields above
 	// say how much each event cost.
 	//
-	// It counts EVENTS, not damaged regions, and one region can produce more than
-	// one: a segment the read path quarantines is quarantined again when the commit
-	// walk later crosses it, so a single unframable record can read as Corruptions=2
-	// with LostSegments=1. The byte and record figures are booked once; this one
-	// tracks the reports actually handed to consumers.
+	// A deferred retirement of damage already reported by a read does not book
+	// another event when an acknowledgement later advances across it.
 	Corruptions uint64
 }
 
@@ -483,7 +481,7 @@ func (w *Queue[T]) putBuf(mb *marshalBuf) {
 // pwrite) leaves the queue untouched: the error means the item is not in it.
 //
 // A durability failure is the one AMBIGUOUS answer. If the error wraps ErrIO the
-// item may or may not be in the log, and the two arms are not distinguishable
+// item may or may not be in the log, and these cases are not distinguishable
 // from the error: a failed HEADER fsync leaves the record real to everything
 // short of a power loss (its bytes and the header publishing them both reached
 // the page cache), while a failed DATA fsync publishes nothing at all. Either way
@@ -578,12 +576,15 @@ func (w *Queue[T]) AddWait(ctx context.Context, data T) error {
 // AddBatch appends items in order, amortizing the lock and — under the per-op
 // policy — the fsyncs across the whole batch: the records' bytes go down
 // first, one data fsync covers them all, then one header write and one header
-// fsync publish them together (per segment crossed). Every published record is
-// durable when AddBatch returns.
+// fsync publish them together (per segment crossed). With the default policy,
+// every published record is durable on a nil error. Deferred sync policies keep
+// their usual power-loss window.
 //
 // It returns how many leading items are in the queue. n < len(items) comes
 // with the error that stopped the batch (ErrFull, a marshal error, an I/O
-// failure); the first n items are placed and durable regardless.
+// failure). The first n items were published; a final header-sync failure leaves
+// them visible in the page cache but returns ErrIO, so their durability is
+// uncertain, just as with Add.
 //
 // Unlike Add and AddWait, which marshal BEFORE taking the lock, AddBatch calls
 // MarshalFunc with the queue mutex held. A codec that panics there is therefore a
@@ -599,12 +600,13 @@ func (w *Queue[T]) AddBatch(items []T) (int, error) {
 		return 0, ErrClosed
 	}
 	before := w.st.writeOffset()
-	n, err := w.addBatchLocked(items)
-	w.dropOversizedScratch()
-	if w.st.writeOffset() != before {
-		w.signal()
-	}
-	return n, err
+	defer func() {
+		w.dropOversizedScratch()
+		if w.st.writeOffset() != before {
+			w.signal() // a codec panic can follow an already-published segment
+		}
+	}()
+	return w.addBatchLocked(items)
 }
 
 // addBatchLocked stages every record and publishes one span per segment crossed,
@@ -641,6 +643,9 @@ func (w *Queue[T]) addBatchLocked(items []T) (int, error) {
 	w.waitFlushQuiescedLocked()
 	if w.closed {
 		return 0, ErrClosed // Close ran while the quiesce had the lock released
+	}
+	if st.ioErr != nil {
+		return 0, st.ioErr
 	}
 	published := 0
 	for _, it := range items {
@@ -867,6 +872,9 @@ func (w *Queue[T]) leadFlushLocked() error {
 			err = datasync(f)
 			w.mu.Lock()
 		}
+		if err == nil {
+			err = st.ioErr // a concurrent commit/eviction may have failed its flush
+		}
 		switch {
 		case err != nil:
 			// The span's bytes may be gone and nothing was published: discard
@@ -887,6 +895,9 @@ func (w *Queue[T]) leadFlushLocked() error {
 						// real to everything short of a power loss. They stay,
 						// and the store is poisoned.
 						err = st.failIO(herr)
+					}
+					if err == nil {
+						err = st.ioErr
 					}
 				}
 				// dirty deliberately stays set: a commit may have rewritten the
@@ -921,6 +932,7 @@ func (w *Queue[T]) leadFlushLocked() error {
 	}
 	st.flushing = false
 	w.signalFlushDrained()
+	w.signalSpace() // rollback freed staged capacity, or a latch must wake AddWait
 	return mine
 }
 
@@ -1012,6 +1024,16 @@ func (w *Queue[T]) signalSpace() {
 	if w.spaceNotify != nil {
 		close(w.spaceNotify)
 		w.spaceNotify = nil
+	}
+}
+
+// signalProgress wakes producers after a consume operation and readers when a
+// commit discovered corruption after the read cursor had already reached the
+// tail. Pending reports are readable work too. The caller holds w.mu.
+func (w *Queue[T]) signalProgress() {
+	w.signalSpace()
+	if w.st.pendingCorrupt > 0 {
+		w.signal()
 	}
 }
 
@@ -1134,7 +1156,7 @@ func (w *Queue[T]) Sync() error { return w.syncOffLock() }
 // than resetting, which is what keeps them honest under concurrent producers.
 //
 // The dirty set is listed under the lock but pinned and opened a chunk at a
-// time (flushChunkSize, one below MaxOpenFiles), because a pinned file is
+// time (flushChunkSize, two below MaxOpenFiles), because a pinned file is
 // exactly the one evictOpen may not close: pinning the whole set at once — as
 // this did — took MaxOpenFiles out of force for the duration of the flush and,
 // since nothing re-evicts on the way out, after it as well. Under NoSync that
@@ -1155,6 +1177,7 @@ func (w *Queue[T]) syncOffLock() error {
 	defer w.syncMu.Unlock()
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	defer w.signalSpace() // a flush failure must wake producers to observe the latch
 	if w.closed {
 		return ErrClosed
 	}
@@ -1206,6 +1229,9 @@ func (w *Queue[T]) syncOffLock() error {
 	// counted here — unless an interleaved flushBatch already zeroed the gauges
 	// (the epoch moved), in which case they now describe only what accumulated
 	// since it and the stale snapshot must not be subtracted from that.
+	if err := st.syncDir(); err != nil {
+		return err
+	}
 	if st.flushEpoch == snapEpoch {
 		st.unsynced = max(st.unsynced-snapOps, 0)
 		st.unsyncedBytes = max(st.unsyncedBytes-snapBytes, 0)

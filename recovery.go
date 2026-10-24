@@ -103,7 +103,7 @@ func (s *store) load() error {
 	// Commit cursor: the first file whose commit cursor is short of its end.
 	s.commitOff = s.writeOff
 	for i, df := range s.files {
-		if commitCurs[i] < headerSize+df.size {
+		if df.resetCommit || commitCurs[i] < headerSize+df.size {
 			s.commitOff = df.base + (commitCurs[i] - headerSize)
 			break
 		}
@@ -151,7 +151,12 @@ func (s *store) load() error {
 	//
 	// On a healthy open the guard never fires — every field already agrees — so
 	// reopening still costs one 64-byte pread per segment and no writes.
-	for _, df := range s.files {
+	// Repair from the tail backwards: an empty salvaged segment is the only
+	// evidence that following commits must replay. Replace that torn header only
+	// after the later commit headers have been reset, so an interrupted repair
+	// cannot erase the witness before its consequences reach disk.
+	for i := len(s.files) - 1; i >= 0; i-- {
+		df := s.files[i]
 		// The commit cursor this segment must publish, reconciled against the
 		// recovered GLOBAL cursor exactly as the count pass above reconciles the
 		// counts: everything below it is committed, everything above it is not, and
@@ -168,17 +173,13 @@ func (s *store) load() error {
 			df.commitCursor() == cc && df.committedCount() == df.committed {
 			continue
 		}
-		// Fatal only for a TRUNCATED segment, whose republish must land or the same
-		// loss is re-booked on every open. For the reconciliation-only population
-		// this is best-effort, like the re-extension below: a segment that can be
-		// read but not written (a read-only file, a full disk) must not take its
-		// healthy siblings down with it, and leaving that header uncorrected is
-		// exactly the state every release before this one shipped.
-		fatal := df.truncated
+		// Cursor/count reconciliation is part of recovery, not best-effort
+		// maintenance: leaving a stale committed header can silently retire
+		// replayed work once its preceding segment is reclaimed.
 		if err := s.ensureOpen(df); err != nil {
-			if !fatal {
-				continue
-			}
+			return err
+		}
+		if err := faultPoint("recovery.writeHeader"); err != nil {
 			return err
 		}
 		df.header(
@@ -188,18 +189,16 @@ func (s *store) load() error {
 			setCommittedCount(df.committed),
 		)
 		if err := s.writeHeader(df); err != nil {
-			if !fatal {
-				continue
-			}
 			return err
 		}
-		if !s.noSync {
-			if err := s.flushFile(df); err != nil {
-				if !fatal {
-					continue
-				}
-				return err
-			}
+		// Recovery repairs must survive before the file is re-extended or a
+		// torn header's replay witness is replaced, even with NoSync. That option
+		// defers normal operations; it cannot defer this repair ordering.
+		if err := faultPoint("recovery.syncHeader"); err != nil {
+			return s.failIO(err)
+		}
+		if err := s.flushFile(df); err != nil {
+			return err
 		}
 		// Restore the geometry too, and only after the clamped cursor is durable.
 		// Re-extended, the segment is an ordinary partly-filled file whose tail is
@@ -305,8 +304,14 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 		// zeros rather than a zero-length one. Counted as damage it reports a whole
 		// segment's worth of loss — 8 MiB at the default geometry — for a file that
 		// never held a byte, which is what an operator sees after a power cut.
-		if tail && s.abortedCreate(num, size, h) {
-			return nil, 0, s.removeFile(num)
+		if tail {
+			aborted, err := s.abortedCreate(num, size, h)
+			if err != nil {
+				return nil, 0, err
+			}
+			if aborted {
+				return nil, 0, s.removeFile(num)
+			}
 		}
 		return nil, 0, s.dropSegment(num, size, false)
 	case !th.headerChecksumOK():
@@ -328,6 +333,7 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 				return nil, 0, serr
 			}
 			if ok {
+				copy(df.diskHeader[:], h)
 				return df, cc, nil
 			}
 		}
@@ -380,6 +386,7 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 	}
 	df := &dataFile{num: num, path: path, hdr: h, base: base, size: w - headerSize,
 		capacity: capacity, truncated: truncated}
+	copy(df.diskHeader[:], h)
 	df.written = max(th.writtenCount(), 0)
 	if lostTail {
 		// The header counts records the file no longer holds, so Count() would
@@ -398,6 +405,12 @@ func (s *store) loadFile(num uint64, base int64, tail bool) (*dataFile, int64, e
 			// for the repair below to republish and the next append to land behind.
 			// Fail the open — the segment is untouched and a retry once the error
 			// clears recovers everything.
+			if df.f != nil {
+				_ = df.f.Close() // read-only walk; no unpublished writes
+				df.f = nil
+				s.untrackOpen(df)
+			}
+			s.dropBlock()
 			return nil, 0, werr
 		}
 		{
@@ -574,6 +587,7 @@ func (s *store) salvageTornHeader(num uint64, path string, base, size int64) (*d
 	// durably and re-extends the file — the same aftercare a truncated segment
 	// gets, for the same reason: the next open must find a header it can believe.
 	df.truncated = true
+	df.resetCommit = true
 
 	s.corruptions++
 	s.pendingCorrupt++
@@ -635,23 +649,21 @@ func (s *store) countVerified(df *dataFile) (int64, int64, error) {
 //     time at the end of the sequence, and the number advances only once the
 //     create has succeeded. A zeroed segment with a higher-numbered sibling is
 //     therefore something else, and stays corruption.
-//   - A scan that cannot finish answers false, leaving the segment with the
-//     verdict its unbelievable header already earned. Failing to look licenses
-//     nothing here — the unlink was licensed already, and what is at stake is
-//     only whether it is counted as loss.
+//   - An I/O failure during the scan fails recovery. A partial read cannot
+//     establish whether the file is an aborted create or contains data.
 //
 // Writing the header before reserving the blocks would not settle the same
 // ambiguity: the reservation is metadata and can reach the disk while the
 // header's bytes are still in the page cache, leaving exactly this file again.
-func (s *store) abortedCreate(num uint64, size int64, h []byte) bool {
+func (s *store) abortedCreate(num uint64, size int64, h []byte) (bool, error) {
 	for _, b := range h {
 		if b != 0 {
-			return false
+			return false, nil
 		}
 	}
 	f, err := os.Open(s.filePath(num))
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer func() { _ = f.Close() }() // read-only handle: nothing to lose on close
 	// The walk stops at the first nonzero byte, so a segment that holds records
@@ -659,20 +671,26 @@ func (s *store) abortedCreate(num uint64, size int64, h []byte) bool {
 	// on an open that found a header of zeros.
 	buf := make([]byte, 64<<10)
 	for off := int64(headerSize); off < size; {
+		if err := faultPoint("recovery.readZero"); err != nil {
+			return false, err
+		}
 		n, rerr := f.ReadAt(buf[:min(int64(len(buf)), size-off)], off)
+		if rerr != nil && !isShortRead(rerr) {
+			return false, rerr
+		}
 		for _, b := range buf[:n] {
 			if b != 0 {
-				return false
+				return false, nil
 			}
 		}
 		if rerr != nil {
 			// The file ended before the length os.Stat reported: everything that is
 			// there has been read, and all of it was zero.
-			return isShortRead(rerr)
+			return true, nil
 		}
 		off += int64(n)
 	}
-	return true
+	return true, nil
 }
 
 // dropSegment unlinks a segment that cannot be read and books the loss: as

@@ -101,8 +101,10 @@ that arrives while another Add's fsync is in flight joins the next flush span,
 so one data fsync and one header fsync cover every record that joined (group
 commit). Each Add still returns only once its own record is durable — the
 sharing changes the cost, not the contract. [Queue.AddBatch] amortizes the
-same way across a batch from one goroutine, and returns how many leading items
-were placed, each durable, when it stops early.
+same way across a batch from one goroutine and returns how many leading items
+were published. Their durability follows the selected sync policy; a final
+header-sync failure returns [ErrIO] with the published count and uncertain
+durability, as with Add.
 
 How often that fsync happens is the main throughput knob:
 
@@ -114,10 +116,11 @@ How often that fsync happens is the main throughput knob:
     checksum on read.
   - [Options].SyncInterval adds a wall-clock backstop, so an idle queue's last
     writes become durable on a timer rather than waiting for N more operations.
-  - [Options].NoSync never syncs. Data still survives a process crash through the
+  - [Options].NoSync disables per-operation syncs. Data survives a process crash through the
     page cache, but not a power loss.
 
-[Queue.Sync] flushes on demand and [Queue.Close] always flushes. A flush's
+[Queue.Sync] flushes on demand and [Queue.Close] always flushes, including the
+directory entries that name the segments on supported platforms. A flush's
 per-file fdatasyncs run WITHOUT the queue's lock held — pinned against eviction
 and reclamation instead — so the SyncInterval backstop over a deep unsynced
 backlog does not stall every concurrent Add and read for the duration of the
@@ -134,6 +137,10 @@ can report success over data that is already gone. Rather than claim a durabilit
 it does not have, the queue latches the failure: every subsequent Add, commit and
 Sync returns [ErrIO] wrapping the original errno. Reads keep working, so a
 poisoned queue can still be drained. Close and reopen to continue.
+
+A partial header overwrite is restored and flushed before returning a retriable
+write error. If that restoration cannot be completed, the queue also latches
+[ErrIO]: the published extent is uncertain until recovery.
 
 # Crash recovery and corruption
 
@@ -154,6 +161,10 @@ that segment with it, because the record boundaries behind it are gone too. A
 genuine I/O error is not damage at all: nothing is dropped and the cursor stays
 put, since the bytes may still be there next time.
 
+Retiring damage never retires an earlier outstanding reservation. The damaged
+extent waits in the acknowledgement ledger until the earlier work is acknowledged;
+that later retirement does not report the corruption again.
+
 Reopening reads no records — one 64-byte header pread per segment, and the header
 is the single source of truth for the write cursor, the resume point and the
 record count. Two kinds of segment are excepted, both already known to be
@@ -167,6 +178,10 @@ rather than dropped: the header was the only casualty, the records beneath it
 vouch for themselves, and the one thing that cannot be reconstructed is the
 commit position, so that segment and everything after it replays
 (at-least-once). One corruption event is reported for it.
+
+Required header repairs are flushed before opening completes, even under NoSync.
+Following commit headers are reset before a salvaged header is replaced, so an interrupted repair
+preserves the replay decision even when the salvaged segment is empty.
 
 On reopen the read cursor resets to the persisted commit cursor, so uncommitted
 items replay: the crash guarantee is at-least-once. [Queue.Rewind] does the same

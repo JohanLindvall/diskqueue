@@ -36,6 +36,11 @@ type reservation struct {
 	start int64
 	end   int64
 	acked bool
+	// A corrupt span covers a segment's abandoned tail. written snapshots the
+	// segment's published count at detection, so later appends to the same file
+	// cannot be retired along with the damage.
+	corrupt bool
+	written int64
 }
 
 // trackReserve records the boundary of the record a Reserve just handed over.
@@ -139,6 +144,9 @@ func (s *store) ackedRunEnd() int64 {
 // part way leaves the ledger describing what actually happened and the next ack
 // picks up from there.
 func (s *store) ackTo(end int64) (bool, error) {
+	if s.ioErr != nil {
+		return true, s.ioErr
+	}
 	s.dropRetired()
 	if end <= s.commitOff {
 		return true, nil // already retired, here or by another consume path
@@ -157,11 +165,18 @@ func (s *store) ackTo(end int64) (bool, error) {
 // reservation commits nothing and is not an error. Shared by ackTo, AckBatch and
 // retireFrame.
 func (s *store) commitAckedRun() error {
+	return s.commitAckedRunDurable(true)
+}
+
+func (s *store) commitAckedRunDurable(durable bool) error {
+	if s.ioErr != nil {
+		return s.ioErr
+	}
 	target := s.ackedRunEnd()
 	if target <= s.commitOff {
 		return nil // acknowledged, but a gap ahead still blocks the cursor
 	}
-	err := s.commitTo(target)
+	err := s.commitDurable(target, durable)
 	s.dropRetired() // keep the ledger in step with however far the commit actually got
 	return err
 }
@@ -180,7 +195,11 @@ func (s *store) commitAckedRun() error {
 // Appending keeps the ledger sorted: the frame was the read head, so its end is
 // past every outstanding reservation's.
 func (s *store) retireFrame(start, end int64) error {
+	return s.retireFrameDurable(start, end, true)
+}
+
+func (s *store) retireFrameDurable(start, end int64, durable bool) error {
 	s.dropRetired()
 	s.reserved = append(s.reserved, reservation{start: start, end: end, acked: true})
-	return s.commitAckedRun()
+	return s.commitAckedRunDurable(durable)
 }

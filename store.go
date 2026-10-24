@@ -214,13 +214,15 @@ func openStore(dir string, segmentSize int64, maxSegments int, noSync bool, sync
 	return s, nil
 }
 
-// failIO latches an unrecoverable durability failure. Only fsync failures land
-// here: the kernel reports a writeback error once and then drops the dirty pages,
-// so a retry can report success with the data already gone. Rather than claim a
+// failIO latches an unrecoverable durability failure: a failed fsync, or a partial
+// header overwrite whose previous image could not be restored. The kernel can
+// report a writeback error once and then drop the dirty pages, so a retry can
+// report success with the data already gone. Rather than claim a
 // durability it cannot deliver, the store remembers the first such failure and
 // every later append/commit/sync repeats it; the caller's recourse is to close
-// and reopen. Write and open failures are *not* latched — they leave the store
-// consistent and are safe to retry.
+// and reopen. Ordinary write and open failures are not latched: they leave the
+// store consistent and are safe to retry. A failed header restoration cannot make
+// that promise, so it takes the same latch rather than guessing what was published.
 func (s *store) failIO(err error) error {
 	if err == nil {
 		return nil
@@ -334,31 +336,25 @@ func (s *store) evictOpen(keep *dataFile) {
 	}
 }
 
-// live reports whether df is still one of the store's segments — for a caller
-// holding a pointer it collected under an earlier acquisition of the lock, like
-// the chunked off-lock flush. Reclamation only ever removes a leading PREFIX of
-// s.files (see dropCommitted), and segment bases only ever increase, so a file
-// has been unlinked exactly when its base sits below the live range: no
-// per-file "dropped" flag to keep in step with every removal path. A file
-// dropCommitted could not unlink stays in s.files, which only makes this answer
-// conservatively "live".
+// live checks membership for a pointer retained across lock holds. A pinned or
+// un-unlinkable file can survive while later committed files are reclaimed, so
+// comparing against the first live base alone cannot establish membership.
 func (s *store) live(df *dataFile) bool {
-	return len(s.files) > 0 && df.base >= s.files[0].base
+	i := sort.Search(len(s.files), func(i int) bool { return s.files[i].num >= df.num })
+	return i < len(s.files) && s.files[i] == df
 }
 
 // flushChunkSize is how many files an off-lock flush (Queue.syncOffLock) may
 // hold open at once; 0 means no limit, matching an unbounded maxOpenFiles.
 //
-// One below the cap, because the chunk's files are pinned and the active file
-// is never evictable: leaving that one slot free is what keeps nOpen at or
-// under maxOpenFiles for the whole flush rather than one over it whenever the
-// active file is not itself in the chunk. openStore floors a nonzero
-// maxOpenFiles at 3, so a chunk always holds at least two files.
+// Leave slots for both the active file and a concurrent reader's newly opened
+// file: neither is evictable during ensureOpen. openStore floors a nonzero cap
+// at 3, so even the smallest cap permits one pinned file.
 func (s *store) flushChunkSize() int {
 	if s.maxOpenFiles <= 0 {
 		return 0
 	}
-	return max(s.maxOpenFiles-1, 1)
+	return max(s.maxOpenFiles-2, 1)
 }
 
 // batched reports whether the sync policy defers fsync to a periodic flush
@@ -405,6 +401,12 @@ func (s *store) flushBatch() error {
 	if errs != nil {
 		return errs
 	}
+	if s.ioErr != nil {
+		return s.ioErr // reopening a dirty file may have failed an eviction flush
+	}
+	if err := s.syncDir(); err != nil {
+		return err
+	}
 	s.unsynced, s.unsyncedBytes = 0, 0
 	s.flushEpoch++
 	return nil
@@ -419,8 +421,11 @@ func (s *store) filePath(num uint64) string {
 // to trip over, and returns cleanly: nothing was published, so the store is
 // exactly where it was.
 func (s *store) createFile(num uint64, base, capacity int64) (*dataFile, error) {
+	if num == 0 {
+		return nil, errors.New("diskqueue: segment number space exhausted")
+	}
 	path := s.filePath(num)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -487,13 +492,50 @@ func (s *store) writeHeader(df *dataFile) error {
 			return err
 		}
 	}
+	if s.ioErr != nil {
+		return s.ioErr // ensureOpen can latch a dirty victim's failed flush
+	}
 	if _, err := df.f.WriteAt(df.hdr, 0); err != nil {
+		// A closed os.File rejects the call before issuing any write. Other
+		// failures can have overwritten a prefix even when WriteAt reports n=0,
+		// so read back the header rather than trusting that count.
+		if !errors.Is(err, os.ErrClosed) {
+			if rerr := s.restoreHeader(df); rerr != nil {
+				return errors.Join(err, s.failIO(rerr))
+			}
+		}
 		return err
 	}
+	copy(df.diskHeader[:], df.hdr)
 	s.nHeaderWrites++
 	df.dirty = true
 	df.writeSeq++
 	return nil
+}
+
+// restoreHeader restores the changed prefix of a failed header overwrite. It
+// flushes the restoration before reporting a retriable write failure, so recovery
+// cannot mistake the torn image for a reason to salvage an unpublished append.
+func (s *store) restoreHeader(df *dataFile) error {
+	var current [headerSize]byte
+	if _, err := df.f.ReadAt(current[:], 0); err != nil {
+		return fmt.Errorf("checking failed header write: %w", err)
+	}
+	n := headerSize
+	for n > 0 && current[n-1] == df.diskHeader[n-1] {
+		n--
+	}
+	if n == 0 {
+		return nil // the failed write left the published header intact
+	}
+	df.dirty = true
+	df.writeSeq++
+	// Restore only bytes that changed. A file-size limit can reject a complete
+	// header overwrite while still allowing this smaller repair to succeed.
+	if _, err := df.f.WriteAt(df.diskHeader[:n], 0); err != nil {
+		return fmt.Errorf("restoring partial header: %w", err)
+	}
+	return datasync(df.f)
 }
 
 // flushFile fsyncs df if it has unsynced writes, then marks it clean. No-op for
@@ -511,6 +553,9 @@ func (s *store) flushFile(df *dataFile) error {
 		if err := s.ensureOpen(df); err != nil {
 			return err
 		}
+	}
+	if s.ioErr != nil {
+		return s.ioErr
 	}
 	if err := datasync(df.f); err != nil {
 		return s.failIO(err)
@@ -564,6 +609,9 @@ func (s *store) appendRecord(payload []byte, force bool) error {
 	// LRU never evicts it.
 	if err := s.ensureOpen(af); err != nil {
 		return err
+	}
+	if s.ioErr != nil {
+		return s.ioErr // ensureOpen/cycle may have failed a dirty eviction
 	}
 
 	if err := faultPoint("append.writeRecord"); err != nil {
@@ -718,6 +766,9 @@ func (s *store) stagePending(payload []byte) error {
 	if err := s.ensureOpen(af); err != nil {
 		return err
 	}
+	if s.ioErr != nil {
+		return s.ioErr
+	}
 	if err := faultPoint("append.writeRecord"); err != nil {
 		return err
 	}
@@ -829,6 +880,9 @@ func (s *store) cycle(need int64, force bool) error {
 	s.diskBytes += headerSize + df.capacity
 	s.trackOpen(df)
 	// Persist the new (and removed) entries before records land in the file.
+	if s.ioErr != nil {
+		return s.ioErr
+	}
 	if !s.noSync {
 		if err := s.syncDir(); err != nil {
 			return err
@@ -1003,33 +1057,13 @@ func (s *store) takeHead() ([]byte, int64, bool, error) {
 		s.corruptions++
 		s.headOff = next
 		cerr := fmt.Errorf("%w: record checksum", ErrCorrupt)
-		// Retire the record that was just reported destroyed. Nothing else ever
-		// would: every consume op returns on this error without committing, so a
-		// damaged record left at the head keeps Count() above zero for good, pins its
-		// segment against reclamation, and is re-read and re-reported on every reopen
-		// — one ErrCorrupt and one LostRecords per restart, forever.
-		//
-		// Only when the commit cursor stood exactly here, though. With records
-		// reserved behind it the cursor may not jump: that would retire work no
-		// consumer has acknowledged. Those cases normally heal on their own, because
-		// the eventual Commit walks across this record like any other — its framing
-		// is intact, only the payload failed its checksum.
-		//
-		// The residue, stated so nobody rediscovers it as a bug: a Reserve/Commit
-		// consumer that NEVER acknowledges past the damage leaves Count() at the
-		// number of records it is still holding, with Empty() true, and pins their
-		// segment for the session. That is the same thing an unacknowledged reserve
-		// does to any record, damaged or not — the store keeps no per-record
-		// reservation state, so it cannot tell "handed out and outstanding" from
-		// "handed out and dropped", and guessing would retire live work. Rewind or a
-		// Commit past the damage clears it.
-		if head == s.commitOff && s.ioErr == nil {
-			// Unflushed (see commitDurable) and deliberately unreported: the record
-			// is already booked lost and the cursor has already moved, so ErrCorrupt
-			// alone is the whole truth the caller needs. Joining a write failure on
-			// here would turn one damaged record into a second, unrelated error on a
-			// path whose contract is "damage was dropped, go round again".
-			_ = s.commitDurable(next, false)
+		// Keep the dropped frame in the same contiguous retirement ledger as
+		// Skip. Otherwise an Ack before the damage leaves an unfillable hole,
+		// while a prefix commit would retire another worker's reservation.
+		// Reads do not spend a SyncEvery tick, but a failed header write must
+		// still reach the caller; the ledger retains the retirement for retry.
+		if err := s.retireFrameDurable(head, next, false); err != nil {
+			return nil, 0, false, errors.Join(cerr, err)
 		}
 		return nil, 0, false, cerr
 	}
@@ -1152,9 +1186,12 @@ func (s *store) forceCommitAll() error {
 			return err
 		}
 		if abandoned := df.written - df.committed; abandoned > 0 {
+			s.nCommitted += abandoned
 			s.nCommittedTotal += uint64(abandoned)
 		}
 		df.committed = df.written
+		s.commitOff = max(s.commitOff, df.base+df.size)
+		s.headOff = max(s.headOff, s.commitOff)
 	}
 	// Square the global counter outright instead of summing the per-file moves
 	// above, because the two differ in exactly the case this arm exists to answer:
@@ -1172,10 +1209,10 @@ func (s *store) forceCommitAll() error {
 	return nil
 }
 
-// skipCorruptSegment abandons the rest of the segment holding off: it advances
-// the read cursor past the segment, and — when the commit cursor is already
-// within that segment (the auto-committing read path) — force-commits the
-// abandoned tail so it is reclaimed and never replayed.
+// skipCorruptSegment abandons the rest of the segment holding off. It advances
+// the read cursor and retires the damage immediately only when commitOff has
+// reached off. Otherwise the abandoned extent enters the acknowledgement ledger,
+// so earlier reservations remain live, including ones in the same segment.
 //
 // This is the expensive half of the blast-radius rule, reached only when the
 // framing itself is gone: with the record boundaries unknown, there is nothing
@@ -1199,12 +1236,13 @@ func (s *store) skipCorruptSegment(off int64) error {
 		// not carry is replayed wholesale by the next open, while nCommittedTotal — a
 		// lifetime counter no reopen undoes — has already counted those records, so
 		// Stats().Committed would count them again as they are re-consumed.
+		head := s.headOff
 		if err := s.forceCommitAll(); err != nil {
 			return err
 		}
 		s.corruptions++
 		s.lostSegments++
-		if lost := s.writeOff - s.headOff; lost > 0 {
+		if lost := s.writeOff - head; lost > 0 {
 			s.lostBytes += uint64(lost)
 		}
 		s.headOff = s.writeOff
@@ -1214,7 +1252,7 @@ func (s *store) skipCorruptSegment(off int64) error {
 		return nil
 	}
 	end := df.base + df.size
-	if s.commitOff >= df.base {
+	if s.commitOff == off {
 		// A segment whose file has vanished leaves no header to record the
 		// quarantine in and nothing to replay from it, so publishFullCommit
 		// succeeds and the in-memory advance below is all there is to do;
@@ -1244,6 +1282,15 @@ func (s *store) skipCorruptSegment(off int64) error {
 	}
 	if s.headOff < end {
 		s.headOff = end
+	}
+	if s.commitOff < end {
+		// Defer retirement behind earlier work, including a reservation in this
+		// same segment. Snapshot the extent/count so concurrent publication or a
+		// later append cannot be mistaken for part of this abandoned tail.
+		s.dropRetired()
+		s.reserved = append(s.reserved, reservation{
+			start: off, end: end, acked: true, corrupt: true, written: df.written,
+		})
 	}
 	s.corruptions++
 	return nil
@@ -1283,7 +1330,8 @@ func (s *store) commitDurable(off int64, durable bool) error {
 	perOp := durable && s.perOp()
 	var cur *dataFile // file with header changes not yet written out
 	var stop error
-	advanced := false
+	before := s.commitOff
+	reservedIndex := 0
 	var df *dataFile // carried across iterations; the walk is sequential
 	for s.commitOff < off {
 		// Re-resolve only when the cursor leaves the carried file: re-scanning the
@@ -1300,17 +1348,58 @@ func (s *store) commitDurable(off int64, durable bool) error {
 		if cur != nil && cur != df {
 			// Leaving a file: write its final header now, while its handle is
 			// certainly still open — opening the next segment can evict this one.
-			if err := s.persistCommit(cur, perOp); err != nil {
+			previous := cur
+			cur = nil
+			if err := s.persistCommit(previous, perOp); err != nil {
 				stop = err
 				break
 			}
-			cur = nil
 		}
-		if err := s.ensureOpen(df); err != nil {
-			stop = err // can't open the file to advance the cursor; replay later
+		// The ledger and commit walk both advance in order. Carry its position
+		// across records instead of searching the whole in-flight set each time.
+		for reservedIndex < len(s.reserved) && s.reserved[reservedIndex].end <= s.commitOff {
+			reservedIndex++
+		}
+		var reserved *reservation
+		if reservedIndex < len(s.reserved) && s.reserved[reservedIndex].start == s.commitOff {
+			reserved = &s.reserved[reservedIndex]
+		}
+		if reserved != nil && reserved.corrupt {
+			if reserved.end > off {
+				break
+			}
+			// Its framing is known to be unusable. Retire exactly the extent
+			// already reported lost, without walking it or reporting it again.
+			abandoned := max(reserved.written-df.committed, 0)
+			s.commitOff = reserved.end
+			s.nCommitted += abandoned
+			s.nCommittedTotal += uint64(abandoned)
+			df.committed += abandoned
+			cur = df
+			continue
+		}
+		openErr := s.ensureOpen(df)
+		if s.ioErr != nil {
+			stop = s.ioErr
 			break
 		}
-		next, ok, err := s.frameEnd(df, s.commitOff)
+		if openErr != nil && !errors.Is(openErr, os.ErrNotExist) {
+			stop = openErr // inaccessible is not corrupt: retry later
+			break
+		}
+		var next int64
+		var ok bool
+		var err error
+		switch {
+		case openErr == nil:
+			next, ok, err = s.frameEnd(df, s.commitOff)
+		case reserved != nil:
+			// The bytes vanished after delivery, but this reservation's boundary
+			// is still known. Acknowledging it must not retire its neighbours.
+			next, ok = reserved.end, true
+		default:
+			err = fmt.Errorf("%w: %w", ErrCorrupt, openErr)
+		}
 		// The cursor may only ever move forward, and never past the tail: a decoded
 		// length that says otherwise is corruption, not a destination.
 		if ok && (next <= s.commitOff || next > s.writeOff) {
@@ -1325,6 +1414,12 @@ func (s *store) commitDurable(off int64, durable bool) error {
 			// applies. A cursor stuck on an unframable record would also stop all
 			// reclamation, so the disk fills behind it.
 			if errors.Is(err, ErrCorrupt) {
+				if off < df.base+df.size {
+					// A prefix commit is not permission to discard outstanding
+					// reservations or unread records beyond its target.
+					stop = err
+					break
+				}
 				if serr := s.skipCorruptSegment(s.commitOff); serr != nil {
 					stop = serr
 					break
@@ -1335,7 +1430,7 @@ func (s *store) commitDurable(off int64, durable bool) error {
 				// climbs with nothing in any log is what breaks an operator's trust
 				// in the number.
 				s.pendingCorrupt++
-				cur, advanced = nil, true // it persisted the header itself
+				cur = nil // it persisted the header itself
 				continue
 			}
 			stop = err
@@ -1357,14 +1452,13 @@ func (s *store) commitDurable(off int64, durable bool) error {
 		// recomputed the 56-byte checksum for every record crossed and threw all but
 		// the last away — 43% of the commit walk, with the queue mutex held.
 		cur = df
-		advanced = true
 	}
 	if cur != nil {
 		if err := s.persistCommit(cur, perOp); err != nil && stop == nil {
 			stop = err
 		}
 	}
-	if !advanced {
+	if s.commitOff == before {
 		return stop // nothing committed
 	}
 	if durable && s.batched() {
@@ -1394,11 +1488,24 @@ func (s *store) commitDurable(off int64, durable bool) error {
 // The cursor is clamped to df's own extent, because this is also the call that
 // finalizes a file the walk has already left — and such a file is fully committed.
 func (s *store) persistCommit(df *dataFile, perOp bool) error {
+	prevCursor, prevCount := df.commitCursor(), df.committedCount()
 	df.header(
 		setCommitCursor(headerSize+min(s.commitOff-df.base, df.size)),
 		setCommittedCount(df.committed),
 	)
 	if err := s.writeHeader(df); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // a vanished segment has neither a header nor data to replay
+		}
+		// Only successfully published segments may remain retired. Keeping this
+		// advance would make an Ack retry a no-op and allow reclamation to unlink
+		// work whose commit never reached even the page cache.
+		rolledBack := df.committed - prevCount
+		s.commitOff = df.base + prevCursor - headerSize
+		s.nCommitted -= rolledBack
+		s.nCommittedTotal -= uint64(rolledBack)
+		df.committed = prevCount
+		df.header(setCommitCursor(prevCursor), setCommittedCount(prevCount))
 		return err
 	}
 	if perOp {
@@ -1484,6 +1591,9 @@ func (s *store) syncDir() error {
 	if s.dirFile == nil {
 		return nil
 	}
+	if err := faultPoint("sync.dir"); err != nil {
+		return s.failIO(err)
+	}
 	err := fsyncDir(s.dirFile)
 	if err == nil || dirSyncUnsupported(err) {
 		return nil
@@ -1515,7 +1625,11 @@ func (s *store) close() error {
 		if err := df.f.Close(); err != nil && first == nil {
 			first = err
 		}
+		s.untrackOpen(df)
 		df.f = nil
+	}
+	if first == nil {
+		first = s.syncDir()
 	}
 	if first == nil {
 		// Every file reached stable storage, so the power-loss exposure is genuinely

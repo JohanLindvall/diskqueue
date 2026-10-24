@@ -247,14 +247,12 @@ func TestCommitToOpenFailureIsRetriableAndDeletesNothing(t *testing.T) {
 // cache looked exactly like one that did.
 //
 // The failure is a pwrite, not an fsync — class (2) — so it must be returned
-// without poisoning the store, and what the walk already committed stands (the
-// cursor only ever moved forward over records that were really there).
+// without poisoning the store. Only headers successfully published before the
+// failure may advance retirement; this failure is in the very first segment.
 func TestCommitToPersistFailureOnLeavingSegment(t *testing.T) {
 	s, _ := newTestStore(t, 512, 0)
 	committoFillSegments(t, s, 2)
 	total := s.count()
-	firstSeg := s.files[0]
-	boundary := s.files[1].base // where the walk crosses out of segment 1
 
 	// Reads keep working, so the walk crosses the whole of segment 1; the header
 	// write it does on the way out is what fails.
@@ -270,19 +268,19 @@ func TestCommitToPersistFailureOnLeavingSegment(t *testing.T) {
 	if errors.Is(err, ErrCorrupt) {
 		t.Fatalf("a failed pwrite is not corruption: %v", err)
 	}
-	if s.commitOff != boundary {
-		t.Fatalf("commitOff=%d, want %d: the walk stops where the header write failed",
-			s.commitOff, boundary)
+	if s.commitOff != 0 {
+		t.Fatalf("commitOff=%d, want 0: the first header write failed", s.commitOff)
 	}
-	if want := total - firstSeg.written; s.count() != want {
-		t.Fatalf("count=%d, want %d: what was committed before the failure stands", s.count(), want)
+	if s.count() != total {
+		t.Fatalf("count=%d, want %d: no retirement was published", s.count(), total)
 	}
 	if st := s.stats(); st.Corruptions != 0 {
 		t.Fatalf("corruptions=%d: a write failure is not damage", st.Corruptions)
 	}
 
-	// The store is still usable: the rest of the backlog commits normally, now
-	// that the walk starts in a segment whose handle is healthy.
+	// Once the write failure clears, the same commit retries the unpublished
+	// segment instead of reporting success over a header it never persisted.
+	repairHandle(t, s, 0)
 	if err := s.commitTo(s.writeOffset()); err != nil {
 		t.Fatalf("second commitTo: %v", err)
 	}
