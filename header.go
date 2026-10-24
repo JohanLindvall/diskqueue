@@ -52,8 +52,12 @@ type dataFile struct {
 	path string
 	f    *os.File // open handle, or nil when not currently open
 	hdr  []byte   // resident copy of the 64-byte header (page 0)
-	base int64    // global offset of this file's first data byte
-	size int64    // bytes of records written into the data region (excludes header)
+	// The last complete header image written or read from disk. Header modifiers
+	// change hdr before publication; this image lets a short overwrite restore
+	// exactly the bytes it changed without resurrecting an unpublished append.
+	diskHeader [headerSize]byte
+	base       int64 // global offset of this file's first data byte
+	size       int64 // bytes of records written into the data region (excludes header)
 	// capacity is how many record bytes this segment's data region can hold. It is
 	// the store's segmentSize for an ordinary segment, and exactly one record's
 	// framed length for an oversized one — which is what keeps "records never span
@@ -93,6 +97,9 @@ type dataFile struct {
 	// re-extends the file — otherwise the next open reads the zero fill back as
 	// records.
 	truncated bool
+	// A salvaged header has no trustworthy commit position, even when no record
+	// survived. Recovery must rewind the following segments before replacing it.
+	resetCommit bool
 }
 
 // Header layout (little-endian): [0:8] magic, [8:16] commit cursor, [16:24] write

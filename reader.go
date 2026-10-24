@@ -98,7 +98,7 @@ func (r *Reader[T]) TryReserve() (T, bool, int64, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // a quarantine on the read path can advance the commit cursor
+	defer r.w.signalProgress() // a quarantine on the read path can advance the commit cursor
 	if r.w.closed {
 		return zero, false, 0, ErrClosed
 	}
@@ -113,13 +113,13 @@ func (r *Reader[T]) TryReserve() (T, bool, int64, error) {
 // TryTake returns and commits the front item; ok is false when empty.
 //
 // A non-nil error with ok true means the item was read but its commit could not
-// be persisted: the item is yours, and it will be delivered again after a reopen
-// (the commit, not the read, is what is missing).
+// be persisted: the item is yours and may replay after a reopen. A failed header
+// write leaves it uncommitted; a failed final sync leaves durability uncertain.
 func (r *Reader[T]) TryTake() (T, bool, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	defer r.w.signalProgress() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return zero, false, ErrClosed
 	}
@@ -136,7 +136,7 @@ func (r *Reader[T]) Reserve(ctx context.Context) (T, bool, int64, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // a quarantine on the read path can advance the commit cursor
+	defer r.w.signalProgress() // a quarantine on the read path can advance the commit cursor
 	for {
 		if r.w.closed {
 			return zero, false, 0, ErrClosed
@@ -157,12 +157,12 @@ func (r *Reader[T]) Reserve(ctx context.Context) (T, bool, int64, error) {
 
 // Take blocks until an item is available (or ctx is done) and returns + commits
 // it. As with TryTake, a non-nil error alongside ok true means the item was read
-// but its commit did not reach disk, so it replays after a reopen.
+// but its commit failed, so it may replay after a reopen.
 func (r *Reader[T]) Take(ctx context.Context) (T, bool, error) {
 	var zero T
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	defer r.w.signalProgress() // the commit may have freed capacity a producer waits on
 	for {
 		if r.w.closed {
 			return zero, false, ErrClosed
@@ -192,7 +192,7 @@ func (r *Reader[T]) Take(ctx context.Context) (T, bool, error) {
 func (r *Reader[T]) Commit(offset int64) error {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	defer r.w.signalProgress() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return ErrClosed
 	}
@@ -230,7 +230,7 @@ func (r *Reader[T]) Commit(offset int64) error {
 func (r *Reader[T]) Ack(offset int64) error {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	defer r.w.signalProgress() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return ErrClosed
 	}
@@ -279,11 +279,14 @@ func (r *Reader[T]) LastAge() time.Duration { return r.lastAge }
 func (r *Reader[T]) AckBatch(offsets ...int64) error {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	defer r.w.signalProgress() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return ErrClosed
 	}
 	st := r.w.st
+	if st.ioErr != nil {
+		return st.ioErr
+	}
 	st.dropRetired()
 	head := st.headOffset()
 	invalid := false
@@ -336,7 +339,7 @@ func (r *Reader[T]) AckBatch(offsets ...int64) error {
 func (r *Reader[T]) Skip() (bool, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // the commit may have freed capacity a producer waits on
+	defer r.w.signalProgress() // the commit may have freed capacity a producer waits on
 	if r.w.closed {
 		return false, ErrClosed
 	}
@@ -404,7 +407,7 @@ func (r *Reader[T]) next(ctx context.Context, follow bool, end int64) (T, bool, 
 	w := r.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	defer w.signalSpace() // iterators commit as they read; producers may be waiting
+	defer w.signalProgress() // iterators commit as they read; producers may be waiting
 	for {
 		if w.closed {
 			return zero, false, nil
@@ -494,7 +497,8 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 	// start, which a quarantine en route may have moved past (see trackReserve).
 	// The stamp counts: it is part of the payload, so LastBytes stays the exact
 	// unit MaxBytes and AddSized report.
-	r.lastBytes = r.w.st.lastFrameEnd - r.w.st.lastFrameAt
+	lastBytes := r.w.st.lastFrameEnd - r.w.st.lastFrameAt
+	var lastAge time.Duration
 	defer r.trimScratch() // on the codec exit too; see TryPeek
 	body := r.scratch
 	if r.w.stamp {
@@ -507,7 +511,7 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 			// and never a panic.
 			return zero, 0, false, fmt.Errorf("%w: %w", ErrCodec, errShortStamp)
 		}
-		r.lastAge = stampAge(body)
+		lastAge = stampAge(body)
 		body = body[stampLen:]
 	}
 	v, err := r.w.unmarshal(body)
@@ -521,6 +525,7 @@ func (r *Reader[T]) read() (T, int64, bool, error) {
 		return zero, 0, false, fmt.Errorf("%w: %w", ErrCodec, err)
 	}
 	delivered = true
+	r.lastBytes, r.lastAge = lastBytes, lastAge
 	return v, off, true, nil
 }
 
@@ -576,7 +581,7 @@ func (r *Reader[T]) trimScratch() {
 func (r *Reader[T]) Requeue() (bool, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	defer r.w.signalSpace() // the head commit may free capacity a producer waits on
+	defer r.w.signalProgress() // the head commit may free capacity a producer waits on
 	if r.w.closed {
 		return false, ErrClosed
 	}

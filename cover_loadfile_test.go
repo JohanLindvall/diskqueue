@@ -611,15 +611,9 @@ func TestLoadFileCommitCursorPastSegmentClamped(t *testing.T) {
 	}
 }
 
-// TestAbortedCreateScanFailuresKeepTheCorruptionVerdict covers abortedCreate's two
-// failure arms, which decide whether a dropped segment is COUNTED as loss.
-//
-// Neither is reachable through loadFile — a segment that cannot be opened has
-// already failed readHeader, and the scan is bounded by the length os.Stat
-// reported a moment earlier — so they are exercised directly. Both must answer in
-// the conservative direction: silence is only ever bought by proof, because an
-// under-reported loss is a segment that went missing with nothing said.
-func TestAbortedCreateScanFailuresKeepTheCorruptionVerdict(t *testing.T) {
+// An open/read failure must be reported separately from the verdict on a file's
+// contents. EOF still proves an all-zero file if every surviving byte was read.
+func TestAbortedCreateScanFailuresAreReported(t *testing.T) {
 	dir := t.TempDir()
 	s, err := openStore(dir, loadfileSegSize, 0, false, 0, 0)
 	if err != nil {
@@ -629,9 +623,8 @@ func TestAbortedCreateScanFailuresKeepTheCorruptionVerdict(t *testing.T) {
 	zeroHdr := make([]byte, headerSize)
 	full := int64(headerSize + loadfileSegSize)
 
-	// The scan cannot even open the file: nothing was proved, so the segment keeps
-	// the verdict its unreadable header earned.
-	if s.abortedCreate(404, full, zeroHdr) {
+	// The scan cannot open the file: recovery must fail without deleting it.
+	if aborted, err := s.abortedCreate(404, full, zeroHdr); aborted || err == nil {
 		t.Fatal("a segment that could not be opened was reclaimed as an aborted create")
 	}
 
@@ -644,7 +637,7 @@ func TestAbortedCreateScanFailuresKeepTheCorruptionVerdict(t *testing.T) {
 		}
 	}
 	writeSeg(900, make([]byte, headerSize+16))
-	if !s.abortedCreate(900, full, zeroHdr) {
+	if aborted, err := s.abortedCreate(900, full, zeroHdr); !aborted || err != nil {
 		t.Fatal("a wholly zero file that ended early was not recognised as an aborted create")
 	}
 
@@ -653,7 +646,7 @@ func TestAbortedCreateScanFailuresKeepTheCorruptionVerdict(t *testing.T) {
 	late := make([]byte, headerSize+16)
 	late[len(late)-1] = 1
 	writeSeg(901, late)
-	if s.abortedCreate(901, full, zeroHdr) {
+	if aborted, err := s.abortedCreate(901, full, zeroHdr); aborted || err != nil {
 		t.Fatal("a file with data in it was reclaimed as an aborted create")
 	}
 
@@ -662,7 +655,7 @@ func TestAbortedCreateScanFailuresKeepTheCorruptionVerdict(t *testing.T) {
 	writeSeg(902, make([]byte, full))
 	nonZeroHdr := make([]byte, headerSize)
 	nonZeroHdr[headerSize-1] = 1
-	if s.abortedCreate(902, full, nonZeroHdr) {
+	if aborted, err := s.abortedCreate(902, full, nonZeroHdr); aborted || err != nil {
 		t.Fatal("a segment carrying a header was reclaimed as an aborted create")
 	}
 }
